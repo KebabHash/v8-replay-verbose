@@ -1,3 +1,4 @@
+# Revision: context-fix-2. Replace .github/workflows/v8-replay-verbose.yml in full.
 # Single file: put ONLY this YAML in .github/workflows/v8-checkpoint-atlas.yml.
 # All project Python, Bash, JavaScript, HTML and CSS are embedded below.
 # No checkout, companion files, Python packages, npm packages or API keys.
@@ -18,7 +19,7 @@
 # Every run block is kept below GitHub's documented 21,000-character limit.
 #
 # LOCAL VALIDATION IS NOT A LIVE GITHUB/DOCKER/CRIU RESULT.
-name: V8 Checkpoint Atlas - self-contained and ultra verbose
+name: V8 Checkpoint Atlas - context-fix-2 - ultra verbose
 'on':
   workflow_dispatch:
     inputs:
@@ -41,7 +42,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     env:
-      BUNDLE_DIR: ${{ runner.temp }}/v8-checkpoint-atlas
+      BUNDLE_DIR: ${{ github.workspace }}/.v8-checkpoint-atlas
       EVIDENCE_DIR: ${{ github.workspace }}/evidence
       IMAGE: cybergym/v8@sha256:d53b336a90e184fe61c2067342eb278f6d54d009d7b4d93b958029b86904e48a
       CRIU_VERSION: '4.3'
@@ -58,6 +59,7 @@ jobs:
       shell: bash
       run: |
         set -Eeuo pipefail
+        printf 'Workflow revision: context-fix-2\n'
         mkdir -p "$BUNDLE_DIR" "$EVIDENCE_DIR" "$EVIDENCE_DIR/sources"
         printf '
         === V8 CHECKPOINT ATLAS: SINGLE YAML, FULL CONSOLE OUTPUT ===
