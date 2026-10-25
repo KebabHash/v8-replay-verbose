@@ -1,155 +1,182 @@
-name: V8 checkpoint fidelity - verbose
+name: V8 Full Execution Checkpoint Feasibility (Ultra Verbose)
+
 on:
   workflow_dispatch:
     inputs:
-      repetitions:
-        description: 'Number of independent restores (1-10)'
+      image:
+        description: 'V8 ExploitGym Docker image (pin by digest for rigorous comparisons)'
         required: false
-        default: '3'
-        type: string
-  push:
-    paths:
-      - '.github/workflows/v8-checkpoint-fidelity.yml'
+        default: 'cybergym/v8@sha256:d53b336a90e184fe61c2067342eb278f6d54d009d7b4d93b958029b86904e48a'
+      checkpoint_wait_seconds:
+        description: 'Seconds to allow target to warm up before checkpoint'
+        required: false
+        default: '8'
 
 permissions:
   contents: read
 
 jobs:
-  checkpoint-fidelity:
-    runs-on: ubuntu-latest
-    timeout-minutes: 25
+  feasibility:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
     env:
-      IMAGE: cybergym/v8:human-446124892-nosandbox-buildable
-      REPS: ${{ inputs.repetitions || '3' }}
-      OUT: checkpoint-evidence
+      DOCKER_CLI_EXPERIMENTAL: enabled
+      IMAGE: ${{ inputs.image || 'cybergym/v8@sha256:d53b336a90e184fe61c2067342eb278f6d54d009d7b4d93b958029b86904e48a' }}
+      WARMUP: ${{ inputs.checkpoint_wait_seconds || '8' }}
     steps:
-      - name: Capture, mutate, restore, verify, and report
+      - name: Host and Docker preflight (never hide errors)
         shell: bash
         run: |
-          set -euo pipefail
-          mkdir -p "$OUT"
-          cat > /tmp/checkpoint_fidelity.py <<'PY'
-          import datetime, hashlib, json, os, pathlib, subprocess, sys, time, traceback
-          from concurrent.futures import ThreadPoolExecutor
+          set -uo pipefail
+          mkdir -p evidence
+          exec > >(tee evidence/host-preflight.log) 2>&1
+          echo '=== UTC ==='; date -u --iso-8601=seconds
+          echo '=== OS ==='; uname -a; cat /etc/os-release
+          echo '=== USER ==='; id; sudo -n true; echo "sudo_status=$?"
+          echo '=== CPU / RAM ==='; nproc; free -h; cat /proc/meminfo | head -n 25
+          echo '=== DISK ==='; df -h; mount | head -n 40
+          echo '=== KERNEL CRIU RELEVANT ==='
+          for f in /proc/sys/kernel/yama/ptrace_scope /proc/sys/kernel/ns_last_pid /proc/sys/kernel/unprivileged_userns_clone /proc/sys/kernel/kptr_restrict; do
+            echo "--- $f"; cat "$f" 2>&1 || true
+          done
+          echo '=== DOCKER ==='; docker version || true; docker info || true
+          echo '=== DOCKER CHECKPOINT COMMAND ==='; docker checkpoint --help || true
+          echo '=== CRIU VERSION (before install) ==='; command -v criu && criu --version || true
+          echo '=== CGROUPS ==='; cat /proc/self/cgroup; stat -fc %T /sys/fs/cgroup
+          echo '=== SECURITY ==='; grep -E '^(Cap|Seccomp|NoNewPrivs)' /proc/self/status || true
 
-          OUT = pathlib.Path(os.environ['OUT']); OUT.mkdir(exist_ok=True)
-          IMAGE = os.environ['IMAGE']
-          REPS = int(os.environ.get('REPS','3'))
-          if not 1 <= REPS <= 10: raise ValueError('repetitions must be 1..10')
-          PREFIX = 'v8-fidelity-' + os.environ.get('GITHUB_RUN_ID','local') + '-'
-          BASE = PREFIX + 'base'
-          SNAP = PREFIX + 's0'
-          RESULTS = []
-          EVENTS = []
-          CONTAINERS = []
-          def log(kind, **data):
-              e = {'at':datetime.datetime.now(datetime.timezone.utc).isoformat(), 'kind':kind, **data}
-              EVENTS.append(e)
-              print(json.dumps(e, sort_keys=True, default=str), flush=True)
-              (OUT/'events.json').write_text(json.dumps(EVENTS, indent=2, default=str))
-          def cmd(args, *, check=True, timeout=120, label=None):
-              start=time.monotonic()
+      - name: Install checkpoint tools and record versions
+        shell: bash
+        run: |
+          set -uo pipefail
+          { sudo apt-get update; sudo DEBIAN_FRONTEND=noninteractive apt-get install -y criu jq; } 2>&1 | tee evidence/criu-install.log
+          { echo '=== CRIU ==='; criu --version || true; echo '=== CRIU CHECK ==='; sudo criu check -v 4 || true; echo '=== DOCKER EXPERIMENTAL ==='; docker info --format '{{json .}}' | jq '{ServerVersion, ExperimentalBuild, SecurityOptions, CgroupVersion, Driver, Runtimes}' || true; } 2>&1 | tee evidence/criu-preflight.log
+
+      - name: Pull pinned V8 image and inspect executable availability
+        shell: bash
+        run: |
+          set -uo pipefail
+          { echo "IMAGE=$IMAGE"; docker pull "$IMAGE"; docker image inspect "$IMAGE"; echo '=== D8 CANDIDATES ==='; docker run --rm --entrypoint /bin/sh "$IMAGE" -c 'pwd; id; command -v d8 || true; find / -type f \( -name d8 -o -name "d8.*" \) 2>/dev/null | head -n 30' || true; } 2>&1 | tee evidence/v8-image-inspection.log
+
+      - name: Run native V8 heap-and-JIT continuity test with Docker checkpoint/restore
+        id: experiment
+        shell: bash
+        run: |
+          set -uo pipefail
+          cat > /tmp/checkpoint_probe.py <<'PY'
+          import datetime, hashlib, json, os, pathlib, shlex, subprocess, sys, time, traceback
+          root=pathlib.Path('evidence'); root.mkdir(exist_ok=True)
+          image=os.environ['IMAGE']; warmup=max(2,min(30,int(os.environ.get('WARMUP','8'))))
+          result={'image':image,'started_utc':datetime.datetime.now(datetime.timezone.utc).isoformat(),'tests':{},'caveats':[]}
+          def run(label,cmd,timeout=120):
+              print('\n'+'='*110,flush=True); print('COMMAND:',label,'\nARGV:',repr(cmd),'\nTIME:',datetime.datetime.now(datetime.timezone.utc).isoformat(),flush=True)
+              t=time.monotonic()
               try:
-                  p=subprocess.run(args,text=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=timeout)
-                  rc=p.returncode; stdout=p.stdout; stderr=p.stderr
-              except subprocess.TimeoutExpired as exc:
-                  rc=124; stdout=str(exc.stdout or ''); stderr='TIMEOUT: '+str(exc)
-              duration=round(time.monotonic()-start,4)
-              log('command',label=label or ' '.join(args[:3]),argv=args,exit=rc,duration_s=duration,stdout=stdout[-10000:],stderr=stderr[-5000:])
-              if check and rc: raise RuntimeError(f'command failed ({rc}): {args!r}: {stderr[-600:]}')
-              return rc,stdout.strip(),duration
-          def test(name, ok, detail, **extra):
-              r={'test':name,'pass':bool(ok),'detail':detail,**extra}; RESULTS.append(r)
-              log('assertion',**r)
-          def docker_exec(name, script, check=True):
-              return cmd(['docker','exec',name,'/bin/sh','-c',script],check=check,label='exec '+name)
-          def get_file(name,path):
-              return docker_exec(name,'cat '+path)[1]
-          def sha_bytes(data): return hashlib.sha256(data.encode()).hexdigest()
-          def start_container(name,image):
-              CONTAINERS.append(name)
-              cmd(['docker','run','-d','--name',name,'--network','none','--memory','4g','--memory-swap','4g','--pids-limit','256','--entrypoint','/bin/sh',image,'-c','while :; do sleep 3600; done'],timeout=60,label='start '+name)
-          def inspect(name):
-              return json.loads(cmd(['docker','inspect',name,'--format','{{json .}}'],label='inspect '+name)[1])
-          def snapshot_tree(name):
-              # Canonicalize by path and contents, excluding file metadata not modeled by this test.
-              script="find /tmp/agent-replay -type f -print | LC_ALL=C sort | while IFS= read -r f; do sha256sum \"$f\"; done"
-              return docker_exec(name,script)[1]
-          def cgroup(name):
-              return docker_exec(name,'for f in /sys/fs/cgroup/memory.current /sys/fs/cgroup/memory.peak /sys/fs/cgroup/memory.events; do echo "$f"; cat "$f" 2>/dev/null || true; done',check=False)[1]
-          failed=False
+                  p=subprocess.run(cmd,text=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=timeout)
+                  rc=p.returncode; out=p.stdout; err=p.stderr
+              except subprocess.TimeoutExpired as e:
+                  rc=124; out=(e.stdout or b'').decode(errors='replace') if isinstance(e.stdout,bytes) else (e.stdout or ''); err=(e.stderr or b'').decode(errors='replace') if isinstance(e.stderr,bytes) else (e.stderr or '')
+              elapsed=time.monotonic()-t
+              (root/(label+'.stdout.txt')).write_text(out); (root/(label+'.stderr.txt')).write_text(err)
+              print('EXIT:',rc,'ELAPSED_SEC:',round(elapsed,3),'\nSTDOUT:\n',out[-16000:],'\nSTDERR:\n',err[-16000:],flush=True)
+              return rc,out,err
+          def record(key,passed,detail):
+              result['tests'][key]={'passed':bool(passed),'detail':detail}; print(('PASS' if passed else 'FAIL')+' '+key+' '+str(detail),flush=True)
+          name='v8-criu-fidelity-'+os.environ.get('GITHUB_RUN_ID','local')
           try:
-              log('configuration',image=IMAGE,repetitions=REPS,runner=os.environ.get('RUNNER_NAME'),run_id=os.environ.get('GITHUB_RUN_ID'),guarantee='Docker commit filesystem only; not process memory, volumes, or external state')
-              cmd(['docker','version'],label='docker version')
-              cmd(['docker','info','--format','{{json .}}'],label='docker info')
-              cmd(['docker','pull',IMAGE],timeout=360,label='pull V8 image')
-              digest=cmd(['docker','image','inspect',IMAGE,'--format','{{index .RepoDigests 0}}'],label='source digest')[1]
-              log('provenance',digest=digest)
-              start_container(BASE,IMAGE)
-              docker_exec(BASE,"mkdir -p /tmp/agent-replay/sub && printf 'origin=clean\\nstep=0\\n' > /tmp/agent-replay/state.txt && printf 'nested\\n' > /tmp/agent-replay/sub/other.txt && chmod 640 /tmp/agent-replay/state.txt && ln -s state.txt /tmp/agent-replay/link")
-              # Keep a live shell process with mutable shell state to show that docker commit does not preserve it.
-              docker_exec(BASE,"/bin/sh -c 'SECRET_PROCESS_STATE=alive; export SECRET_PROCESS_STATE; while :; do sleep 1; done' >/tmp/agent-replay/worker.log 2>&1 & echo $! > /tmp/agent-replay/worker.pid")
-              before=snapshot_tree(BASE)
-              mode_before=docker_exec(BASE,'stat -c %a /tmp/agent-replay/state.txt')[1]
-              symlink_before=docker_exec(BASE,'readlink /tmp/agent-replay/link')[1]
-              pid_before=get_file(BASE,'/tmp/agent-replay/worker.pid')
-              docker_exec(BASE,'kill -0 "$(cat /tmp/agent-replay/worker.pid)"')
-              log('baseline',tree=before,tree_sha256=sha_bytes(before),mode=mode_before,symlink=symlink_before,worker_pid=pid_before,cgroup=cgroup(BASE))
-              _,snap_id,commit_time=cmd(['docker','commit',BASE,SNAP],timeout=180,label='CAPTURE S0 docker commit')
-              test('checkpoint created',bool(snap_id.startswith('sha256:')),'Docker commit produced image ID',image_id=snap_id,seconds=commit_time)
-              # Mutate the source after S0, including changes to existing files, deletion, and addition.
-              docker_exec(BASE,"printf 'origin=changed\\nstep=1\\n' > /tmp/agent-replay/state.txt; rm /tmp/agent-replay/sub/other.txt; printf 'new file\\n' > /tmp/agent-replay/added.txt; chmod 777 /tmp/agent-replay/state.txt")
-              changed=snapshot_tree(BASE)
-              test('source changed after capture',changed!=before,'Baseline and mutated source differ',before_sha=sha_bytes(before),after_sha=sha_bytes(changed))
-              restore_times=[]; restored_hashes=[]
-              for i in range(REPS):
-                  name=PREFIX+'restore-'+str(i)
-                  _,_,elapsed=cmd(['docker','run','-d','--name',name,'--network','none','--memory','4g','--memory-swap','4g','--pids-limit','256','--entrypoint','/bin/sh',SNAP,'-c','while :; do sleep 3600; done'],timeout=60,label=f'RESTORE {i} from S0')
-                  CONTAINERS.append(name); restore_times.append(elapsed)
-                  actual=snapshot_tree(name); restored_hashes.append(sha_bytes(actual))
-                  test(f'restore {i}: file content exact',actual==before,'Canonical file paths and SHA-256 hashes match baseline',expected=sha_bytes(before),actual=sha_bytes(actual))
-                  test(f'restore {i}: permissions exact',docker_exec(name,'stat -c %a /tmp/agent-replay/state.txt')[1]==mode_before,'POSIX mode restored')
-                  test(f'restore {i}: symlink exact',docker_exec(name,'readlink /tmp/agent-replay/link')[1]==symlink_before,'Symlink target restored')
-                  test(f'restore {i}: post-checkpoint addition absent',docker_exec(name,'test ! -e /tmp/agent-replay/added.txt',check=False)[0]==0,'Added file not present in S0')
-                  test(f'restore {i}: post-checkpoint deletion reversed',docker_exec(name,'test -f /tmp/agent-replay/sub/other.txt',check=False)[0]==0,'Deleted file restored from S0')
-                  # Process state is deliberately not expected to survive.
-                  pid_file=get_file(name,'/tmp/agent-replay/worker.pid')
-                  rc,_,_=docker_exec(name,'test -d /proc/"$(cat /tmp/agent-replay/worker.pid)" && tr "\\000" " " < /proc/"$(cat /tmp/agent-replay/worker.pid)"/cmdline | grep -q SECRET_PROCESS_STATE',check=False)
-                  log('process_state_limitation',restore=i,recorded_pid=pid_file,original_worker_not_restored=(rc!=0),note='PID reuse and command-line matching are imperfect; Docker commit is documented not to checkpoint processes')
-                  log('restore_resource_metrics',restore=i,cgroup=cgroup(name),container_state=inspect(name).get('State',{}))
-                  # Branch from restored state, without affecting S0 image.
-                  docker_exec(name,f"printf 'branch={i}\\n' > /tmp/agent-replay/branch.txt")
-                  test(f'branch {i}: state diverges',snapshot_tree(name)!=before,'Branch modification changes the tree')
-              test('repeated restore determinism',len(set(restored_hashes))==1,'All restored file-content hashes agree',hashes=restored_hashes)
-              log('timing_summary',capture_seconds=commit_time,restore_start_seconds=restore_times,average_restore_start_seconds=round(sum(restore_times)/len(restore_times),4),warning='Restore startup time is not total workload-ready time')
-              test('source remains mutated',snapshot_tree(BASE)==changed,'Restoring S0 did not mutate the original container')
-          except Exception as exc:
-              failed=True; log('fatal',error=repr(exc),traceback=traceback.format_exc())
+              # This JS mutates a live heap object, exercises hot function calls, and emits monotonically increasing markers.
+              js='''let count=0; let heap={token:"V8-HEAP-STATE-UNIQUE-6f8c", history:[]}; function hot(x){return (x*17+3)|0;} while(true){count++; let value=hot(count); if(count%500000===0){heap.history.push(value); if(heap.history.length>40)heap.history.shift(); print("V8_LIVE_MARKER count="+count+" heap="+heap.token+" value="+value+" history="+heap.history.length); } }'''
+              (root/'probe.js').write_text(js)
+              # Locate a real d8 binary; do not substitute a fake executable.
+              rc,out,_=run('locate-d8',['docker','run','--rm','--entrypoint','/bin/sh',image,'-c','command -v d8 || find / -type f -name d8 2>/dev/null | head -n 1'],120)
+              path=next((x.strip() for x in out.splitlines() if x.strip().startswith('/') and ' ' not in x.strip()),None)
+              if not path:
+                  record('real_v8_binary_present',False,'No d8 found; no real V8 execution claim permitted'); return_code=0
+              else:
+                  record('real_v8_binary_present',True,path)
+                  run('remove-old-container',['docker','rm','-f',name],30)
+                  # Mount JS from workspace: Docker checkpoint cannot preserve external file mutations, so keep it immutable.
+                  script=str((root/'probe.js').resolve())
+                  cmd=['docker','run','-d','--name',name,'--memory','4g','--cpus','2','-v',script+':/tmp/checkpoint_probe.js:ro','--entrypoint',path,image,'/tmp/checkpoint_probe.js']
+                  rc,_,_=run('start-real-v8',cmd,90)
+                  if rc:
+                      record('real_v8_started',False,'d8 invocation failed; inspect command stderr')
+                  else:
+                      time.sleep(warmup)
+                      rc,logs,_=run('before-checkpoint-logs',['docker','logs','--tail','80',name],30)
+                      marker_lines=[l for l in logs.splitlines() if 'V8_LIVE_MARKER count=' in l]
+                      running=run('before-checkpoint-inspect',['docker','inspect','-f','{{.State.Running}} {{.State.Pid}} {{.State.ExitCode}}',name],30)[1]
+                      record('real_v8_running',bool(marker_lines) and 'true' in running,{'markers':len(marker_lines),'inspect':running.strip()})
+                      if marker_lines and 'true' in running:
+                          last=marker_lines[-1]
+                          print('LAST PRE-CHECKPOINT MARKER:',last,flush=True)
+                          # IMPORTANT: this is a real process-memory checkpoint attempt, not docker commit.
+                          rc,_,err=run('docker-checkpoint-create',['docker','checkpoint','create',name,'checkpoint0'],180)
+                          record('docker_checkpoint_create',rc==0,err[-2000:])
+                          if rc==0:
+                              run('checkpoint-container-inspect',['docker','inspect',name],30)
+                              rc,_,err=run('docker-checkpoint-restore',['docker','start','--checkpoint','checkpoint0',name],180)
+                              record('docker_checkpoint_restore',rc==0,err[-2000:])
+                              if rc==0:
+                                  time.sleep(3)
+                                  _,after,_=run('after-restore-logs',['docker','logs','--tail','150',name],30)
+                                  post=[l for l in after.splitlines() if 'V8_LIVE_MARKER count=' in l]
+                                  def extract(line):
+                                      try:return int(line.split('count=')[1].split()[0])
+                                      except Exception:return -1
+                                  before_count=extract(last)
+                                  after_count=max((extract(l) for l in post),default=-1)
+                                  record('heap_execution_continuity',after_count>before_count and 'V8-HEAP-STATE-UNIQUE-6f8c' in after,{'before_count':before_count,'after_max_count':after_count,'note':'Log persistence alone is insufficient; post-checkpoint count must advance.'})
+                                  record('process_alive_after_restore','true' in run('after-restore-inspect',['docker','inspect','-f','{{.State.Running}} {{.State.Pid}}',name],30)[1],'Inspect state')
+                          else:
+                              result['caveats'].append('Docker daemon may not enable CRIU checkpoint/restore on GitHub-hosted runners; see checkpoint stderr. This is an environment feasibility result, not proof the approach is impossible.')
+          except Exception as e:
+              traceback.print_exc(); result['exception']=repr(e)
           finally:
-              for name in reversed(CONTAINERS): cmd(['docker','rm','-f',name],check=False,timeout=30,label='cleanup '+name)
-              cmd(['docker','image','rm',SNAP],check=False,timeout=60,label='cleanup snapshot')
-              report={'source_image':IMAGE,'repetitions':REPS,'passed':sum(x['pass'] for x in RESULTS),'failed':sum(not x['pass'] for x in RESULTS),'fatal':failed,'tests':RESULTS,'limitations':['No V8 JavaScript execution in this workflow','No CRIU or VM memory checkpoint','No Docker volumes or external network state checkpoint','Content hash comparison excludes timestamps, ownership, xattrs, and directory metadata','Docker commit snapshot is deleted after run; artifact contains evidence, not image']}
-              (OUT/'results.json').write_text(json.dumps(report,indent=2))
-              with (OUT/'summary.md').open('w') as f:
-                  f.write('# V8 checkpoint fidelity\n\n')
-                  f.write(f"**PASS:** {report['passed']} / {len(RESULTS)} assertions; fatal={failed}\n\n")
-                  f.write('| Test | Result | Detail |\n|---|---|---|\n')
-                  for r in RESULTS: f.write(f"| {r['test']} | {'PASS' if r['pass'] else 'FAIL'} | {r['detail']} |\n")
-                  f.write('\n## Limitations\n')
-                  for x in report['limitations']: f.write('- '+x+'\n')
-              summary=os.environ.get('GITHUB_STEP_SUMMARY')
-              if summary:
-                  with open(summary,'a') as f: f.write((OUT/'summary.md').read_text())
-              print((OUT/'summary.md').read_text())
-              if failed or any(not x['pass'] for x in RESULTS): sys.exit(1)
+              run('cleanup',['docker','rm','-f',name],45)
+              result['finished_utc']=datetime.datetime.now(datetime.timezone.utc).isoformat()
+              (root/'report.json').write_text(json.dumps(result,indent=2))
+              print('\n'+'#'*110+'\nFINAL MACHINE-READABLE REPORT\n'+json.dumps(result,indent=2)+'\n'+'#'*110,flush=True)
           PY
-          python3 /tmp/checkpoint_fidelity.py
+          python3 -u /tmp/checkpoint_probe.py 2>&1 | tee evidence/full-execution-console.log
+          # Do not hide feasibility failure: preserve artifacts and set the job outcome after upload.
+          python3 - <<'PY'
+          import json,os
+          p=json.load(open('evidence/report.json'))
+          required=['real_v8_binary_present','real_v8_running','docker_checkpoint_create','docker_checkpoint_restore','heap_execution_continuity','process_alive_after_restore']
+          good=all(p['tests'].get(k,{}).get('passed',False) for k in required)
+          with open(os.environ['GITHUB_OUTPUT'],'a') as f:f.write(f'feasible={str(good).lower()}\n')
+          print('FULL_EXECUTION_CHECKPOINT_FEASIBLE=',good)
+          PY
 
-      - name: Upload complete evidence even if tests fail
+      - name: Explain results in GitHub summary
+        if: always()
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json,os,pathlib
+          p=pathlib.Path('evidence/report.json')
+          lines=['# Full V8 execution checkpoint feasibility','', '**Scope:** Live `d8` process checkpoint/restore via Docker/CRIU, not filesystem-only `docker commit`.','', '| Assertion | Outcome |','|---|---|']
+          if p.exists():
+              d=json.loads(p.read_text())
+              for k,v in d.get('tests',{}).items():lines.append(f"| `{k}` | {'PASS' if v['passed'] else 'FAIL'} |")
+              lines+=['','**Interpretation:** Failure on GitHub-hosted runners may reflect unavailable kernel/daemon checkpoint features. Success demonstrates continuity for this V8 probe only, not fidelity for every ExploitGym target, network socket, or agent process.','', '**Next validation:** Repeat checkpoint/restore at multiple pause points; verify object/heap contents, open FDs, sockets, threads, ASLR, JIT state, and exploit outcomes; repeat on self-hosted Linux with configured CRIU.']
+          else:lines+=['','No report generated; inspect logs.']
+          with open(os.environ['GITHUB_STEP_SUMMARY'],'a') as f:f.write('\n'.join(lines)+'\n')
+          PY
+
+      - name: Upload all evidence including failure diagnostics
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: v8-checkpoint-fidelity-evidence
-          path: checkpoint-evidence/
+          name: v8-full-execution-checkpoint-evidence
+          path: evidence/
           if-no-files-found: warn
-          retention-days: 30
+          retention-days: 14
+
+      - name: Mark experiment failed when real execution checkpoint is unproven
+        if: always() && steps.experiment.outputs.feasible != 'true'
+        shell: bash
+        run: |
+          echo 'FAIL-CLOSED: Full V8 execution checkpoint continuity was NOT demonstrated. Read uploaded evidence and job summary.'
+          exit 1
