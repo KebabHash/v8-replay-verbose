@@ -1,276 +1,109 @@
-name: V8 ExploitGym - Verbose Memory and Replay Diagnostics
+name: V8 ExploitGym - Capture Restore Branch
 on:
   workflow_dispatch:
-    inputs:
-      min_available_gib:
-        description: 'Minimum MemAvailable before pulling image (GiB; planning threshold)'
-        required: false
-        default: '5'
-      container_memory_gib:
-        description: 'Docker hard memory limit (GiB)'
-        required: false
-        default: '4'
-      host_reserve_gib:
-        description: 'RAM to reserve for host and Docker (GiB)'
-        required: false
-        default: '2'
   push:
     paths:
-      - '.github/workflows/v8-replay-verbose.yml'
+      - '.github/workflows/v8-capture-restore.yml'
 permissions:
   contents: read
 jobs:
-  diagnostics:
+  capture-restore:
     runs-on: ubuntu-latest
-    timeout-minutes: 55
+    timeout-minutes: 30
     env:
       V8_IMAGE: cybergym/v8:human-446124892-nosandbox-buildable
-      MIN_AVAILABLE_GIB: ${{ inputs.min_available_gib || '5' }}
-      CONTAINER_MEMORY_GIB: ${{ inputs.container_memory_gib || '4' }}
-      HOST_RESERVE_GIB: ${{ inputs.host_reserve_gib || '2' }}
     steps:
-      - name: Memory suitability, V8 inspection, recording and replay
+      - name: Capture S0, branch A, restore S0, branch B, verify
         shell: python
         run: |
-          import datetime as dt
-          import hashlib
-          import json
-          import os
-          import pathlib
-          import platform
-          import re
-          import shutil
-          import subprocess
-          import sys
-          import time
-          import traceback
-
-          OUT = pathlib.Path('v8-replay-artifacts')
-          OUT.mkdir(exist_ok=True)
-          LOG = OUT / 'verbose.log'
-          IMAGE = os.environ['V8_IMAGE']
-          TASK = 'v8:human/446124892'
-          GiB = 1024 ** 3
-          checks = []
+          import datetime, hashlib, json, os, pathlib, subprocess, time, traceback
+          out = pathlib.Path('capture-restore-artifacts')
+          out.mkdir(exist_ok=True)
           events = []
-          commands = []
-          status = 'FAIL'
-          failure = None
-          def log(message):
-              line = f"[{dt.datetime.now(dt.timezone.utc).isoformat()}] {message}"
-              print(line, flush=True)
-              with LOG.open('a') as f:
-                  f.write(line + '\n')
-          def check(name, level, detail):
-              checks.append({'check': name, 'status': level, 'detail': str(detail)})
-              log(f'[{level}] {name}: {detail}')
-          def command(args, timeout=60, max_output=100000):
-              log('$ ' + ' '.join(map(str, args)))
+          containers = []
+          images = []
+          image = os.environ['V8_IMAGE']
+          def log(kind, **fields):
+              event = {'time': datetime.datetime.now(datetime.timezone.utc).isoformat(), 'kind': kind, **fields}
+              events.append(event)
+              print(json.dumps(event, sort_keys=True), flush=True)
+              (out / 'events.json').write_text(json.dumps(events, indent=2))
+          def run(args, check=True, timeout=180):
               start = time.monotonic()
-              try:
-                  p = subprocess.run(args, text=True, stdout=subprocess.PIPE,
-                                     stderr=subprocess.STDOUT, timeout=timeout, errors='replace')
-                  result = {'argv': args, 'exit_code': p.returncode,
-                            'elapsed_seconds': round(time.monotonic()-start, 3),
-                            'output': p.stdout[-max_output:]}
-              except (subprocess.TimeoutExpired, OSError) as e:
-                  result = {'argv': args, 'exit_code': None,
-                            'elapsed_seconds': round(time.monotonic()-start, 3),
-                            'error': repr(e), 'output': ''}
-              commands.append(result)
-              log(f"exit={result['exit_code']} duration={result['elapsed_seconds']}s")
-              if result['output']:
-                  for line in result['output'][:12000].splitlines():
-                      log('  ' + line)
-              return result
-          def meminfo():
-              data = {}
-              for line in pathlib.Path('/proc/meminfo').read_text().splitlines():
-                  m = re.match(r'^(\w+):\s+(\d+)\s+kB', line)
-                  if m:
-                      data[m.group(1)] = int(m.group(2)) * 1024
-              return data
-          def cgroup(path):
-              p = pathlib.Path(path)
-              return p.read_text().strip() if p.exists() else 'unavailable'
-          def gb(n):
-              return round(n / GiB, 2)
-          def positive(name):
-              value = float(os.environ[name])
-              if not (0.25 <= value <= 1024):
-                  raise ValueError(f'{name} must be between 0.25 and 1024 GiB')
-              return value
+              p = subprocess.run(args, capture_output=True, text=True, errors='replace', timeout=timeout)
+              log('command', argv=args, code=p.returncode, duration_s=round(time.monotonic()-start, 3),
+                  stdout=p.stdout[-10000:], stderr=p.stderr[-10000:])
+              if check and p.returncode:
+                  raise RuntimeError(f'command failed: {args}: {p.stderr[-1000:]}')
+              return p.stdout.strip()
+          def sha(data):
+              return hashlib.sha256(data.encode()).hexdigest()
+          def start(name, base):
+              run(['docker', 'run', '-d', '--name', name, '--network', 'none', '--memory', '4g',
+                   '--memory-swap', '4g', '--pids-limit', '256', '--entrypoint', '/bin/sh', base,
+                   '-c', 'while :; do sleep 3600; done'])
+              containers.append(name)
+              return name
+          def script(container, code):
+              return run(['docker', 'exec', container, '/bin/sh', '-c', code])
+          def state(container):
+              # A deliberately controlled workspace: no volumes, external services, or processes included.
+              return script(container, 'cd /tmp/agent-replay && sha256sum state.txt && cat state.txt')
           try:
-              log('===== TARGET / ENVIRONMENT =====')
-              log(f'task={TASK} image={IMAGE}')
-              log(f'python={sys.version.split()[0]} os={platform.platform()} architecture={platform.machine()}')
-              log(f'github_runner={os.getenv("RUNNER_NAME", "unknown")} runner_os={os.getenv("RUNNER_OS", "unknown")}')
-              min_avail = positive('MIN_AVAILABLE_GIB')
-              container_gib = positive('CONTAINER_MEMORY_GIB')
-              reserve_gib = positive('HOST_RESERVE_GIB')
-              log(f'Configured thresholds: minimum available={min_avail}GiB; container limit={container_gib}GiB; host reserve={reserve_gib}GiB')
-              log('These are configurable planning thresholds, NOT validated V8/ExploitGym minimum requirements.')
-
-              log('===== HOST MEMORY / CGROUP / DISK =====')
-              m = meminfo()
-              total = m['MemTotal']
-              available = m.get('MemAvailable', m['MemFree'])
-              swap_total = m.get('SwapTotal', 0)
-              swap_free = m.get('SwapFree', 0)
-              disk = shutil.disk_usage('.')
-              host = {'total_gib': gb(total), 'available_gib': gb(available),
-                      'swap_total_gib': gb(swap_total), 'swap_free_gib': gb(swap_free),
-                      'disk_free_gib': gb(disk.free), 'cpu_count': os.cpu_count(),
-                      'architecture': platform.machine(),
-                      'cgroup_memory_max': cgroup('/sys/fs/cgroup/memory.max'),
-                      'cgroup_memory_current': cgroup('/sys/fs/cgroup/memory.current'),
-                      'cgroup_memory_events': cgroup('/sys/fs/cgroup/memory.events'),
-                      'overcommit_memory': cgroup('/proc/sys/vm/overcommit_memory'),
-                      'overcommit_ratio': cgroup('/proc/sys/vm/overcommit_ratio'),
-                      'randomize_va_space': cgroup('/proc/sys/kernel/randomize_va_space')}
-              log(json.dumps(host, indent=2))
-              if available < min_avail * GiB:
-                  check('available memory threshold', 'FAIL', f'{gb(available)} GiB < configured {min_avail} GiB')
-              else:
-                  check('available memory threshold', 'PASS', f'{gb(available)} GiB >= {min_avail} GiB')
-              if available < (container_gib + reserve_gib) * GiB:
-                  check('container plus host reserve', 'FAIL', f'{gb(available)} GiB < {container_gib}+{reserve_gib} GiB')
-              else:
-                  check('container plus host reserve', 'PASS', 'Sufficient currently available RAM for configured limit and reserve')
-              if platform.machine() not in ('x86_64', 'AMD64'):
-                  check('V8 target architecture', 'FAIL', 'This workflow expects an x86-64 Linux V8 image')
-              else:
-                  check('V8 target architecture', 'PASS', 'x86-64 host')
-              if swap_total == 0:
-                  check('swap availability', 'WARN', 'No host swap; container also explicitly disables additional swap')
-              else:
-                  check('swap availability', 'PASS', f'{gb(swap_total)} GiB host swap (container swap still disabled)')
-              if disk.free < 8 * GiB:
-                  check('free disk space', 'FAIL', f'{gb(disk.free)} GiB < 8 GiB pre-pull planning threshold')
-              else:
-                  check('free disk space', 'PASS', f'{gb(disk.free)} GiB')
-              if any(c['status'] == 'FAIL' for c in checks):
-                  raise RuntimeError('Host suitability gate failed; no image pulled')
-
-              log('===== DOCKER DAEMON =====')
-              info = command(['docker', 'info', '--format', '{{json .}}'], timeout=30)
-              if info['exit_code'] != 0:
-                  raise RuntimeError('Docker daemon unavailable')
-              try:
-                  docker_info = json.loads(info['output'])
-                  log(f"docker architecture={docker_info.get('Architecture')} total memory={gb(docker_info.get('MemTotal', 0))}GiB")
-              except (ValueError, TypeError):
-                  docker_info = {}
-                  check('docker info parsing', 'WARN', 'Could not parse daemon JSON')
-              command(['docker', 'version'], timeout=30)
-
-              log('===== IMAGE PULL / DIGEST =====')
-              pull = command(['docker', 'pull', IMAGE], timeout=1200)
-              if pull['exit_code'] != 0:
-                  raise RuntimeError('Docker pull failed')
-              inspect = command(['docker', 'image', 'inspect', IMAGE, '--format', '{{json .}}'], timeout=30)
-              if inspect['exit_code'] != 0:
-                  raise RuntimeError('Image inspection failed')
-              metadata = json.loads(inspect['output'])
-              image_size_gib = gb(metadata.get('Size', 0))
-              log(f"image_size={image_size_gib}GiB repo_digests={metadata.get('RepoDigests')}")
-              image_arch = metadata.get('Architecture')
-              if image_arch != 'amd64':
-                  check('image architecture', 'FAIL', f'Expected amd64, found {image_arch}')
-                  raise RuntimeError('Image architecture mismatch')
-              check('image architecture', 'PASS', 'amd64')
-              log('Image size is DISK usage, not runtime resident memory.')
-              post_pull_disk = shutil.disk_usage('.')
-              log(f'post_pull_free_disk_gib={gb(post_pull_disk.free)}')
-
-              log('===== CONTAINER MEMORY MODEL =====')
-              memory_bytes = int(container_gib * GiB)
-              # --memory-swap equal to --memory means no additional swap allowance.
-              base = ['docker', 'run', '--rm', '--network', 'none', '--read-only',
-                      '--memory', str(memory_bytes), '--memory-swap', str(memory_bytes),
-                      '--pids-limit', '256', '--security-opt', 'no-new-privileges',
-                      '--entrypoint', '/bin/sh', IMAGE, '-c']
-              script = (
-                  'echo "=== container uname ==="; uname -a; '
-                  'echo "=== memory ==="; cat /proc/meminfo | head -25; '
-                  'echo "=== cgroup ==="; '
-                  'for f in /sys/fs/cgroup/memory.max /sys/fs/cgroup/memory.current '
-                  '/sys/fs/cgroup/memory.swap.max /sys/fs/cgroup/memory.events; '
-                  'do echo "$f"; cat "$f" 2>/dev/null || true; done; '
-                  'echo "=== v8 build metadata ==="; '
-                  'ls -l /challenge/d8 /challenge/REVISION /challenge/args.gn 2>&1 || true; '
-                  'cat /challenge/REVISION 2>/dev/null || true; '
-                  'cat /challenge/args.gn 2>/dev/null || true; '
-                  'echo "=== d8 version ==="; '
-                  'if [ -x /challenge/d8 ]; then /challenge/d8 --version; '
-                  'else echo "NO_EXECUTABLE_D8_AT_EXPECTED_PATH"; fi'
-              )
-              request = base + [script]
-              observed = command(request, timeout=180)
-              events.append({'kind': 'tool', 'request': request, 'response': observed})
-              if observed['exit_code'] != 0:
-                  check('V8 container smoke test', 'FAIL', f"exit code={observed['exit_code']}")
-                  raise RuntimeError('V8 inspection command failed')
-              if 'NO_EXECUTABLE_D8_AT_EXPECTED_PATH' in observed['output']:
-                  check('d8 executable path', 'WARN', 'Expected /challenge/d8 missing; inspect image layout before actual V8 execution')
-              else:
-                  check('d8 executable path', 'PASS', 'Executable at /challenge/d8; version command attempted')
-              if 'memory.max' in observed['output']:
-                  check('container cgroup visibility', 'PASS', 'Cgroup memory files visible in container output')
-              else:
-                  check('container cgroup visibility', 'WARN', 'No cgroup memory.max observed; limits need independent confirmation')
-              if 'v8_enable_pointer_compression' not in observed['output']:
-                  check('pointer compression build flag', 'WARN', 'Not proven by available args.gn; do not infer from architecture')
-              else:
-                  check('pointer compression build flag', 'PASS', 'Flag text found; inspect value in verbose.log')
-              if 'v8_enable_sandbox' not in observed['output']:
-                  check('V8 sandbox build flag', 'WARN', 'Not proven by available args.gn; image tag alone is not proof')
-              else:
-                  check('V8 sandbox build flag', 'PASS', 'Flag text found; inspect value in verbose.log')
-
-              log('===== RECORD AND TRANSCRIPT REPLAY =====')
-              trace = {'schema_version': 2, 'task_id': TASK, 'image': IMAGE,
-                       'image_id': metadata.get('Id'), 'repo_digests': metadata.get('RepoDigests'),
-                       'host': host, 'events': events}
-              (OUT/'trajectory.json').write_text(json.dumps(trace, indent=2))
-              replay = json.loads((OUT/'trajectory.json').read_text())
-              assert replay['events'] == events
-              assert replay['task_id'] == TASK
-              check('transcript replay equality', 'PASS', 'JSON record/replay matches; zero Docker calls in replay')
-              status = 'PASS'
+              log('start', task='v8:human/446124892', image=image,
+                  guarantee='filesystem snapshot and restart, NOT process-memory checkpoint')
+              run(['docker', 'pull', image], timeout=600)
+              digest = run(['docker', 'image', 'inspect', image, '--format', '{{index .RepoDigests 0}}'])
+              log('provenance', digest=digest)
+              base = start('v8-capture-base', image)
+              script(base, 'mkdir -p /tmp/agent-replay && printf "origin=clean\\nstep=0\\n" > /tmp/agent-replay/state.txt')
+              s0 = state(base)
+              # Capture S0 as an immutable local Docker image. Running processes are NOT preserved.
+              snapshot = 'v8-agent-checkpoint:s0'
+              run(['docker', 'commit', base, snapshot])
+              images.append(snapshot)
+              log('capture', checkpoint='S0', snapshot=snapshot, state_sha256=sha(s0), state=s0)
+              # Branch A modifies workspace after S0.
+              script(base, 'printf "origin=clean\\nstep=1\\nchoice=A\\n" > /tmp/agent-replay/state.txt')
+              a = state(base)
+              log('branch', branch='A', state_sha256=sha(a), state=a)
+              # Restore S0 by creating a NEW container from the checkpoint image.
+              restored = start('v8-capture-restored', snapshot)
+              s0_restored = state(restored)
+              assert s0_restored == s0, 'RESTORE FAILED: S0 state differs'
+              assert s0_restored != a, 'RESTORE FAILED: branch A state leaked into restored environment'
+              log('restore', checkpoint='S0', exact_match=True, state_sha256=sha(s0_restored))
+              # Branch B starts from the restored S0 and diverges.
+              script(restored, 'printf "origin=clean\\nstep=1\\nchoice=B\\n" > /tmp/agent-replay/state.txt')
+              b = state(restored)
+              assert b != a and b != s0, 'BRANCH FAILED: expected distinct states'
+              log('branch', branch='B', state_sha256=sha(b), state=b)
+              result = {'task': 'v8:human/446124892', 'image_digest': digest,
+                        'checkpoint': 'Docker filesystem image', 's0': s0, 'branch_a': a,
+                        'restored_s0': s0_restored, 'branch_b': b,
+                        'restore_exact': s0 == s0_restored, 'branches_differ': a != b,
+                        'limitations': ['No agent LLM is invoked', 'No exploit attempted',
+                                        'No V8 process memory restored', 'No volumes or external state captured']}
+              (out / 'results.json').write_text(json.dumps(result, indent=2))
+              (out / 'image-digest.txt').write_text(digest + '\n')
+              print('CAPTURE / RESTORE / BRANCH: PASS', flush=True)
+              with open(os.environ.get('GITHUB_STEP_SUMMARY', '/dev/null'), 'a') as f:
+                  f.write('## V8 capture/restore/branch: PASS\n\n'
+                          f'- Image: `{digest}`\n- S0 restored exactly: **yes**\n'
+                          '- Branches A and B diverged: **yes**\n\n'
+                          'Filesystem-only demonstration; no process-memory restoration or exploit run.\n')
           except Exception as e:
-              failure = repr(e)
-              log('FATAL: ' + failure)
-              log(traceback.format_exc())
+              log('failure', error=str(e), traceback=traceback.format_exc())
+              raise
           finally:
-              summary = {'status': status, 'task_id': TASK, 'image': IMAGE,
-                         'checks': checks, 'failure': failure,
-                         'host': locals().get('host'), 'image_metadata': {
-                             'id': locals().get('metadata', {}).get('Id'),
-                             'repo_digests': locals().get('metadata', {}).get('RepoDigests'),
-                             'size_gib': locals().get('image_size_gib')},
-                         'commands': commands, 'recorded_events': len(events),
-                         'replay_external_calls': 0 if status == 'PASS' else None,
-                         'scope': 'V8 container inspection only; no agent, exploit, or VM-state replay'}
-              (OUT/'diagnostics.json').write_text(json.dumps(summary, indent=2))
-              if os.getenv('GITHUB_STEP_SUMMARY'):
-                  with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as f:
-                      f.write(f'## V8 memory/replay diagnostics: {status}\n\n')
-                      f.write(f'Image: `{IMAGE}`  \nTask: `{TASK}`\n\n')
-                      f.write('| Check | Status | Detail |\n|---|---|---|\n')
-                      for c in checks:
-                          f.write(f"| {c['check']} | {c['status']} | {c['detail'].replace('|', '/').replace(chr(10), ' ')} |\n")
-                      if failure:
-                          f.write(f'\n**Failure:** `{failure}`\n')
-                      f.write('\nThresholds are planning assumptions, not benchmark-certified minimums.\n')
-              log('===== FINAL SUMMARY =====')
-              log(json.dumps({'status': status, 'checks': checks, 'failure': failure}, indent=2))
-          if status != 'PASS':
-              raise SystemExit(1)
-      - name: Upload verbose diagnostics even on failure
+              for c in containers:
+                  run(['docker', 'rm', '-f', c], check=False)
+              for i in images:
+                  run(['docker', 'image', 'rm', i], check=False)
+      - name: Upload event log and verification results
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: v8-memory-replay-diagnostics
-          path: v8-replay-artifacts/
+          name: v8-capture-restore-evidence
+          path: capture-restore-artifacts/
           if-no-files-found: warn
