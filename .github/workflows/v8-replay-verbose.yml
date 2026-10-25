@@ -1,24 +1,39 @@
-# Self-contained, manual-only experiment for an ephemeral GitHub-hosted Linux runner.
-# CRIU 4.3 release commit: https://github.com/checkpoint-restore/criu/commit/2b7ac603cda31d015d91c856c34c557cb2300e7d
-# Upstream Noble packaging issue: https://github.com/checkpoint-restore/criu/issues/2404
-# Installation: https://criu.org/Installation
-# Docker checkpoint: https://docs.docker.com/reference/cli/docker/checkpoint/
-# upload-artifact pinned to v6.0.0 (Node 24); no checkout or API keys are needed.
-# This restarts Docker on the disposable runner. Do not move it to a shared host unchanged.
-# Local validation exercises syntax, installer failure paths, and the JS protocol;
-# it does not substitute for a real Docker/CRIU run on GitHub.
-name: V8 live checkpoint - source-built CRIU and strict continuity
+# Single file: put ONLY this YAML in .github/workflows/v8-checkpoint-atlas.yml.
+# All project Python, Bash, JavaScript, HTML and CSS are embedded below.
+# No checkout, companion files, Python packages, npm packages or API keys.
+# Internet is required for APT dependencies, pinned CRIU source, the pinned V8 image,
+# and the pinned upload-artifact action. This is NOT an air-gapped distribution.
+#
+# SECURITY/SCOPE: disposable GitHub-hosted Ubuntu runner only. Restarts Docker.
+# No network inside the target container, no Docker socket mount, no terminal/TTY.
+# seccomp and AppArmor are relaxed only for the test container to support CRIU.
+# Raw checkpoint images are not uploaded. Do not add secrets to the workload.
+# HTML rewind is evidence navigation; real restoration happens during this job.
+#
+# DEPENDENCY PROVENANCE:
+# https://github.com/checkpoint-restore/criu/commit/2b7ac603cda31d015d91c856c34c557cb2300e7d
+# https://docs.docker.com/reference/cli/docker/checkpoint/
+# https://raw.githubusercontent.com/sunblaze-ucb/exploitgym/main/data/tasks/v8/human/446124892/challenge/patch
+# https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax
+# Every run block is kept below GitHub's documented 21,000-character limit.
+#
+# LOCAL VALIDATION IS NOT A LIVE GITHUB/DOCKER/CRIU RESULT.
+name: V8 Checkpoint Atlas - self-contained and ultra verbose
 'on':
   workflow_dispatch:
     inputs:
       restore_rounds:
-        description: Sequential live checkpoint/restore rounds (1-5)
+        description: Sequential real checkpoint/restore rounds (1-5)
         type: string
         default: '2'
       warmup_seconds:
-        description: V8 warmup before each pause (1-30)
+        description: Work before each checkpoint boundary (1-30 seconds)
         type: string
         default: '3'
+      timed_gate_seconds:
+        description: Pause window for capture (15-180 seconds). Host waits out the gate while target is stopped.
+        type: string
+        default: '45'
 permissions:
   contents: read
 jobs:
@@ -26,22 +41,43 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     env:
+      BUNDLE_DIR: ${{ runner.temp }}/v8-checkpoint-atlas
       EVIDENCE_DIR: ${{ github.workspace }}/evidence
       IMAGE: cybergym/v8@sha256:d53b336a90e184fe61c2067342eb278f6d54d009d7b4d93b958029b86904e48a
       CRIU_VERSION: '4.3'
       CRIU_COMMIT: 2b7ac603cda31d015d91c856c34c557cb2300e7d
       RESTORE_ROUNDS: ${{ inputs.restore_rounds || '2' }}
       WARMUP: ${{ inputs.warmup_seconds || '3' }}
+      TIMED_GATE_SECONDS: ${{ inputs.timed_gate_seconds || '45' }}
+      HEARTBEAT_SECONDS: '5'
       PYTHONUNBUFFERED: '1'
       DOCKER_CLI_EXPERIMENTAL: enabled
     steps:
-    - name: Write the self-contained checkpoint controller
-      id: prepare
+    - name: Initialize the single-file package and evidence directory
+      id: initialize
       shell: bash
       run: |
         set -Eeuo pipefail
-        mkdir -p "$EVIDENCE_DIR"
-        cat > "$RUNNER_TEMP/checkpoint_probe.py" <<'PYPROBE'
+        mkdir -p "$BUNDLE_DIR" "$EVIDENCE_DIR" "$EVIDENCE_DIR/sources"
+        printf '
+        === V8 CHECKPOINT ATLAS: SINGLE YAML, FULL CONSOLE OUTPUT ===
+        '
+        printf 'All project code and HTML are embedded in this workflow. No checkout, pip, npm, CDN or model key is required.
+        '
+        printf 'Network is still required for APT build dependencies, pinned CRIU source, the V8 image and artifact upload.
+        '
+        printf 'Rewind in HTML inspects evidence; it does not control a live process.
+        '
+        printf 'Run: %s  attempt: %s  revision: %s
+        ' "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$GITHUB_SHA"
+        printf 'Evidence: %s
+        Sources: %s
+        ' "$EVIDENCE_DIR" "$BUNDLE_DIR"
+    - name: Embed checkpoint_probe.py [1/3]
+      shell: bash
+      run: |
+        set -Eeuo pipefail
+        cat > "$BUNDLE_DIR/checkpoint_probe.py" <<'EMBED_CHECKPOINT_PROBE_PY_1'
         import datetime
         import hashlib
         import json
@@ -57,11 +93,18 @@ jobs:
         import traceback
         import uuid
 
-        # The controller file contains only pause/continue instructions, never heap state.
-        # A cold restart generates a new token and reinitializes the heap.
-        PROBE_JS = r'''
-        "use strict";
-        const controlPath = "/tmp/v8-cp-control.txt";
+        # No removed shell file APIs are required. The native binary is not patched.
+        # Timed rendezvous: the tracked probe words stay unchanged during a wall-clock gate.
+        # The controller checkpoints before the gate expires, waits while STOPPED, then restores.
+        # Date/time is deliberately external and advancing; this is not clock replay.
+        PROBE_JS = r'''"use strict";
+        const CONFIG = __PROBE_CONFIG__;
+        const writeLine = (typeof globalThis.print === "function")
+          ? (s) => globalThis.print(s)
+          : (typeof globalThis.console === "object" && typeof globalThis.console.log === "function")
+            ? (s) => globalThis.console.log(s)
+            : null;
+        if (!writeLine) throw new Error("No supported output API: neither print nor console.log is available");
         const token = Array.from({length: 6}, () =>
           Math.floor(Math.random() * 4294967296).toString(16).padStart(8, "0")
         ).join("") + "-" + Date.now().toString(16);
@@ -72,24 +115,20 @@ jobs:
           seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0;
           heap[i] = seed;
         }
-        let tick = 0;
-        let hotResult = 0;
+        let tick = 0, hotResult = 0;
         function hot(x) { return (Math.imul(x ^ 0x12345678, 17) + 3) | 0; }
         function digest() {
           let h = 2166136261 >>> 0;
           for (let i = 0; i < heap.length; i++) h = Math.imul(h ^ heap[i], 16777619) >>> 0;
           return h.toString(16).padStart(8, "0");
         }
-        function snapshot(event, ticket) {
-          const result = {event, ticket, token, tick, digest: digest(), hot: hotResult, words: heap.length};
-          if (event === "paused" || event === "resumed") result.heap_words = Array.from(heap);
-          return result;
+        function emit(event, ticket = "", extra = {}) {
+          const state = {event, ticket, token, tick, digest: digest(), hot: hotResult, words: heap.length, ...extra};
+          if (event === "paused" || event === "resumed") state.heap_words = Array.from(heap);
+          writeLine("V8_PROBE " + JSON.stringify(state));
         }
-        function emit(event, ticket = "") { print("V8_PROBE " + JSON.stringify(snapshot(event, ticket))); }
-        function command() { return read(controlPath).trim(); }
         function delay(ms) { const end = Date.now() + ms; while (Date.now() < end) {} }
-        emit("boot");
-        while (true) {
+        function advance() {
           for (let j = 0; j < 20000; j++) {
             const i = (j + tick) & (heap.length - 1);
             hotResult = hot((heap[i] + j) | 0);
@@ -97,17 +136,52 @@ jobs:
           }
           tick++;
           emit("tick");
-          const instruction = command();
-          if (instruction.startsWith("pause:")) {
-            const ticket = instruction.slice(6);
-            emit("paused", ticket);
-            while (command() !== "continue:" + ticket) delay(25);
-            // Computed from the live typed array again, not from a cached log message.
-            emit("resumed", ticket);
-          }
-          delay(150);
         }
+        emit("boot", "", {protocol: "timed-gate-v1", config: CONFIG});
+        for (let round = 1; round <= CONFIG.rounds; round++) {
+          const warmUntil = Date.now() + CONFIG.warmup_ms;
+          do { advance(); delay(CONFIG.tick_ms); } while (Date.now() < warmUntil);
+          const ticket = token + ":round-" + round;
+          const deadline_ms = Date.now() + CONFIG.gate_ms;
+          emit("paused", ticket, {round, deadline_ms, protocol: "timed-gate-v1"});
+          // The tested array, token, counter, and hotResult are not written in this loop.
+          while (Date.now() < deadline_ms) delay(20);
+          // Recompute the observations from live state after restoration, not cached output.
+          emit("resumed", ticket, {round, deadline_ms, protocol: "timed-gate-v1"});
+          advance();
+        }
+        // Keep PID 1 alive so the controller can independently inspect the restored process.
+        while (true) { advance(); delay(CONFIG.tick_ms); }
         '''
+
+        CAPABILITY_JS = r'''(() => {
+          const c = {print: typeof globalThis.print, read: typeof globalThis.read,
+            console_log: (typeof globalThis.console === "object" ? typeof globalThis.console.log : "undefined"),
+            uint32array: typeof Uint32Array, date_now: typeof Date.now};
+          const s = ["V8", "API", "CAPABILITIES"].join("_") + ":" + JSON.stringify(c);
+          if (c.print === "function") globalThis.print(s);
+          else if (c.console_log === "function") globalThis.console.log(s);
+          else throw new Error(s);
+        })();'''
+
+
+        def probe_source(rounds, warmup, gate, tick_ms=200):
+            config = dict(rounds=rounds, warmup_ms=round(warmup * 1000),
+                          gate_ms=round(gate * 1000), tick_ms=tick_ms)
+            return PROBE_JS.replace('__PROBE_CONFIG__', json.dumps(config, sort_keys=True))
+
+
+        def parse_capabilities(text):
+            for line in text.splitlines():
+                pos = line.find('V8_API_CAPABILITIES:')
+                if pos >= 0:
+                    try:
+                        value, _ = json.JSONDecoder().raw_decode(line[pos + len('V8_API_CAPABILITIES:'):])
+                        if isinstance(value, dict):
+                            return value
+                    except (ValueError, TypeError):
+                        pass
+            return {}
 
 
         def marker_events(text):
@@ -163,44 +237,78 @@ jobs:
             def __init__(self, root):
                 self.root = Path(root).resolve()
                 self.root.mkdir(parents=True, exist_ok=True)
-                self.index = 0
+                self.index = sum(1 for line in (self.root / "events.jsonl").read_text().splitlines()
+                                     if '"kind": "command_start"' in line) if (self.root / "events.jsonl").exists() else 0
+                self.monotonic_start = time.monotonic()
+                self.print_lock = threading.Lock()
+                self.event_lock = threading.Lock()
+                self.heartbeat_s = max(0.05, float(os.environ.get("HEARTBEAT_SECONDS", "5")))
                 self.stage = "setup"
-                self.report = {"status": "not_demonstrated", "scope": "same-host live d8 process",
+                self.report = {"status": "not_demonstrated", "scope": "same-host live d8 process, timed rendezvous, finite probe", "protocol": "timed-gate-v1",
                                "started_utc": self.now(), "assertions": [], "rounds": [],
                                "limitations": ["Not a full VM or agent checkpoint.",
                                    "Finite probe checks do not prove equality of the entire V8 heap or JIT internals.",
                                    "Network is disabled; no socket or model-provider state is tested.",
-                                   "The controller intentionally changes an instruction file after restore.",
+                                   "This probe uses a wall-clock rendezvous, not shell read() or restored clock state.",
+                                    "The binary is unmodified; it must expose print or console.log.",
                                    "Raw CRIU memory images are not uploaded; this is an in-job feasibility test."]}
 
             @staticmethod
             def now():
                 return datetime.datetime.now(datetime.timezone.utc).isoformat()
 
+            def say(self, message):
+                with self.print_lock:
+                    print(f"[{self.now()}] [{self.stage}] {message}", flush=True)
+
             def event(self, kind, **fields):
-                event = {"utc": self.now(), "kind": kind, **fields}
-                with (self.root / "events.jsonl").open("a") as f:
-                    f.write(json.dumps(event, sort_keys=True) + "\n")
-                print(json.dumps(event, sort_keys=True), flush=True)
+                event = {"utc": self.now(), "kind": kind, "stage": self.stage, **fields}
+                with self.event_lock:
+                    with (self.root / "events.jsonl").open("a") as f:
+                        f.write(json.dumps(event, sort_keys=True) + "\n")
+                self.say("EVENT " + json.dumps(event, sort_keys=True))
 
             def run(self, label, argv, timeout=90, required=False):
                 self.index += 1
                 tag = f"{self.index:04d}-{label}"
-                self.event("command_start", label=tag, argv=argv, timeout_s=timeout, stage=self.stage)
-                print("\n" + "=" * 110 + "\n$ " + shlex.join(argv), flush=True)
+                self.event("command_start", label=tag, argv=argv, timeout_s=timeout)
+                self.say("=" * 110)
+                self.say(f"COMMAND {tag} | timeout={timeout}s | cwd={os.getcwd()}")
+                self.say("ARGV " + shlex.join(argv))
                 started = time.monotonic()
                 buffers = {"stdout": [], "stderr": []}
+                counts = {"stdout": 0, "stderr": 0}
                 timed_out = False
-                try:
-                    proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                            text=True, encoding="utf-8", errors="replace", start_new_session=True)
-                    def consume(stream, key):
-                        with (self.root / (tag + "." + key + ".txt")).open("w") as log:
+                last_output = [started]
+                finished = threading.Event()
+                threads = []
+                proc = None
+                stream_errors = []
+                def consume(stream, key):
+                    try:
+                        with (self.root / (tag + "." + key + ".txt")).open("w", encoding="utf-8") as log:
                             for line in stream:
                                 buffers[key].append(line)
                                 log.write(line)
                                 log.flush()
-                                print(f"[{tag} {key}] {line.rstrip()}", flush=True)
+                                counts[key] += len(line.encode())
+                                last_output[0] = time.monotonic()
+                                self.say(f"{tag} {key.upper()} | " + line.rstrip("\n"))
+                    except Exception as exc:
+                        stream_errors.append(str(exc))
+                        self.say(f"LOGGER ERROR {tag} {key}: {exc!r}")
+                def heartbeat():
+                    while not finished.wait(self.heartbeat_s):
+                        elapsed = time.monotonic() - started
+                        silence = time.monotonic() - last_output[0]
+                        self.say(f"HEARTBEAT {tag} | elapsed={elapsed:.2f}s | silence={silence:.2f}s "
+                                 f"| stdout_bytes={counts['stdout']} | stderr_bytes={counts['stderr']} "
+                                 f"| timeout_in={max(0, timeout-elapsed):.2f}s")
+                hb = threading.Thread(target=heartbeat, daemon=True)
+                hb.start()
+                try:
+                    proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                            text=True, encoding="utf-8", errors="replace", start_new_session=True)
                     threads = [threading.Thread(target=consume, args=(getattr(proc, key), key), daemon=True)
                                for key in ("stdout", "stderr")]
                     for thread in threads:
@@ -209,23 +317,47 @@ jobs:
                         rc = proc.wait(timeout=timeout)
                     except subprocess.TimeoutExpired:
                         timed_out = True
-                        os.killpg(proc.pid, signal.SIGKILL)
+                        try:
+                            os.killpg(proc.pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
                         proc.wait()
                         rc = 124
                     for thread in threads:
                         thread.join(timeout=10)
-                    for stream in (proc.stdout, proc.stderr):
-                        stream.close()
+                    if any(t.is_alive() for t in threads):
+                        # A child inherited the log pipe. Terminate the group instead of hanging the report.
+                        try:
+                            os.killpg(proc.pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                        for thread in threads:
+                            thread.join(timeout=2)
+                        stream_errors.append("A descendant kept an output pipe open after process exit")
+                    if stream_errors and rc == 0:
+                        rc = 125
                 except OSError as exc:
                     rc = 127
                     buffers["stderr"].append(str(exc))
                     (self.root / (tag + ".stderr.txt")).write_text(str(exc))
+                    self.say(f"SPAWN ERROR {tag}: {exc!r}")
+                finally:
+                    finished.set()
+                    hb.join(timeout=1)
+                    if proc is not None and not any(t.is_alive() for t in threads):
+                        for stream in (proc.stdout, proc.stderr):
+                            stream.close()
                 out, err = "".join(buffers["stdout"]), "".join(buffers["stderr"])
+                for key in ("stdout", "stderr"):
+                    path = self.root / (tag + "." + key + ".txt")
+                    if not path.exists(): path.write_text("")
+                elapsed = round(time.monotonic() - started, 4)
                 self.event("command_end", label=tag, exit_code=rc, timed_out=timed_out,
-                           elapsed_s=round(time.monotonic() - started, 4),
-                           stdout_bytes=len(out.encode()), stderr_bytes=len(err.encode()))
+                           elapsed_s=elapsed, stdout_bytes=len(out.encode()), stderr_bytes=len(err.encode()),
+                           stream_errors=stream_errors)
+                self.say(f"COMMAND END {tag} | exit={rc} | elapsed={elapsed}s | timed_out={timed_out}")
                 if required and rc != 0:
-                    raise RuntimeError(f"{tag} failed with exit {rc}; inspect its stderr artifact")
+                    raise RuntimeError(f"{tag} failed with exit {rc}; {err[-4000:] or out[-4000:] or 'No output'}")
                 return rc, out, err
 
             def require(self, name, condition, detail=None):
@@ -244,19 +376,82 @@ jobs:
 
             def wait_event(self, container, predicate, prefix="", timeout=45):
                 end = time.monotonic() + timeout
+                poll = 0
                 while time.monotonic() < end:
+                    poll += 1
                     logs = self.logs(container)
-                    delta = logs[len(prefix):] if prefix and logs.startswith(prefix) else logs if not prefix else ""
+                    state = self.state(container)
+                    self.say(f"WAIT poll={poll} | running={state.get('Running')} | pid={state.get('Pid')} "
+                             f"| exit={state.get('ExitCode')} | oom={state.get('OOMKilled')} "
+                             f"| remaining={max(0,end-time.monotonic()):.2f}s")
+                    if state.get('Running') is not True:
+                        _, out, err = self.run('early-exit-target-output', ['docker', 'logs', container])
+                        raise RuntimeError('Target exited before required event: ' + json.dumps(state) +
+                                           '\nSTDOUT:\n' + out[-8000:] + '\nSTDERR:\n' + err[-8000:])
+                    if prefix and not logs.startswith(prefix):
+                        raise RuntimeError('Target log prefix changed; old and new output cannot be distinguished safely')
+                    delta = logs[len(prefix):] if prefix else logs
                     matches = [e for e in marker_events(delta) if predicate(e)]
                     if matches:
+                        self.event('marker_observed', snapshot=matches[-1], polling_attempt=poll)
                         return matches[-1], logs
                     time.sleep(0.5)
-                raise TimeoutError("Expected V8 marker did not appear; see target logs")
+                raise TimeoutError('Expected V8 marker did not appear before deadline; inspect target output and container state')
 
-            def control(self, container, text):
-                path = self.root / "controller-instruction.txt"
-                path.write_text(text + "\n")
-                self.run("controller-write", ["docker", "cp", str(path), container + ":/tmp/v8-cp-control.txt"], required=True)
+            def resource_snapshot(self, container, reason):
+                state = self.state(container)
+                pid = state.get('Pid', 0)
+                self.event('resource_boundary', reason=reason, container_state=state)
+                if not isinstance(pid, int) or pid <= 0 or not state.get('Running'):
+                    self.say('No live PID: RSS is unobserved, not zero.')
+                    return
+                code = r'''import json, pathlib, sys
+        pid=int(sys.argv[1]); p=pathlib.Path('/proc')/str(pid)
+        status=(p/'status').read_text()
+        values={line.split(':',1)[0]:line.split(':',1)[1].strip() for line in status.splitlines() if ':' in line}
+        EMBED_CHECKPOINT_PROBE_PY_1
+        printf "Embedded checkpoint_probe.py part 1/3; cumulative bytes: "
+        wc -c < "$BUNDLE_DIR/checkpoint_probe.py"
+    - name: Embed checkpoint_probe.py [2/3]
+      shell: bash
+      run: |
+        set -Eeuo pipefail
+        cat >> "$BUNDLE_DIR/checkpoint_probe.py" <<'EMBED_CHECKPOINT_PROBE_PY_2'
+        mem={line.split(':',1)[0]:int(line.split()[1])*1024 for line in pathlib.Path('/proc/meminfo').read_text().splitlines() if ':' in line}
+        result={'pid':pid,'process_status':values,'host_available_bytes':mem.get('MemAvailable')}
+        for name,key in [('VmRSS','rss_bytes'),('VmSize','virtual_bytes'),('VmHWM','peak_rss_bytes')]:
+            value=values.get(name)
+            if value: result[key]=int(value.split()[0])*1024
+        result['cgroup']=(p/'cgroup').read_text()
+        for line in result['cgroup'].splitlines():
+            if line.startswith('0::'):
+                cg=pathlib.Path('/sys/fs/cgroup')/line.split('::',1)[1].lstrip('/')
+                for name in ['memory.current','memory.peak','memory.max','memory.events','memory.swap.max']:
+                    try: result[name]=(cg/name).read_text().strip()
+                    except OSError: pass
+        print(json.dumps(result,sort_keys=True))
+        '''
+                rc, out, err = self.run('process-memory-' + reason, ['sudo','python3','-c',code,str(pid)])
+                if rc == 0:
+                    try:
+                        sample = json.loads(out)
+                        self.event('resource_sample', relative_s=round(time.monotonic()-self.monotonic_start,4),
+                                   reason=reason, **sample)
+                    except ValueError:
+                        self.event('resource_unavailable', reason=reason, error='Could not parse process-memory data')
+                else:
+                    self.event('resource_unavailable', reason=reason, error=err)
+                self.run('process-list-' + reason, ['docker','top',container,'-eo','pid,ppid,stat,etime,rss,vsz,args'])
+
+            def wait_stopped_until(self, deadline_ms):
+                wait = max(0.0, deadline_ms / 1000.0 + 0.2 - time.time())
+                limit = time.monotonic() + wait
+                self.event('timed_gate_wait', seconds=round(wait,3), deadline_ms=deadline_ms,
+                           explanation='Target is checkpointed and stopped. Host clock continues; this is not clock replay.')
+                while time.monotonic() < limit:
+                    remaining = limit - time.monotonic()
+                    self.say(f'STOPPED GATE HEARTBEAT | waiting={remaining:.2f}s | no target is executing')
+                    time.sleep(min(self.heartbeat_s, remaining))
 
             def evidence_for_container(self, container, docker_root):
                 self.run("inspect-complete", ["docker", "inspect", container])
@@ -296,11 +491,14 @@ jobs:
                         self.require(filename + " succeeded", status.get("status") == "passed", status)
                     rounds = int(os.environ.get("RESTORE_ROUNDS", "2"))
                     warmup = int(os.environ.get("WARMUP", "3"))
+                    gate = int(os.environ.get("TIMED_GATE_SECONDS", "45"))
                     self.require("round count within bounds", 1 <= rounds <= 5, rounds)
                     self.require("warmup within bounds", 1 <= warmup <= 30, warmup)
+                    self.require("timed gate within bounds", 15 <= gate <= 180, gate)
                     image = os.environ["IMAGE"]
                     self.require("image pinned by SHA256 digest", bool(re.fullmatch(r"[^\s]+@sha256:[0-9a-f]{64}", image)), image)
-                    self.report.update(image=image, requested_rounds=rounds)
+                    self.report.update(image=image, requested_rounds=rounds, gate_seconds=gate,
+                                       run_id=os.environ.get('GITHUB_RUN_ID','local'))
                     self.stage = "image_setup"
                     self.run("image-pull", ["docker", "pull", image], timeout=600, required=True)
                     self.run("image-inspect", ["docker", "image", "inspect", image], required=True)
@@ -316,60 +514,87 @@ jobs:
                                "--security-opt", "apparmor=unconfined", "--workdir", str(Path(d8).parent)]
                     self.report["container_options"] = options
                     self.run("d8-version", ["docker", "run", "--rm", *options, "--entrypoint", d8, image, "--version"], required=True)
+                    self.run('d8-binary-hash', ['docker','run','--rm','--network','none','--entrypoint','/bin/sh',image,
+                                              '-c','sha256sum "$1"; uname -a; ls -l "$1"','sh',d8],required=True)
+                    self.stage = "api_capabilities"
+                    rc, out, err = self.run('d8-api-capabilities', ['docker','run','--rm',*options,'--entrypoint',d8,image,'-e',CAPABILITY_JS])
+                    caps = parse_capabilities(out + "\n" + err)
+                    self.report['d8_capabilities'] = caps
+                    (self.root/'d8-capabilities.json').write_text(json.dumps(caps,indent=2)+'\n')
+                    self.require('real d8 has a supported output API', rc == 0 and
+                                 (caps.get('print') == 'function' or caps.get('console_log') == 'function'),
+                                 {'exit_code':rc,'capabilities':caps,'stdout':out,'stderr':err})
+                    self.require('real d8 has standard typed arrays and time',
+                                 caps.get('uint32array') == 'function' and caps.get('date_now') == 'function',caps)
+                    self.event('probe_protocol', protocol='timed-gate-v1',
+                               read_api_required=False, target_binary_modified=False,
+                               note='No shell read()/readline() or file API is used. A timed boundary is not deterministic clock replay.')
                     self.stage = "v8_start"
                     self.run("container-create", ["docker", "create", "--name", container, *options,
                               "--log-driver", "json-file", "--entrypoint", d8, image, "/tmp/v8-checkpoint-probe.js"], required=True)
                     created = True
                     js = self.root / "probe.js"
-                    js.write_text(PROBE_JS)
+                    js.write_text(probe_source(rounds,warmup,gate))
                     self.report["probe_sha256"] = hashlib.sha256(js.read_bytes()).hexdigest()
                     self.run("copy-probe", ["docker", "cp", str(js), container + ":/tmp/v8-checkpoint-probe.js"], required=True)
-                    self.control(container, "run")
                     self.run("container-start", ["docker", "start", container], required=True)
                     self.wait_event(container, lambda e: e.get("event") == "tick")
+                    self.resource_snapshot(container,'startup')
                     for number in range(1, rounds + 1):
-                        ticket = uuid.uuid4().hex
                         checkpoint = f"round-{number}"
-                        self.event("round_start", number=number, ticket=ticket, checkpoint=checkpoint)
-                        time.sleep(warmup)
                         self.stage = "pause"
-                        self.control(container, "pause:" + ticket)
-                        paused, _ = self.wait_event(container, lambda e: e.get("event") == "paused" and e.get("ticket") == ticket)
+                        paused, _ = self.wait_event(container, lambda e: e.get('event') == 'paused' and e.get('round') == number,
+                                                    timeout=warmup+45)
+                        ticket = paused.get('ticket')
+                        deadline = paused.get('deadline_ms')
+                        self.require(f'round {number}: valid timed gate', isinstance(ticket,str) and
+                                     type(deadline) is int and deadline/1000-time.time() > 2,
+                                     {'ticket':ticket,'deadline_ms':deadline,'host_now_ms':int(time.time()*1000)})
+                        row = {'round':number,'checkpoint':checkpoint,'ticket':ticket,'paused':paused,'checks':{}}
+                        self.report['rounds'].append(row)
+                        self.event("round_start", number=number, ticket=ticket, checkpoint=checkpoint)
                         self.require(f"round {number}: alive before dump", self.state(container).get("Running") is True)
                         self.stage = "checkpoint"
                         start = time.monotonic()
                         self.run("checkpoint-create", ["docker", "checkpoint", "create", container, checkpoint], timeout=180, required=True)
-                        dump_s = time.monotonic() - start
+                        row['dump_s'] = time.monotonic() - start
                         self.require(f"round {number}: stopped after dump", self.state(container).get("Running") is False)
-                        # Baseline is taken AFTER dump has stopped the target, not before it.
                         baseline = self.logs(container)
                         time.sleep(0.5)
                         self.require(f"round {number}: logs stable while stopped", self.logs(container) == baseline)
+                        self.require(f"round {number}: gate did not expire before capture",
+                                     not any(e.get('event') == 'resumed' and e.get('ticket') == ticket for e in marker_events(baseline)),
+                                     'If false, increase timed_gate_seconds; this is not a valid pause-state capture.')
                         (self.root / f"round-{number}-stopped-baseline.log").write_text(baseline)
                         self.evidence_for_container(container, docker_root)
+                        self.stage = 'stopped_gate_wait'
+                        self.wait_stopped_until(deadline)
                         self.stage = "restore"
                         start = time.monotonic()
                         self.run("checkpoint-restore", ["docker", "start", "--checkpoint", checkpoint, container], timeout=180, required=True)
-                        restore_s = time.monotonic() - start
+                        row['restore_s'] = time.monotonic() - start
                         self.require(f"round {number}: running after restore", self.state(container).get("Running") is True)
                         self.stage = "fidelity"
-                        self.control(container, "continue:" + ticket)
-                        self.wait_event(container, lambda e: e.get("event") == "resumed" and e.get("ticket") == ticket, prefix=baseline)
+                        resumed, _ = self.wait_event(container, lambda e: e.get("event") == "resumed" and e.get("ticket") == ticket, prefix=baseline)
                         _, after = self.wait_event(container, lambda e: e.get("event") == "tick" and e.get("tick", -1) > paused["tick"], prefix=baseline)
                         running = self.state(container).get("Running") is True
                         checks = continuity_checks(paused, baseline, after, ticket, running)
-                        record = {"round": number, "checkpoint": checkpoint, "ticket": ticket, "paused": paused,
-                                  "dump_s": dump_s, "restore_s": restore_s, "checks": checks}
-                        self.report["rounds"].append(record)
+                        row.update(checks=checks,resumed=resumed)
                         (self.root / f"round-{number}-resumed.log").write_text(after)
+                        # Emit explicit observed values, not a success label without evidence.
+                        for key in ('token','tick','digest','hot','words'):
+                            self.say(f"FIDELITY {key} | before={paused.get(key)!r} | after={resumed.get(key)!r}")
+                        bad = [i for i,(a,b) in enumerate(zip(paused.get('heap_words',[]),resumed.get('heap_words',[]))) if a != b]
+                        self.say(f"FIDELITY probe words | compared={len(paused.get('heap_words',[]))} | mismatching_indices={bad}")
                         for key, value in checks.items():
                             self.require(f"round {number}: {key}", value)
+                        self.resource_snapshot(container,'restored-'+str(number))
                     self.report["status"] = "passed"
                     self.stage = "complete"
                 except Exception as exc:
                     self.report.update(status="failed", failed_stage=self.stage, exception=repr(exc))
                     traceback.print_exc()
-                    self.event("experiment_failed", stage=self.stage, error=repr(exc))
+                    self.event("experiment_failed", error=repr(exc))
                 finally:
                     if created:
                         try:
@@ -380,7 +605,7 @@ jobs:
                         self.run("container-cleanup", ["docker", "rm", "-f", container])
                     self.report.update(finished_utc=self.now(), command_count=self.index)
                     (self.root / "report.json").write_text(json.dumps(self.report, indent=2) + "\n")
-                    print("\nFINAL REPORT\n" + json.dumps(self.report, indent=2), flush=True)
+                    self.say("FINAL MACHINE-READABLE REPORT\n" + json.dumps(self.report, indent=2))
                 return 0 if self.report["status"] == "passed" else 1
 
 
@@ -433,36 +658,430 @@ jobs:
 
         if __name__ == "__main__":
             root = os.environ.get("EVIDENCE_DIR", "evidence")
-            sys.exit(configure_daemon(root) if len(sys.argv) > 1 and sys.argv[1] == "daemon" else Audit(root).main())
-
-
-        PYPROBE
-        python3 -m py_compile "$RUNNER_TEMP/checkpoint_probe.py"
-    - name: Print host diagnostics
-      continue-on-error: true
+        EMBED_CHECKPOINT_PROBE_PY_2
+        printf "Embedded checkpoint_probe.py part 2/3; cumulative bytes: "
+        wc -c < "$BUNDLE_DIR/checkpoint_probe.py"
+    - name: Embed checkpoint_probe.py [3/3]
       shell: bash
       run: |
         set -Eeuo pipefail
-        mkdir -p "$EVIDENCE_DIR"
-        exec > >(tee "$EVIDENCE_DIR/host.log") 2>&1
-        printf '\n=== HOST ===\n'
-        date -u --iso-8601=seconds
-        uname -a
-        cat /etc/os-release
-        id
-        free -h
-        df -h
-        printf '\n=== CAPABILITIES ===\n'
-        grep -E '^(Cap|Seccomp|NoNewPrivs)' /proc/self/status || true
-        printf '\n=== DOCKER ===\n'
-        docker version
-        docker info
-        printf '\n=== NO MODEL KEYS OR EXPLOIT PAYLOADS ARE USED ===\n'
-    - name: Build and install exact upstream CRIU commit
-      id: criu_setup
-      continue-on-error: true
+        cat >> "$BUNDLE_DIR/checkpoint_probe.py" <<'EMBED_CHECKPOINT_PROBE_PY_3'
+            if len(sys.argv) > 1 and sys.argv[1] == 'daemon':
+                sys.exit(configure_daemon(root))
+            if len(sys.argv) > 3 and sys.argv[1] == 'stream':
+                audit = Audit(root)
+                audit.stage = sys.argv[2]
+                sys.exit(audit.run(sys.argv[2],sys.argv[3:],timeout=int(os.environ.get('STEP_COMMAND_TIMEOUT','1800')))[0])
+            sys.exit(Audit(root).main())
+        EMBED_CHECKPOINT_PROBE_PY_3
+        printf "Embedded checkpoint_probe.py part 3/3; cumulative bytes: "
+        wc -c < "$BUNDLE_DIR/checkpoint_probe.py"
+    - name: Embed build_viewer.py [1/1]
       shell: bash
       run: |
+        set -Eeuo pipefail
+        cat > "$BUNDLE_DIR/build_viewer.py" <<'EMBED_BUILD_VIEWER_PY_1'
+        #!/usr/bin/env python3
+        """Build an offline HTML5 evidence viewer. Standard library only; never executes evidence.
+        Usage: python3 build_trajectory_viewer.py EVIDENCE_DIRECTORY [OUTPUT_HTML]
+        Memory images and symlinks are excluded. Original evidence is never modified.
+        """
+        import json
+        import os
+        from pathlib import Path
+        import sys
+
+        MAX_FILE = 2 * 1024 * 1024
+        MAX_TOTAL = 32 * 1024 * 1024
+
+        TEMPLATE = Path(__file__).with_name('viewer-template.html').read_text(encoding='utf-8')
+
+        def collect_files(root, output):
+            root, output = Path(root).resolve(), Path(output).resolve()
+            root.mkdir(parents=True, exist_ok=True)
+            files, omissions, total = [], [], 0
+            priorities = {'report.json': 0, 'setup.json': 1, 'daemon-setup.json': 2,
+                          'events.jsonl': 3, 'events.json': 4, 'results.json': 5}
+            paths = sorted(root.rglob('*'), key=lambda p: (priorities.get(p.name, 10), str(p)))
+            for p in paths:
+                if not p.is_file() or p.is_symlink() or p.resolve() == output:
+                    continue
+                if p.suffix.lower() not in {'.json', '.jsonl', '.txt', '.log'}:
+                    continue
+                if p.name in {'trajectory-bundle.json', 'viewer-build.json'}:
+                    continue
+                name = p.relative_to(root).as_posix()
+                try:
+                    size = p.stat().st_size
+                    if size > MAX_FILE or total + size > MAX_TOTAL:
+                        omissions.append(f'{name}: not embedded (size budget); original file unchanged.')
+                        print('OMIT '+omissions[-1],flush=True)
+                        continue
+                    content = p.read_text(encoding='utf-8', errors='replace')
+                    files.append({'name': name, 'text': content})
+                    print(f'EMBED {name} | bytes={size}',flush=True)
+                    total += size
+                except OSError as exc:
+                    omissions.append(f'{name}: unreadable: {exc}')
+            metadata = {k.lower(): os.environ[k] for k in ('GITHUB_RUN_ID', 'GITHUB_REPOSITORY',
+                        'GITHUB_SHA', 'GITHUB_RUN_ATTEMPT', 'IMAGE') if k in os.environ}
+            if 'github_run_id' in metadata:
+                metadata['run_id'] = metadata['github_run_id']
+            metadata.update(omissions=omissions, embedded_files=len(files), embedded_source_bytes=total,
+                            control_mode='offline', raw_memory_included=False)
+            return {'files': files, 'metadata': metadata}
+
+        def render(payload):
+            # Do not let an imported log terminate the inert JSON script element.
+            data = json.dumps(payload, ensure_ascii=True).replace('<', '\\u003c').replace('>', '\\u003e').replace('&', '\\u0026')
+            return TEMPLATE.replace('__EMBEDDED_EVIDENCE__', data)
+
+        def main():
+            if len(sys.argv) not in (2, 3):
+                raise SystemExit('Usage: build_trajectory_viewer.py EVIDENCE_DIR [OUTPUT_HTML]')
+            root = Path(sys.argv[1])
+            output = Path(sys.argv[2]) if len(sys.argv) == 3 else root / 'trajectory-explorer.html'
+            payload = collect_files(root, output)
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.write_text(render(payload), encoding='utf-8')
+            report = {'status': 'passed', 'output': output.name, 'viewer_mode': 'offline_evidence_only',
+                      'embedded_files': len(payload['files']), 'source_bytes': payload['metadata']['embedded_source_bytes'],
+                      'omissions': payload['metadata']['omissions'], 'runtime_restore_supported': False,
+                      'output_bytes': output.stat().st_size, 'no_external_assets': True}
+            (output.parent / 'viewer-build.json').write_text(json.dumps(report, indent=2) + '\n')
+            print(json.dumps(report, indent=2))
+            summary = os.environ.get('GITHUB_STEP_SUMMARY')
+            if summary:
+                with open(summary, 'a', encoding='utf-8') as f:
+                    f.write('\n## Interactive trajectory explorer\n'
+                            'Download the evidence artifact, extract it, and open `trajectory-explorer.html`. '
+                            'Play and rewind inspect recorded events only. '
+                            'No backend is connected; live process restoration is unavailable.\n')
+            return 0
+
+        if __name__ == '__main__':
+            raise SystemExit(main())
+        EMBED_BUILD_VIEWER_PY_1
+        printf "Embedded build_viewer.py part 1/1; cumulative bytes: "
+        wc -c < "$BUNDLE_DIR/build_viewer.py"
+    - name: Embed viewer-template.html [1/4]
+      shell: bash
+      run: |
+        set -Eeuo pipefail
+        cat > "$BUNDLE_DIR/viewer-template.html" <<'EMBED_VIEWER_TEMPLATE_HTML_1'
+        <!doctype html>
+        <html lang="en">
+        <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width,initial-scale=1">
+        <meta name="color-scheme" content="dark">
+        <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data: blob:; font-src 'none'; connect-src 'none'; base-uri 'none'; form-action 'none'">
+        <title>Trajectory Atlas | Checkpoint evidence explorer</title>
+        <style>
+        :root{--bg:#0b1019;--panel:#131b28;--raised:#192334;--border:#2b374b;--text:#e8edf6;--muted:#a2afc4;--dim:#7d8ca4;--teal:#52dec6;--blue:#89afff;--purple:#bb9cff;--amber:#ffc77d;--red:#ff8994;--mono:ui-monospace,SFMono-Regular,Consolas,monospace}
+        *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}button,input,select,textarea{font:inherit}button,.file-label{display:inline-flex;align-items:center;justify-content:center;gap:7px;border:1px solid var(--border);background:var(--raised);color:var(--text);border-radius:7px;padding:8px 12px;cursor:pointer;text-decoration:none;white-space:nowrap}button:hover:not(:disabled),.file-label:hover{background:#243249;border-color:#52647f}button.primary{background:var(--teal);color:#072b27;border-color:var(--teal);font-weight:650}button:disabled{opacity:.42;cursor:not-allowed}button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-visible,a:focus-visible,svg [tabindex]:focus-visible{outline:2px solid var(--teal);outline-offset:3px}input,select,textarea{background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);padding:7px 10px;min-width:0}label{color:var(--muted)}.small{font-size:12px}.mono,code,pre{font-family:var(--mono)}.muted{color:var(--muted)}.dim{color:var(--dim)}.eyebrow{font-size:10px;letter-spacing:.16em;font-weight:700;color:var(--teal)}.pill{border:1px solid var(--border);border-radius:30px;padding:4px 9px;font-size:11px;white-space:nowrap}.pill.warn{color:var(--amber);border-color:#785936;background:#30251d}.pill.good{color:var(--teal);border-color:#295a54;background:#132c2c}.pill.bad{color:var(--red);border-color:#69404c;background:#2d2029}.topbar{height:68px;display:flex;align-items:center;justify-content:space-between;gap:16px;padding:0 28px;border-bottom:1px solid var(--border);background:#0f1622}.brand{display:flex;align-items:center;gap:12px;font-weight:700;font-size:17px;letter-spacing:-.03em}.brand svg{color:var(--teal)}.top-actions{display:flex;gap:9px;align-items:center}.workspace{display:grid;grid-template-columns:228px minmax(0,1fr);min-height:calc(100vh - 68px);max-width:1800px;margin:auto}.sidebar{border-right:1px solid var(--border);padding:26px 16px;display:flex;flex-direction:column;gap:24px}.sidebar h2{font-size:11px;letter-spacing:.13em;color:var(--dim);margin:0 0 13px;text-transform:uppercase}.trace-button{width:100%;display:block;text-align:left;white-space:normal;margin:6px 0;padding:12px;border-color:transparent;background:transparent;line-height:1.4}.trace-button.active{border-color:#3c5b68;background:#172c32}.trace-button .trace-name{display:block;font-size:13px;font-weight:650;margin-bottom:5px}.trace-button .trace-sub{font-size:11px;color:var(--muted)}.sidebar-note{margin-top:auto;font-size:12px;color:var(--muted);padding:14px;background:var(--panel);border-radius:8px;line-height:1.65}.legend-row{display:flex;gap:10px;align-items:center;margin:9px 0;font-size:12px;color:var(--muted)}.dot{width:9px;height:9px;display:inline-block;background:var(--blue);border-radius:50%;flex-shrink:0}.diamond{border-radius:1px;transform:rotate(45deg);background:var(--teal)}.square{border-radius:1px;background:var(--red)}main{padding:26px 30px 36px;min-width:0}.heading{display:flex;justify-content:space-between;align-items:center;gap:16px;margin-bottom:22px}.heading h1{font-size:29px;line-height:1.2;letter-spacing:-.04em;margin:5px 0 7px}.heading p{margin:0;font-size:13px;color:var(--muted)}.notice{border:1px solid #655135;background:#29231c;border-radius:8px;padding:10px 14px;color:var(--amber);font-size:12px;margin:0 0 18px}.notice.real{border-color:#2a4756;background:#14212d;color:#acc8e1}.stats{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-bottom:18px}.stat{padding:14px 18px;background:var(--panel);border:1px solid var(--border);border-radius:9px}.stat .value{font-size:27px;line-height:1.3;letter-spacing:-.04em;font-weight:650}.stat .caption{font-size:11px;color:var(--muted);margin-top:2px}.panel{background:var(--panel);border:1px solid var(--border);border-radius:10px;overflow:hidden}.panel-head{padding:15px 18px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;gap:12px;align-items:center}.panel-head h2{font-size:14px;margin:0;font-weight:650}.panel-head p{font-size:11px;color:var(--muted);margin:3px 0 0}.panel-tools{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.panel-tools input{width:190px;font-size:12px}.panel-tools select{font-size:12px}.graph-scroll{overflow:auto;min-height:160px;max-height:460px;background:#101824}.graph-scroll svg{display:block}.graph-scroll .node{cursor:pointer;transition:opacity .1s}.graph-scroll .node:hover{filter:brightness(1.4)}.graph-foot{display:flex;justify-content:space-between;gap:10px;padding:8px 18px;border-top:1px solid var(--border);font-size:11px;color:var(--muted)}.transport{padding:14px 18px;border-top:1px solid var(--border);background:#151f2e}.transport-top{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.transport-top .spacer{flex:1}.transport button{font-size:12px}.transport select{font-size:12px;max-width:240px}.scrubber{display:flex;align-items:center;gap:14px;margin-top:13px}.scrubber input{width:100%;accent-color:var(--teal);padding:0}.scrubber .mono{font-size:11px;white-space:nowrap;min-width:95px;color:var(--muted)}.twocol{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.2fr);gap:18px;margin:18px 0}.panel-body{padding:16px 18px}.event-title{font-size:17px;margin:6px 0 12px;overflow-wrap:anywhere}.kv{display:grid;grid-template-columns:105px minmax(0,1fr);gap:6px 12px;font-size:12px;margin-bottom:14px}.kv dt{color:var(--muted)}.kv dd{margin:0;word-break:break-word}.inspector-actions{display:flex;gap:7px;margin:14px 0;flex-wrap:wrap}.inspector-actions button{font-size:11px}.scope-note{border-left:2px solid var(--amber);padding-left:10px;color:var(--muted);font-size:11px;line-height:1.6;margin-top:14px}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#0c131f;border:1px solid var(--border);border-radius:6px;max-height:290px;overflow:auto;padding:12px;font-size:11px;line-height:1.65;margin:10px 0}details summary{cursor:pointer;color:var(--muted);font-size:12px;margin-top:10px}.compare-pickers{display:grid;grid-template-columns:1fr 1fr;gap:10px}.compare-pickers label{font-size:10px;letter-spacing:.06em;text-transform:uppercase}.compare-pickers select{width:100%;font-size:11px;margin-top:5px}.diff-table,.matrix{width:100%;border-collapse:collapse;font-size:12px}.diff-table{margin:12px 0}.diff-table td,.diff-table th{padding:7px 6px;text-align:left;border-bottom:1px solid #263246}.diff-table th{font-weight:500;color:var(--muted);font-size:10px}.diff-table td{font-family:var(--mono);font-size:11px}.diff-table td:first-child{font-family:inherit;color:var(--muted)}.match{color:var(--teal)}.mismatch{color:var(--red)}.unknown{color:var(--dim)}.heap-head{display:flex;justify-content:space-between;gap:15px;font-size:11px;margin:14px 0 9px}.heap-grid{display:grid;grid-template-columns:repeat(32,1fr);gap:3px}.heap-cell{height:12px;border:0;border-radius:2px;background:#2c3547;min-width:0;padding:0}.heap-cell.same{background:#2b786f}.heap-cell.changed{background:var(--red)}.heap-cell:focus{outline:2px solid white}.heap-explain{font-size:10px;color:var(--muted);margin-top:8px;min-height:15px}.matrix-scroll{overflow:auto;max-height:340px}.matrix th{background:#151e2c;color:var(--muted);font-size:10px;text-align:center;padding:12px;position:sticky;top:0;font-weight:500}.matrix td{padding:10px 14px;border-top:1px solid var(--border);text-align:center;font-family:var(--mono);font-size:11px}.matrix th:first-child,.matrix td:first-child{text-align:left;font-family:inherit;min-width:160px}.matrix td:first-child span{display:block;font-size:10px;color:var(--dim);margin-top:2px}.empty{padding:30px 18px;color:var(--muted);font-size:13px;line-height:1.7}.resources{margin:18px 0}.resources svg{width:100%;height:150px;display:block}.footer{margin-top:18px;display:flex;gap:15px;justify-content:space-between;font-size:11px;color:var(--dim);flex-wrap:wrap}.toast{position:fixed;bottom:24px;left:50%;transform:translateX(-50%);background:#22384a;border:1px solid #567486;box-shadow:0 12px 40px #0008;border-radius:9px;padding:12px 20px;color:var(--text);max-width:90vw;z-index:20;display:none}.toast.visible{display:block}dialog{background:var(--panel);color:var(--text);border:1px solid var(--border);border-radius:14px;max-width:600px;width:90vw;padding:24px}dialog::backdrop{background:#000b}dialog h2{margin-top:0}dialog p{color:var(--muted);font-size:13px}dialog label{display:block;font-size:12px;margin:14px 0}dialog input,dialog textarea{width:100%;display:block;margin-top:6px}dialog textarea{min-height:100px}.dialog-actions{display:flex;justify-content:flex-end;gap:9px;margin-top:20px}.visually-hidden{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0,0,0,0)}.badge-line{display:flex;gap:7px;align-items:center;flex-wrap:wrap}.check-banner{font-size:11px;color:var(--muted)}.linklike{background:none;border:0;padding:0;color:var(--teal);font-size:12px}.drop-active{outline:2px dashed var(--teal);outline-offset:-10px}
+        @media(max-width:1200px){.workspace{grid-template-columns:190px minmax(0,1fr)}main{padding:22px 20px}.panel-head{flex-wrap:wrap}.topbar{padding:0 20px}.heap-grid{grid-template-columns:repeat(16,1fr)}}
+        @media(max-width:900px){.workspace{display:block}.sidebar{border-right:0;border-bottom:1px solid var(--border);padding:12px 20px;gap:10px}.sidebar .legend,.sidebar-note,.sidebar h2{display:none}#traceList{display:flex;gap:7px;overflow:auto}.trace-button{min-width:180px;margin:0}.twocol{grid-template-columns:1fr}.topbar{height:auto;min-height:68px;flex-wrap:wrap;padding:14px 20px}.heading{align-items:flex-start}.heading h1{font-size:25px}}
+        @media(max-width:560px){main{padding:18px 12px}.stats{grid-template-columns:repeat(2,1fr)}.heading{display:block}.heading .badge-line{margin-top:12px}.top-actions{flex-wrap:wrap}.top-actions button,.file-label{font-size:12px}.panel-tools input{width:140px}.transport-top .spacer{display:none}.compare-pickers{grid-template-columns:1fr}.graph-foot{display:block}.brand{font-size:15px}}
+        @media(prefers-reduced-motion:reduce){*{scroll-behavior:auto!important;transition:none!important}}
+        </style>
+        </head>
+        <body>
+        <header class="topbar"><div class="brand"><svg width="29" height="29" viewBox="0 0 29 29" aria-hidden="true"><path d="M5 23V6h9v9h10" stroke="currentColor" fill="none" stroke-width="2"/><circle cx="5" cy="6" r="3" fill="currentColor"/><circle cx="14" cy="15" r="3" fill="currentColor"/><circle cx="24" cy="15" r="3" fill="currentColor"/></svg>TRAJECTORY <span class="muted">ATLAS</span></div><div class="top-actions"><span class="pill good">OFFLINE EVIDENCE VIEWER</span><button id="importBtn">Open evidence</button><button id="exportBtn">Export session</button><input hidden type="file" id="fileInput" multiple accept=".json,.jsonl,.log,.txt"><input hidden type="file" id="folderInput" webkitdirectory multiple></div></header>
+        <div class="workspace">
+        <aside class="sidebar"><div><h2>Recorded trajectories</h2><div id="traceList"></div><button class="linklike" id="folderBtn" style="margin:12px 0 0">+ Open an evidence folder</button></div><div class="legend"><h2>Event vocabulary</h2><div class="legend-row"><i class="dot"></i>Tool / execution</div><div class="legend-row"><i class="dot" style="background:var(--purple)"></i>Agent decision</div><div class="legend-row"><i class="dot diamond"></i>Captured checkpoint</div><div class="legend-row"><i class="dot" style="background:var(--amber)"></i>Restore / continuation</div><div class="legend-row"><i class="dot square"></i>Failed check / error</div><div class="legend-row"><i class="dot" style="background:var(--amber)"></i>Observed divergence</div></div><div class="sidebar-note"><strong style="color:var(--text)">Evidence, not a simulator.</strong><br>Rewind moves the inspection cursor. It never restores process memory. This page has no execution backend or network connection.</div></aside>
+        <main>
+        <section class="heading"><div><div class="eyebrow">CHECKPOINT & CONTINUATION LAB</div><h1>Every branch. Every checkpoint.</h1><p id="projectSubtitle">Inspect what happened, then compare what changed.</p></div><div class="badge-line"><span id="dataBadge" class="pill warn">NO EVIDENCE</span><span class="pill">HTML5 / LOCAL</span></div></section>
+        <div id="notice" class="notice" role="status"></div>
+        <section class="stats" aria-label="Evidence summary"><div class="stat"><div id="statTraces" class="value">0</div><div class="caption">Recorded trajectories</div></div><div class="stat"><div id="statCP" class="value">0</div><div class="caption">Successful captures</div></div><div class="stat"><div id="statEvents" class="value">0</div><div class="caption">Events in evidence</div></div><div class="stat"><div id="statFailures" class="value">0</div><div class="caption">Failure events</div></div></section>
+        <section class="panel" aria-label="Trajectory graph"><div class="panel-head"><div><h2>Trajectory map</h2><p>Shared origins connect only when explicitly recorded.</p></div><div class="panel-tools"><input id="search" type="search" aria-label="Search events" placeholder="Search event, stage, error..."><select id="axisMode" aria-label="Timeline axis"><option value="step">Event order</option><option value="time">Relative wall time</option></select><button id="zoomOut" aria-label="Zoom out">-</button><button id="zoomIn" aria-label="Zoom in">+</button><button id="firstFailure">First failure</button></div></div><div class="graph-scroll" id="graphScroll"><svg id="graph" role="img" aria-label="Interactive trajectory graph"></svg></div><div class="graph-foot"><span id="graphCaption">No events loaded.</span><span>Diamond = capture &nbsp; Square = failure &nbsp; Click a node to inspect</span></div><div class="transport"><div class="transport-top"><button id="prev" aria-label="Previous event">&lt; Step</button><button id="play" class="primary">Play evidence</button><button id="next" aria-label="Next event">Step &gt;</button><select id="speed" aria-label="Playback speed"><option value="1200">Slow</option><option value="650" selected>Normal</option><option value="200">Fast</option></select><span class="spacer"></span><button id="rewind">Rewind to checkpoint</button><select id="checkpointSelect" aria-label="Jump to checkpoint"><option value="">Select checkpoint...</option></select></div><div class="scrubber"><span id="cursorText" class="mono">EVENT 0 / 0</span><input id="scrubber" type="range" min="0" max="0" value="0" aria-label="Evidence playback position"><span id="cursorTime" class="mono">No time</span></div></div></section>
+        <div class="twocol"><section class="panel"><div class="panel-head"><div><h2>Event inspector</h2><p>Exact recorded data, never inferred runtime state.</p></div><span id="eventStatus" class="pill">-</span></div><div class="panel-body" id="inspector"><div class="empty">Open evidence to inspect a trajectory.</div></div></section>
+        EMBED_VIEWER_TEMPLATE_HTML_1
+        printf "Embedded viewer-template.html part 1/4; cumulative bytes: "
+        wc -c < "$BUNDLE_DIR/viewer-template.html"
+    - name: Embed viewer-template.html [2/4]
+      shell: bash
+      run: |
+        set -Eeuo pipefail
+        cat >> "$BUNDLE_DIR/viewer-template.html" <<'EMBED_VIEWER_TEMPLATE_HTML_2'
+        <section class="panel"><div class="panel-head"><div><h2>Checkpoint state comparison</h2><p>Probe-level equality is not equality of the entire V8 heap.</p></div></div><div class="panel-body"><div class="compare-pickers"><label>Reference observation<select id="compareA"></select></label><label>Comparison observation<select id="compareB"></select></label></div><div id="diffBody"></div><div class="heap-head"><span>Typed-array word difference</span><span id="heapCount" class="mono">No data</span></div><div id="heapGrid" class="heap-grid" aria-label="Typed-array difference map"></div><div id="heapDetail" class="heap-explain"></div><div class="scope-note">An observation attached to a command is a sampled state, not a new execution checkpoint. Missing fields remain unknown; unknown never counts as a pass.</div></div></section></div>
+        <section class="panel"><div class="panel-head"><div><h2>Restoration fidelity matrix</h2><p>Only explicit assertions are shown. Blank coverage is not success.</p></div><span id="matrixSummary" class="check-banner"></span></div><div class="matrix-scroll" id="matrixBody"></div></section>
+        <section class="panel resources"><div class="panel-head"><div><h2>Measured memory by trajectory</h2><p>Optional RSS samples; this is not a memory-limit or virtual-address-space chart.</p></div><span id="resourceStatus" class="pill">NO SAMPLES</span></div><div id="resourceBody"></div></section>
+        <details class="panel"><summary style="padding:12px 18px;margin:0">Provenance, evidence coverage, and import warnings</summary><div class="panel-body"><pre id="provenance"></pre><div id="warnings"></div></div></details>
+        <footer class="footer"><span>Space: play / pause &nbsp;&nbsp; Left / right: step &nbsp;&nbsp; R: previous checkpoint</span><span>No telemetry. No libraries. No credentials.</span></footer>
+        </main></div>
+        <div class="toast" id="toast" role="status"></div>
+        <dialog id="branchDialog"><h2>Plan a new continuation</h2><span class="pill warn">PLAN ONLY - NOT EXECUTED</span><p id="branchSource"></p><label>Branch label<input id="branchName" value="Alternative continuation" maxlength="120"></label><label>Intervention to apply<textarea id="branchNote" placeholder="For example: use the same target state with a different next agent action."></textarea></label><p>The exported plan records the source checkpoint and expected state. A separate authenticated execution service must validate retained checkpoint files, restore the target, and append a new trajectory. This viewer does none of those operations.</p><div class="dialog-actions"><button id="cancelBranch">Cancel</button><button id="saveBranch" class="primary">Export branch plan</button></div></dialog>
+        <script id="embedded-evidence" type="application/json">__EMBEDDED_EVIDENCE__</script>
+        <script>
+        "use strict";
+        const $ = id => document.getElementById(id);
+        const SVGNS = "http://www.w3.org/2000/svg";
+        const COLORS = {tool:"#89afff",llm:"#bb9cff",checkpoint:"#52dec6",restore:"#ffc77d",failure:"#ff8994",divergence:"#ffc77d",assertion:"#98b2cb",observation:"#6d91ba",setup:"#7187a5",event:"#89afff"};
+        const MAX_FILE = 2 * 1024 * 1024, MAX_TOTAL = 32 * 1024 * 1024;
+        const app = {data:null,trace:null,index:0,zoom:1,timer:null,compareA:null,compareB:null};
+        const text = value => value === undefined || value === null ? "Not recorded" : typeof value === "object" ? JSON.stringify(value) : String(value);
+        const el = (tag, attrs={}, content) => { const n=document.createElement(tag); for(const [k,v] of Object.entries(attrs)){if(k==="class")n.className=v;else n.setAttribute(k,v);} if(content!==undefined)n.textContent=content;return n;};
+        const sv = (tag, attrs={}, content) => {const n=document.createElementNS(SVGNS,tag);for(const [k,v] of Object.entries(attrs))n.setAttribute(k,v);if(content!==undefined)n.textContent=content;return n;};
+        const short = (v,n=35) => {let s=text(v);return s.length>n?s.slice(0,n-3)+"...":s;};
+        const clone = o => JSON.parse(JSON.stringify(o));
+        const parseJSON = (s,fallback=null) => {try{return JSON.parse(s)}catch{return fallback}};
+        const checkpointOK = n => n.kind === "checkpoint" && n.status === "passed";
+        const currentTrace = () => app.data?.traces.find(t=>t.id===app.trace);
+        const currentNode = () => currentTrace()?.nodes[app.index];
+        function toast(message){$("toast").textContent=message;$("toast").classList.add("visible");clearTimeout(toast.timer);toast.timer=setTimeout(()=>$("toast").classList.remove("visible"),4500);}
+        function markers(s){return String(s||"").split(/\r?\n/).filter(l=>l.startsWith("V8_PROBE ")).map(l=>parseJSON(l.slice(9))).filter(x=>x&&typeof x==="object");}
+        function inferKind(label, argv, status){
+          if(status==="failed")return "failure";
+          if(argv?.[0]==="docker" && argv[1]==="checkpoint" && argv[2]==="create")return "checkpoint";
+          if(argv?.includes("--checkpoint"))return "restore";
+          if(/checkpoint-create/.test(label))return "checkpoint";
+          if(/checkpoint-restore/.test(label))return "restore";
+          return "tool";
+        }
+        function normalizeFiles(files, metadata={}){
+          const normalized = files.map(f=>({name:String(f.name).replace(/\\/g,"/"),text:f.text}));
+          const sessions=normalized.filter(f=>/\.json$/.test(f.name)).map(f=>({name:f.name,data:parseJSON(f.text)})).filter(s=>s.data?.schema==="trajectory-atlas/v1");
+          if(sessions.length===1)return validateData(sessions[0].data);
+          if(sessions.length>1){
+            const merged={schema:"trajectory-atlas/v1",synthetic:sessions.some(s=>s.data.synthetic===true),title:"Combined imported sessions",traces:[],warnings:["Multiple sessions merged with namespaced IDs. Synthetic content makes this a demonstration dataset."],provenance:{source:"Multiple local session files",control_mode:"offline"}};
+            sessions.forEach((s,i)=>{const d=validateData(s.data),prefix="session"+i+"/";for(const t of d.traces){t.id=prefix+t.id;t.label=s.name.split("/").at(-1)+" / "+t.label;for(const n of t.nodes){n.id=prefix+n.id;n.trace_id=t.id;}if(t.parent)t.parent={trace_id:prefix+t.parent.trace_id,event_id:prefix+t.parent.event_id};merged.traces.push(t);}merged.warnings.push(...d.warnings);});
+            return validateData(merged);
+          }
+          const map = new Map(normalized.map(f=>[f.name,f.text]));
+          const dirs = new Set();
+          for(const f of normalized)if(/(^|\/)(report\.json|events\.jsonl|events\.json|results\.json|setup\.json|daemon-setup\.json)$/.test(f.name))dirs.add(f.name.slice(0,f.name.lastIndexOf("/")+1));
+          const data={schema:"trajectory-atlas/v1",synthetic:false,title:"V8 checkpoint evidence",traces:[],warnings:[],provenance:{...metadata,source:"Imported evidence files",control_mode:"offline",raw_memory_included:false},coverage:{files:files.length}};
+          for(const dir of dirs){
+            const get = name => map.get(dir+name);
+            const report = parseJSON(get("report.json"),parseJSON(get("results.json"),{})) || {};
+            const runID = String(report.run_id || metadata.run_id || dir.replace(/\/$/,"") || "run") + (data.traces.length ? "-"+data.traces.length:"");
+            const trace={id:runID,label:dir.replace(/\/$/,"")||"Recorded run",status:report.status||"unknown",nodes:[],checks:[],samples:[],parent:null,provenance:{image:report.image||metadata.image,source_directory:dir,report_status:report.status,failed_stage:report.failed_stage,limitations:report.limitations},restore_available:false};
+            let serial=0,lastState=null;
+            const add=n=>{n.id=runID+"/e"+(++serial);n.trace_id=runID;trace.nodes.push(n);return n;};
+            for(const setupName of ["setup.json","daemon-setup.json"]){const setup=parseJSON(get(setupName));if(setup)add({kind:"setup",label:setupName==="setup.json"?"CRIU setup":"Docker configuration",status:setup.status||"unknown",stage:setup.last_phase||setup.stage||"setup",time:setup.finished_utc||setup.started_utc||null,detail:setup});}
+            let events=[];
+            if(get("events.jsonl")){for(const [i,line] of get("events.jsonl").split(/\r?\n/).entries()){if(!line.trim())continue;const e=parseJSON(line);if(e&&typeof e==="object")events.push(e);else data.warnings.push(`${dir}events.jsonl line ${i+1}: invalid JSON, omitted from graph.`);}}
+            else events=parseJSON(get("events.json"),[])||[];
+            if(!Array.isArray(events)){data.warnings.push(dir+"events: expected an array");events=[];}
+            const pending=new Map();
+            const finish=(event,start={})=>{
+              const label=event.label||start.label||"command",argv=event.argv||start.argv||[];
+              const status=event.exit_code===0||event.code===0?"passed":event.exit_code!==undefined||event.code!==undefined?"failed":"unknown";
+              const out=get(label+".stdout.txt")??get(label+".stdout.log")??event.stdout??"";
+              const err=get(label+".stderr.txt")??get(label+".stderr.log")??event.stderr??"";
+              const observations=markers(out);if(observations.length)lastState=observations.at(-1);
+              const kind=inferKind(label,argv,status);
+              let cp=null;if(kind==="checkpoint")cp=argv.at(-1)||event.checkpoint||label;
+              const n=add({kind,label:label.replace(/^\d+-/,""),status,stage:start.stage||event.stage||"command",time:event.utc||event.time||start.utc||null,start_time:start.utc||start.time||null,duration_s:event.elapsed_s??event.duration_s,argv,stdout:out,stderr:err,exit_code:event.exit_code??event.code,checkpoint:cp,snapshot:lastState?clone(lastState):null,snapshot_source:observations.length?"Latest V8 marker observed in this command output":lastState?"Last observed marker, carried forward; not a fresh measurement":null,detail:event});
+              if(kind==="restore")n.checkpoint=argv[argv.indexOf("--checkpoint")+1]||event.checkpoint||null;
+              return n;
+            };
+            for(const e of events){
+              if(e.kind==="command_start"){pending.set(e.label,e);continue;}
+              if(e.kind==="command_end"){finish(e,pending.get(e.label));pending.delete(e.label);continue;}
+              if(e.kind==="command"){finish(e,e);continue;}
+              if(e.kind==="assertion"){
+                trace.checks.push({name:e.name,passed:e.passed===true?true:e.passed===false?false:null,stage:e.stage});
+                add({kind:e.passed===false?"failure":"assertion",label:e.name||"Assertion",status:e.passed===true?"passed":e.passed===false?"failed":"unknown",stage:e.stage,time:e.utc||e.time,detail:e});
+              } else if(e.kind==="resource_sample")trace.samples.push(e);
+              else if(e.kind==="experiment_failed")add({kind:"failure",label:"Experiment failed: "+(e.stage||"unknown"),status:"failed",stage:e.stage,time:e.utc||e.time,detail:e,stderr:e.error||""});
+              else if(e.kind==="capture"||e.kind==="restore")add({kind:e.kind==="capture"?"checkpoint":"restore",label:e.kind+" "+(e.checkpoint||""),checkpoint:e.checkpoint,status:e.exact_match===false?"failed":"unknown",time:e.utc||e.time,detail:e,snapshot:e.state?{filesystem:e.state,state_sha256:e.state_sha256}:null});
+              else add({kind:e.kind==="llm"?"llm":e.kind==="divergence"?"divergence":"event",label:e.kind||"Event",status:"recorded",stage:e.stage,time:e.utc||e.time,detail:e,snapshot:e.snapshot||null});
+            }
+            for(const e of pending.values())add({kind:"tool",label:e.label||"Unfinished command",status:"incomplete",stage:e.stage,time:e.utc||e.time,argv:e.argv,detail:e});
+            if(!events.length && Array.isArray(report.assertions))for(const a of report.assertions){trace.checks.push(a);add({kind:a.passed===false?"failure":"assertion",label:a.name||"Assertion",status:a.passed===true?"passed":a.passed===false?"failed":"unknown",stage:a.stage,detail:a});}
+            for(const r of report.rounds||[]){for(const [key,val] of Object.entries(r.checks||{})){const name=`round ${r.round}: ${key}`;if(!trace.checks.some(c=>c.name===name))trace.checks.push({name,passed:val===true?true:val===false?false:null,stage:"fidelity"});}}
+            if(report.status==="failed"&&!trace.nodes.some(n=>n.kind==="failure"&&n.label.startsWith("Experiment failed")))add({kind:"failure",label:"Experiment failed: "+(report.failed_stage||"unknown"),status:"failed",stage:report.failed_stage,time:report.finished_utc,stderr:report.exception||"Exception not included in imported report",detail:report});
+            if(!trace.nodes.length)add({kind:"event",label:"No execution events recorded",status:"unknown",detail:report});
+            if(!report.status)trace.status=trace.nodes.some(n=>n.status==="failed")?"failed":"unknown";
+            trace.provenance.complete_report=report;
+            data.traces.push(trace);
+          }
+          if(!data.traces.length)data.warnings.push("No report.json, events.jsonl, events.json, results.json, or setup report found. Select the extracted evidence folder, or a trajectory-atlas/v1 JSON session.");
+          data.warnings.push(...(metadata.omissions||[]));
+          return validateData(data);
+        }
+        function validateData(input){
+          if(!input||input.schema!=="trajectory-atlas/v1"||!Array.isArray(input.traces))throw Error("Expected a trajectory-atlas/v1 session with a traces array.");
+          const d=clone(input);d.warnings=Array.isArray(d.warnings)?d.warnings:[];d.provenance=d.provenance||{};
+          const ids=new Set(), allNodeIDs=new Set();
+          for(const [i,t] of d.traces.entries()){
+            t.id=String(t.id||"trace-"+i);if(ids.has(t.id))throw Error("Duplicate trajectory ID: "+t.id);ids.add(t.id);
+            t.label=String(t.label||t.id);t.nodes=Array.isArray(t.nodes)?t.nodes:[];t.checks=Array.isArray(t.checks)?t.checks:[];t.samples=Array.isArray(t.samples)?t.samples:[];
+            const nodeIDs=new Set();for(const [j,n] of t.nodes.entries()){n.id=String(n.id||t.id+"/e"+j);if(nodeIDs.has(n.id)||allNodeIDs.has(n.id))throw Error("Duplicate event ID: "+n.id);nodeIDs.add(n.id);allNodeIDs.add(n.id);n.trace_id=t.id;n.label=String(n.label||n.kind||"Event");n.kind=String(n.kind||"event");n.status=String(n.status||"unknown");if(n.kind==="checkpoint"&&n.status!=="passed")n.checkpoint=n.checkpoint||null;}
+          }
+          for(const t of d.traces){if(t.parent){const p=d.traces.find(x=>x.id===t.parent.trace_id);if(!p?.nodes.some(n=>n.id===t.parent.event_id)){d.warnings.push("Unresolved parent link for "+t.id+"; no fork connector drawn.");t.parent=null;}}}
+          for(const t of d.traces){const seen=new Set();let current=t;while(current?.parent){if(seen.has(current.id))throw Error("Cyclic parent links are not valid trajectory ancestry.");seen.add(current.id);current=d.traces.find(p=>p.id===current.parent.trace_id);}}
+          return d;
+        }
+        function load(data){stop();app.data=validateData(data);app.trace=app.data.traces[0]?.id||null;app.index=0;app.compareA=null;app.compareB=null;app.zoom=1;
+          const cp=currentTrace()?.nodes.findIndex(checkpointOK);if(cp>=0)app.index=cp;
+          renderAll();
+        }
+        function renderAll(){
+          const d=app.data,nodes=d.traces.flatMap(t=>t.nodes);
+          $("dataBadge").textContent=d.synthetic?"SYNTHETIC DEMONSTRATION":d.traces.length?"RECORDED EVIDENCE":"NO EVIDENCE";$("dataBadge").className="pill "+(d.synthetic?"warn":d.traces.length?"good":"warn");
+          $("notice").textContent=d.synthetic?"ILLUSTRATIVE DATA - These branches, timings, memory samples, and outcomes are synthetic. They demonstrate the interface; they are not results from your V8 run.":"Recorded evidence only. Rewind and play navigate the log; they do not execute Docker or restore a process. A failed run remains visible even when no checkpoint was captured.";$("notice").className="notice "+(d.synthetic?"":"real");
+          $("projectSubtitle").textContent=d.title||"V8 checkpoint evidence";
+          $("statTraces").textContent=d.traces.length;$("statEvents").textContent=nodes.length;$("statCP").textContent=nodes.filter(checkpointOK).length;$("statFailures").textContent=nodes.filter(n=>n.status==="failed").length;
+          $("provenance").textContent=JSON.stringify({schema:d.schema,synthetic:d.synthetic===true,...d.provenance,coverage:d.coverage,traces:d.traces.map(t=>({id:t.id,status:t.status,parent:t.parent,provenance:t.provenance}))},null,2);
+          $("warnings").replaceChildren(...d.warnings.map(w=>el("p",{class:"small muted"},w)));
+          renderSidebar();renderSnapshots();renderSelection();renderMatrix();renderResources();
+        }
+        EMBED_VIEWER_TEMPLATE_HTML_2
+        printf "Embedded viewer-template.html part 2/4; cumulative bytes: "
+        wc -c < "$BUNDLE_DIR/viewer-template.html"
+    - name: Embed viewer-template.html [3/4]
+      shell: bash
+      run: |
+        set -Eeuo pipefail
+        cat >> "$BUNDLE_DIR/viewer-template.html" <<'EMBED_VIEWER_TEMPLATE_HTML_3'
+        function renderSidebar(){const list=$("traceList");list.replaceChildren();for(const t of app.data.traces){const b=el("button",{class:"trace-button"+(t.id===app.trace?" active":""),"aria-pressed":String(t.id===app.trace)});b.append(el("span",{class:"trace-name"},t.label),el("span",{class:"trace-sub"},`${t.nodes.length} events / ${t.status||"unknown"}`));b.onclick=()=>{stop();app.trace=t.id;app.index=0;renderSidebar();renderSelection();};list.append(b);}if(!app.data.traces.length)list.append(el("div",{class:"small muted"},"No trajectories loaded."));}
+        function nodePositions(){
+         const traces=app.data.traces, pos=new Map(), axis=$("axisMode").value;
+         const calculate=(t,trail=new Set())=>{
+           if(pos.has(t.id))return pos.get(t.id);if(trail.has(t.id))return [];
+           trail.add(t.id);let offset=0;
+           if(axis==="step"&&t.parent){const p=traces.find(x=>x.id===t.parent.trace_id);if(p){const pp=calculate(p,new Set(trail)),pi=p.nodes.findIndex(n=>n.id===t.parent.event_id);offset=(pp[pi]??0)+1;}}
+           const rawTimes=t.nodes.map(n=>Date.parse(n.time));const valid=rawTimes.filter(Number.isFinite);const start=valid.length?Math.min(...valid):null;
+           let previous=0;const pp=t.nodes.map((n,i)=>{let x=axis==="step"?offset+i:Number.isFinite(rawTimes[i])&&start!==null?(rawTimes[i]-start)/1000:previous;previous=x;return Math.max(0,x);});pos.set(t.id,pp);return pp;
+         };traces.forEach(t=>calculate(t));return pos;
+        }
+        function drawGraph(){
+         const graph=$("graph");graph.replaceChildren();const traces=app.data.traces,pos=nodePositions(),isTime=$("axisMode").value==="time";
+         const flat=[...pos.values()].flat(),max=Math.max(1,...flat),baseW=Math.max(850,$("graphScroll").clientWidth),spacing=isTime?Math.max(1,(baseW-210)/max):65;
+         const content=Math.max(baseW,(isTime?baseW:(max+1)*spacing+195)*app.zoom),height=Math.max(170,traces.length*83+65),x=u=>175+u*((content-225)/max),y=i=>60+i*83;
+         graph.setAttribute("width",content);graph.setAttribute("height",height);graph.setAttribute("viewBox",`0 0 ${content} ${height}`);
+         for(let i=0;i<=8;i++){let u=max*i/8;let px=x(u);graph.append(sv("line",{x1:px,x2:px,y1:28,y2:height-22,stroke:"#273347","stroke-dasharray":"3 5"}),sv("text",{x:px,y:18,fill:"#7d8ca4","font-size":10,"text-anchor":"middle"},isTime?u.toFixed(1)+"s":String(Math.round(u))));}
+         const query=$("search").value.toLowerCase();let matches=0;
+         traces.forEach((t,i)=>{
+           graph.append(sv("rect",{x:0,y:y(i)-25,width:content,height:52,fill:t.id===app.trace?"#172731":"#121c2a"}));
+           graph.append(sv("text",{x:16,y:y(i)-2,fill:t.id===app.trace?"#dcf8f2":"#b1bfd3","font-size":12,"font-weight":600},short(t.label,21)));
+           graph.append(sv("text",{x:16,y:y(i)+15,fill:"#778ba6","font-size":10},t.parent?"explicit fork / "+t.nodes.length+" events":"independent trace / "+t.nodes.length+" events"));
+           const pp=pos.get(t.id)||[];
+           if(pp.length)graph.append(sv("path",{d:pp.map((p,j)=>(j?"L":"M")+x(p)+" "+y(i)).join(" "),stroke:t.id===app.trace?"#547c86":"#3b4d67","stroke-width":2,fill:"none"}));
+           if(t.parent){const parentIndex=traces.findIndex(p=>p.id===t.parent.trace_id);const p=traces[parentIndex];const pn=p?.nodes.findIndex(n=>n.id===t.parent.event_id);if(p&&pn>=0&&pp.length){const sx=x(pos.get(p.id)[pn]),sy=y(parentIndex),tx=x(pp[0]),ty=y(i);graph.append(sv("path",{d:`M${sx} ${sy} C${sx+30} ${sy} ${tx-30} ${ty} ${tx} ${ty}`,stroke:"#697e9d","stroke-width":1.5,"stroke-dasharray":"5 4",fill:"none"}));}}
+           t.nodes.forEach((n,j)=>{const cx=x(pp[j]),cy=y(i),selected=t.id===app.trace&&j===app.index,match=!query||JSON.stringify(n).toLowerCase().includes(query);if(match)matches++;
+             const g=sv("g",{class:"node",tabindex:0,role:"button","aria-label":`${t.label}: ${n.label}, ${n.status}`,opacity:match?1:.16,"data-event":n.id});const color=n.status==="failed"?COLORS.failure:COLORS[n.kind]||COLORS.event;
+             if(selected){g.append(sv("circle",{cx,cy,r:14,fill:"#52dec61a",stroke:"#e8fff7","stroke-width":1.3}));graph.append(sv("line",{x1:cx,x2:cx,y1:29,y2:height-20,stroke:"#91d9cd","stroke-dasharray":"2 6",opacity:.5}));}
+             if(n.kind==="checkpoint")g.append(sv("rect",{x:cx-6,y:cy-6,width:12,height:12,rx:1,transform:`rotate(45 ${cx} ${cy})`,fill:color,stroke:"#101824","stroke-width":1.5}));
+             else if(n.status==="failed")g.append(sv("rect",{x:cx-6,y:cy-6,width:12,height:12,rx:2,fill:color}));
+             else g.append(sv("circle",{cx,cy,r:n.kind==="llm"?6:5,fill:color,stroke:"#101824","stroke-width":1.5}));
+             g.append(sv("title",{},`${n.label}\n${n.status}\n${n.time||"Time not recorded"}`));
+             if(n.kind==="checkpoint"||n.kind==="divergence"||n.status==="failed"||selected)g.append(sv("text",{x:cx,y:cy+33,fill:selected?"#e8edf6":"#9badc6","font-size":10,"text-anchor":"middle"},short(n.checkpoint||n.label,23)));
+             const go=()=>{stop();app.trace=t.id;app.index=j;renderSidebar();renderSelection();};g.onclick=go;g.onkeydown=e=>{if(e.key==="Enter"||e.key===" "){e.preventDefault();go();}};graph.append(g);
+           });
+         });
+         $("graphCaption").textContent=`${matches} / ${flat.length} events match. ${isTime?"Relative to each trace's first recorded timestamp; missing times share the preceding position.":"Event order, not elapsed duration. Explicit branches align to their parent event."}`;
+        }
+        function checkpointTargets(){
+          const local=currentTrace();if(!local)return [];
+          const targets=[];const visited=new Set();
+          function collect(t,limit){
+            if(!t||visited.has(t.id))return;visited.add(t.id);
+            if(t.parent){const p=app.data.traces.find(p=>p.id===t.parent.trace_id);const limit=p?.nodes.findIndex(n=>n.id===t.parent.event_id);if(p&&limit>=0)collect(p,limit);}
+            t.nodes.forEach((n,i)=>{if(i<=limit&&checkpointOK(n))targets.push({n,i,trace:t.id,label:t.label,value:t.id===app.trace?String(i):"ancestor:"+n.id});});
+          }
+          collect(local,local.nodes.length-1);return targets;
+        }
+        function renderSelection(){
+         const t=currentTrace(),n=currentNode(),count=t?.nodes.length||0;
+         $("scrubber").max=Math.max(0,count-1);$("scrubber").value=app.index;$("scrubber").disabled=!count;$("cursorText").textContent=`EVENT ${count?app.index+1:0} / ${count}`;$("cursorTime").textContent=n?.duration_s!==undefined?n.duration_s.toFixed?.(3)+"s command":n?.time?new Date(n.time).toLocaleTimeString():"Time unknown";
+         $("prev").disabled=!count||app.index===0;$("next").disabled=!count||app.index>=count-1;$("play").disabled=!count;
+         const cps=checkpointTargets();
+         $("rewind").disabled=!cps.some(c=>c.trace!==app.trace||c.i<app.index);
+         const options=[el("option",{value:""},cps.length?"Jump to capture...":"No successful capture")];for(const cp of cps)options.push(el("option",{value:cp.value},`${cp.n.checkpoint||cp.n.label} / ${cp.trace===app.trace?"event "+(cp.i+1):cp.label}`));$("checkpointSelect").replaceChildren(...options);$("checkpointSelect").disabled=!cps.length;
+         renderInspector();drawGraph();
+        }
+        function renderInspector(){
+         const node=currentNode(),t=currentTrace(),body=$("inspector");body.replaceChildren();$("eventStatus").textContent=node?.status?.toUpperCase()||"NO EVENT";$("eventStatus").className="pill "+(node?.status==="failed"?"bad":node?.status==="passed"?"good":node?.status==="diverged"?"warn":"");
+         if(!node){body.append(el("div",{class:"empty"},"Choose an evidence folder or a saved session. This page does not manufacture checkpoints when the run failed before capture."));return;}
+         body.append(el("div",{class:"eyebrow"},(node.stage||node.kind||"event").toUpperCase()),el("div",{class:"event-title"},node.label));
+         const dl=el("dl",{class:"kv"});for(const [key,val] of [["Trajectory",t.label],["Event ID",node.id],["Recorded at",node.time],["Exit code",node.exit_code],["Checkpoint",node.checkpoint]]){dl.append(el("dt",{},key),el("dd",{class:key==="Trajectory"?"":"mono"},text(val)));}body.append(dl);
+         const actions=el("div",{class:"inspector-actions"});const pin=el("button",{},"Use state as reference");pin.disabled=!node.snapshot;pin.onclick=()=>{app.compareA=node.id;$("compareA").value=node.id;renderDiff();toast("Reference observation selected.");};actions.append(pin);
+         const inspect=el("button",{},"Compare this state");inspect.disabled=!node.snapshot;inspect.onclick=()=>{app.compareB=node.id;$("compareB").value=node.id;renderDiff();};actions.append(inspect);
+         const branch=el("button",{},"Plan branch here");branch.id="planBranch";branch.disabled=!checkpointOK(node);branch.onclick=openBranch;actions.append(branch);body.append(actions);
+         const live=el("button",{disabled:"",title:"No execution backend is connected. The CI container and its checkpoints are not retained."},"Live restore unavailable");body.append(live,el("div",{class:"scope-note"},"Inspection rewind changes only your viewing position. Runtime restoration needs a retained checkpoint and a live authenticated runner. No restore command is issued from this page."));
+         if(node.snapshot_source)body.append(el("p",{class:"small muted"},node.snapshot_source));
+         for(const [title,value] of [["Command arguments",node.argv],["Standard output",node.stdout],["Standard error",node.stderr],["Recorded event",node.detail||node],["State observation",node.snapshot]]){if(value===undefined||value===null||value==="")continue;const details=el("details");if(title==="Standard error"&&node.status==="failed")details.open=true;details.append(el("summary",{},title),el("pre",{},typeof value==="string"?value:JSON.stringify(value,null,2)));body.append(details);}
+        }
+        function snapshots(){return app.data.traces.flatMap(t=>t.nodes.filter(n=>n.snapshot).map(n=>({trace:t,node:n})));}
+        function renderSnapshots(){
+         const ss=snapshots();for(const id of ["compareA","compareB"]){const options=[el("option",{value:""},"Select recorded observation...")];for(const s of ss)options.push(el("option",{value:s.node.id},short(s.trace.label+" / "+s.node.label,70)));$(id).replaceChildren(...options);}
+         if(!app.compareA&&ss.length)app.compareA=ss.find(s=>checkpointOK(s.node))?.node.id||ss[0].node.id;
+         if(!app.compareB&&ss.length)app.compareB=ss.find(s=>s.node.kind==="restore"&&s.node.id!==app.compareA)?.node.id||ss.at(-1).node.id;
+         $("compareA").value=app.compareA||"";$("compareB").value=app.compareB||"";renderDiff();
+        }
+        function getNode(id){for(const t of app.data.traces){const n=t.nodes.find(n=>n.id===id);if(n)return n;}return null;}
+        function renderDiff(){
+         const a=getNode(app.compareA)?.snapshot,b=getNode(app.compareB)?.snapshot,body=$("diffBody");body.replaceChildren();$("heapGrid").replaceChildren();
+         if(!a||!b){body.append(el("p",{class:"small muted"},"Choose two captured or observed states. Your latest failed-start run may have none; no values will be fabricated."));$("heapCount").textContent="Not recorded";$("heapDetail").textContent="No comparable typed-array snapshots.";return;}
+         const table=el("table",{class:"diff-table"}),head=el("tr");["Probe field","Reference","Comparison","Result"].forEach(x=>head.append(el("th",{},x)));table.append(head);
+         const keys=["token","tick","digest","hot","words","state_sha256"];
+         for(const k of keys){if(k==="state_sha256"&&a[k]===undefined&&b[k]===undefined)continue;const known=a[k]!==undefined&&b[k]!==undefined&&a[k]!==null&&b[k]!==null,match=known&&JSON.stringify(a[k])===JSON.stringify(b[k]);const tr=el("tr");tr.append(el("td",{},k),el("td",{title:text(a[k])},short(a[k],16)),el("td",{title:text(b[k])},short(b[k],16)),el("td",{class:known?(match?"match":"mismatch"):"unknown"},known?(match?"EQUAL":"DIFF"):"UNKNOWN"));table.append(tr);}body.append(table);
+         const aa=a.heap_words,bb=b.heap_words;
+         if(!Array.isArray(aa)||!Array.isArray(bb)){$("heapCount").textContent="Not recorded";$("heapDetail").textContent="Array words missing from one or both observations; digest equality alone is not byte-for-byte evidence.";return;}
+         const size=Math.max(aa.length,bb.length),group=Math.max(1,Math.ceil(size/128));let changed=0,missing=0;for(let i=0;i<size;i++){if(i>=aa.length||i>=bb.length)missing++;else if(aa[i]!==bb[i])changed++;}
+         $("heapCount").textContent=`${changed} different / ${missing} missing / ${size} words`;
+         for(let start=0;start<size;start+=group){const end=Math.min(size,start+group);let diff=0,unknown=0;for(let i=start;i<end;i++){if(i>=aa.length||i>=bb.length)unknown++;else if(aa[i]!==bb[i])diff++;}const label=`Words ${start}-${end-1}: ${diff} different, ${unknown} missing`;const btn=el("button",{class:"heap-cell "+(unknown?"":diff?"changed":"same"),title:label,"aria-label":label});btn.onclick=()=>{$("heapDetail").textContent=label+". "+Array.from({length:Math.min(5,end-start)},(_,j)=>`${start+j}: ${text(aa[start+j])} -> ${text(bb[start+j])}`).join("; ");};$("heapGrid").append(btn);}
+         $("heapDetail").textContent=`Each square covers up to ${group} probe words. Teal: equal. Pink: differs. Gray: missing. Click for indices. These are not all V8 heap pages.`;
+        }
+        function renderMatrix(){
+         const categories=[['Capture',/stopped after dump|checkpoint.*create|capture/i],['Restore',/running after restore|checkpoint.*restore/i],['Token',/same.*token/i],['Counter',/exact_counter/i],['4096 words',/4096.*exact|all_4096/i],['New output',/new_output|execution_advances/i],['Alive',/alive_after_restore/i]];
+         const body=$("matrixBody"),table=el("table",{class:"matrix"}),head=el("tr");head.append(el("th",{},"Trajectory / round"));categories.forEach(c=>head.append(el("th",{},c[0])));table.append(head);let passes=0,fails=0;
+         for(const t of app.data.traces){const rounds=[...new Set(t.checks.map(c=>String(c.name||"").match(/^round (\d+):/)?.[1]).filter(Boolean))];const groups=rounds.length?rounds:[null];for(const r of groups){const checks=t.checks.filter(c=>r===null||String(c.name).startsWith("round "+r+":"));const row=el("tr"),label=el("td",{},t.label);label.append(el("span",{},r?"round "+r:"no recorded fidelity round"));row.append(label);
+         for(const [name,pattern] of categories){const values=checks.filter(c=>pattern.test(c.name||"")).map(c=>c.passed);const outcome=values.some(v=>v===false)?"FAIL":values.length&&values.every(v=>v===true)?"PASS":"--";if(outcome==="PASS")passes++;if(outcome==="FAIL")fails++;row.append(el("td",{class:outcome==="PASS"?"match":outcome==="FAIL"?"mismatch":"unknown",title:values.length?checks.filter(c=>pattern.test(c.name||"")).map(c=>c.name+": "+c.passed).join("\n"):"No explicit assertion recorded"},outcome));}table.append(row);}}
+         body.replaceChildren(table);if(!app.data.traces.length)body.append(el("div",{class:"empty"},"No evidence loaded."));$("matrixSummary").textContent=`${passes} passing cells / ${fails} failing cells`;
+        }
+        function renderResources(){
+         const body=$("resourceBody");body.replaceChildren();const series=app.data.traces.map(t=>({t,s:t.samples.filter(s=>Number.isFinite(s.rss_bytes)&&Number.isFinite(s.relative_s))})).filter(x=>x.s.length);
+         if(!series.length){$("resourceStatus").textContent="NOT RECORDED";body.append(el("div",{class:"empty"},"No RSS time series was recorded. The page deliberately leaves this chart empty instead of estimating memory from the Docker image size or the container limit."));return;}
+         $("resourceStatus").textContent=app.data.synthetic?"SYNTHETIC SAMPLES":"RECORDED RSS";const svg=sv("svg",{viewBox:"0 0 900 150",role:"img","aria-label":"Recorded RSS versus relative seconds"});const maxT=Math.max(1,...series.flatMap(x=>x.s.map(s=>s.relative_s))),maxM=Math.max(1,...series.flatMap(x=>x.s.map(s=>s.rss_bytes/1048576)))*1.15;
+         for(let i=0;i<4;i++){const yy=115-i*30;svg.append(sv("line",{x1:65,x2:870,y1:yy,y2:yy,stroke:"#2a374b"}),sv("text",{x:54,y:yy+4,fill:"#a2afc4","text-anchor":"end","font-size":10},(i*maxM/3).toFixed(0)+" MiB"));}
+        EMBED_VIEWER_TEMPLATE_HTML_3
+        printf "Embedded viewer-template.html part 3/4; cumulative bytes: "
+        wc -c < "$BUNDLE_DIR/viewer-template.html"
+    - name: Embed viewer-template.html [4/4]
+      shell: bash
+      run: |
+        set -Eeuo pipefail
+        cat >> "$BUNDLE_DIR/viewer-template.html" <<'EMBED_VIEWER_TEMPLATE_HTML_4'
+         series.forEach(({t,s},i)=>{const color=[COLORS.tool,COLORS.checkpoint,COLORS.llm,COLORS.failure][i%4];svg.append(sv("path",{d:s.map((a,j)=>(j?"L":"M")+(65+a.relative_s/maxT*805)+" "+(115-a.rss_bytes/1048576/maxM*90)).join(" "),stroke:color,"stroke-width":2,fill:"none"}));svg.append(sv("text",{x:65+i*190,y:145,fill:color,"font-size":10},short(t.label,25)));});svg.append(sv("text",{x:870,y:131,fill:"#a2afc4","text-anchor":"end","font-size":10},maxT.toFixed(1)+"s relative to each run"));body.append(svg);
+        }
+        function select(i){const t=currentTrace();if(!t)return;app.index=Math.max(0,Math.min(t.nodes.length-1,i));renderSelection();}
+        function stop(){if(app.timer)clearTimeout(app.timer);app.timer=null;$("play").textContent="Play evidence";}
+        function play(){if(app.timer){stop();return;}const t=currentTrace();if(!t?.nodes.length)return;if(app.index>=t.nodes.length-1)select(0);$("play").textContent="Pause replay";const tick=()=>{if(app.index>=currentTrace().nodes.length-1){stop();return;}select(app.index+1);app.timer=setTimeout(tick,Number($("speed").value));};app.timer=setTimeout(tick,Number($("speed").value));}
+        function rewind(){stop();const targets=checkpointTargets().filter(c=>c.trace!==app.trace||c.i<app.index);const cp=targets.at(-1);if(!cp){toast("No earlier successful checkpoint in this trajectory or its recorded ancestry.");return;}app.trace=cp.trace;app.index=cp.i;renderSidebar();renderSelection();toast("Inspection cursor rewound. No runtime restore was performed.");}
+        function download(name,data){const blob=new Blob([typeof data==="string"?data:JSON.stringify(data,null,2)],{type:"application/json"});const url=URL.createObjectURL(blob),a=el("a",{href:url,download:name});document.body.append(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),1000);}
+        function openBranch(){const n=currentNode();if(!checkpointOK(n))return;$("branchSource").textContent=`Source: ${currentTrace().label} / ${n.checkpoint||n.id}. This creates a request document, not a new measured trajectory.`;$("branchDialog").showModal();}
+        function branchPlan(){const n=currentNode(),t=currentTrace();return {schema:"trajectory-atlas/branch-plan-v1",plan_only:true,execute:false,synthetic_source:app.data.synthetic===true,created_at:new Date().toISOString(),source:{trace_id:t.id,event_id:n.id,checkpoint:n.checkpoint,provenance:t.provenance,expected_observed_state:n.snapshot||null},branch:{label:$("branchName").value.trim(),intervention:$("branchNote").value.trim()},requirements:["Retained checkpoint files and compatible original runtime","Validate image, kernel, CRIU version, and source-state provenance","Use a trusted authenticated executor; never execute commands from untrusted evidence","Append a new measured trajectory with an explicit parent link"],execution_status:"not_requested_no_backend"};}
+        async function importFiles(fileList){
+         try{let total=0,files=[],omissions=[];for(const f of fileList){const name=f.webkitRelativePath||f.name;if(!/\.(json|jsonl|txt|log)$/i.test(name))continue;if(f.size>MAX_FILE||total+f.size>MAX_TOTAL){omissions.push(name+": not embedded (size limit); original file remains unchanged.");continue;}total+=f.size;files.push({name,text:await f.text()});}load(normalizeFiles(files,{source:"User-selected local files",omissions}));toast(`Loaded ${files.length} local files. Nothing was uploaded.`);}catch(e){toast("Import failed: "+e.message);}
+        }
+        $("importBtn").onclick=()=>$("fileInput").click();$("folderBtn").onclick=()=>$("folderInput").click();$("fileInput").onchange=e=>importFiles(e.target.files);$("folderInput").onchange=e=>importFiles(e.target.files);
+        $("exportBtn").onclick=()=>download("trajectory-session.json",app.data);$("search").oninput=drawGraph;$("axisMode").onchange=drawGraph;$("zoomIn").onclick=()=>{app.zoom=Math.min(5,app.zoom*1.3);drawGraph();};$("zoomOut").onclick=()=>{app.zoom=Math.max(.3,app.zoom/1.3);drawGraph();};
+        $("prev").onclick=()=>{stop();select(app.index-1);};$("next").onclick=()=>{stop();select(app.index+1);};$("play").onclick=play;$("rewind").onclick=rewind;$("scrubber").oninput=e=>{stop();select(Number(e.target.value));};$("checkpointSelect").onchange=e=>{const cp=checkpointTargets().find(c=>c.value===e.target.value);if(cp){stop();app.trace=cp.trace;app.index=cp.i;renderSidebar();renderSelection();}};
+        $("compareA").onchange=e=>{app.compareA=e.target.value;renderDiff();};$("compareB").onchange=e=>{app.compareB=e.target.value;renderDiff();};
+        $("firstFailure").onclick=()=>{for(const t of app.data.traces){const i=t.nodes.findIndex(n=>n.status==="failed");if(i>=0){stop();app.trace=t.id;app.index=i;renderSidebar();renderSelection();return;}}toast("No explicit failure event is present in the loaded evidence.");};
+        $("cancelBranch").onclick=()=>$("branchDialog").close();$("saveBranch").onclick=()=>{download("branch-plan.json",branchPlan());$("branchDialog").close();toast("Plan exported. No branch was executed or added to the evidence.");};
+        document.addEventListener("keydown",e=>{if(["INPUT","TEXTAREA","SELECT","BUTTON"].includes(e.target.tagName)||$("branchDialog").open)return;if(e.key===" "){e.preventDefault();play();}else if(e.key==="ArrowRight"){e.preventDefault();stop();select(app.index+1);}else if(e.key==="ArrowLeft"){e.preventDefault();stop();select(app.index-1);}else if(e.key.toLowerCase()==="r")rewind();});
+        window.addEventListener("resize",()=>app.data&&drawGraph());
+        document.body.addEventListener("dragover",e=>{e.preventDefault();document.body.classList.add("drop-active");});document.body.addEventListener("dragleave",()=>document.body.classList.remove("drop-active"));document.body.addEventListener("drop",e=>{e.preventDefault();document.body.classList.remove("drop-active");importFiles(e.dataTransfer.files);});
+        try{const embedded=JSON.parse($("embedded-evidence").textContent);load(embedded.schema==="trajectory-atlas/v1"?embedded:normalizeFiles(embedded.files||[],embedded.metadata||{}));}catch(e){load({schema:"trajectory-atlas/v1",synthetic:false,traces:[],warnings:["Initial data could not be loaded: "+e.message],provenance:{}});}
+        // A small, explicit test surface; it has no network or execution capabilities.
+        window.Atlas={normalizeFiles,validateData,load,getData:()=>app.data,getSelection:()=>({trace:app.trace,index:app.index}),select,rewind,branchPlan};
+        </script>
+        </body>
+        </html>
+        EMBED_VIEWER_TEMPLATE_HTML_4
+        printf "Embedded viewer-template.html part 4/4; cumulative bytes: "
+        wc -c < "$BUNDLE_DIR/viewer-template.html"
+    - name: Embed install_criu.sh [1/1]
+      shell: bash
+      run: |
+        set -Eeuo pipefail
+        cat > "$BUNDLE_DIR/install_criu.sh" <<'EMBED_INSTALL_CRIU_SH_1'
         set -Eeuo pipefail
         export LC_ALL=C
         EVIDENCE_DIR="${EVIDENCE_DIR:-$PWD/evidence}"
@@ -471,6 +1090,8 @@ jobs:
         EVIDENCE_DIR="$(realpath "$EVIDENCE_DIR")"
         export EVIDENCE_DIR
         exec > >(tee "$EVIDENCE_DIR/criu-install.log") 2>&1
+        export PS4='+ [${EPOCHREALTIME}] [criu:${phase:-initialization}:${LINENO}] '
+        set -x
         phase=initialization
         source_commit=''
         finish() {
@@ -546,82 +1167,391 @@ jobs:
         phase=complete
         echo 'CRIU native binary is installed and its --version invocation succeeded.'
         echo 'This is NOT a claim that kernel or Docker checkpoint/restore works.'
-    - name: Enable and verify Docker server experimental mode
-      id: daemon_setup
-      if: ${{ !cancelled() && steps.criu_setup.outcome == 'success' }}
-      continue-on-error: true
+        EMBED_INSTALL_CRIU_SH_1
+        printf "Embedded install_criu.sh part 1/1; cumulative bytes: "
+        wc -c < "$BUNDLE_DIR/install_criu.sh"
+    - name: Embed host_diagnostics.sh [1/1]
       shell: bash
       run: |
-        python3 -u "$RUNNER_TEMP/checkpoint_probe.py" daemon
-    - name: Checkpoint and restore a live d8 heap (or report the blocking setup stage)
-      id: experiment
-      if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
+        set -Eeuo pipefail
+        cat > "$BUNDLE_DIR/host_diagnostics.sh" <<'EMBED_HOST_DIAGNOSTICS_SH_1'
+        #!/usr/bin/env bash
+        set -uo pipefail
+        export LC_ALL=C
+        export PS4='+ [${EPOCHREALTIME}] [host:${LINENO}] '
+        set -x
+        probe() {
+          printf '\n========== %s ==========\n' "$1"
+          shift
+          "$@"
+          rc=$?
+          printf '\nDIAGNOSTIC EXIT=%s\n' "$rc"
+          return 0
+        }
+        probe UTC date -u --iso-8601=seconds
+        probe OS uname -a
+        probe DISTRIBUTION cat /etc/os-release
+        probe ID id
+        probe SUDO sudo -n true
+        probe CPU lscpu
+        probe MEMORY free -h
+        probe MEMINFO cat /proc/meminfo
+        probe DISK df -hT
+        probe MEMORY_MAPPING sh -c 'ulimit -a; sysctl vm.overcommit_memory vm.overcommit_ratio vm.max_map_count kernel.randomize_va_space kernel.yama.ptrace_scope'
+        probe CGROUPS sh -c 'cat /proc/self/cgroup; stat -fc %T /sys/fs/cgroup; for f in memory.max memory.current memory.peak memory.swap.max memory.events; do echo "$f"; cat "/sys/fs/cgroup/$f" 2>/dev/null || true; done'
+        probe SECURITY sh -c 'grep -E "^(Cap|Seccomp|NoNewPrivs)" /proc/self/status'
+        probe DOCKER_VERSION docker version
+        probe DOCKER_INFO docker info
+        probe DOCKER_CHECKPOINT_HELP docker checkpoint --help
+        probe RUNC runc --version
+        probe CONTAINERD containerd --version
+        probe PREEXISTING_CRIU sh -c 'command -v criu; criu --version'
+        printf '\nNo environment dump, model API key, exploit payload, Docker socket mount, or public service is used.\n'
+        printf 'Disposable hosted runner only: the workflow restarts Docker and relaxes container seccomp/AppArmor for CRIU.\n'
+        EMBED_HOST_DIAGNOSTICS_SH_1
+        printf "Embedded host_diagnostics.sh part 1/1; cumulative bytes: "
+        wc -c < "$BUNDLE_DIR/host_diagnostics.sh"
+    - name: Embed report_tools.py [1/1]
+      shell: bash
+      run: |
+        set -Eeuo pipefail
+        cat > "$BUNDLE_DIR/report_tools.py" <<'EMBED_REPORT_TOOLS_PY_1'
+        """Summary, inventory, integrity and final fail-closed gate. Standard library only."""
+        import datetime
+        import hashlib
+        import html
+        import json
+        import os
+        from pathlib import Path
+        import sys
+
+        ROOT = Path(os.environ.get('EVIDENCE_DIR', 'evidence'))
+        ROOT.mkdir(parents=True, exist_ok=True)
+
+
+        def read(name):
+            try:
+                result = json.loads((ROOT / name).read_text())
+                if not isinstance(result, dict): raise ValueError('Expected a JSON object')
+                return result
+            except (OSError, ValueError) as exc:
+                return {'status': 'not_run', 'exception': str(exc)}
+
+
+        def summary():
+            records = {n: read(n) for n in ('self-tests.json', 'setup.json', 'daemon-setup.json', 'report.json')}
+            success = all(r.get('status') == 'passed' for r in records.values())
+            lines = ['# V8 checkpoint + HTML5 trajectory audit', '',
+                     '**Execution result: ' + ('PASS for this finite probe only' if success else 'NOT DEMONSTRATED') + '**', '',
+                     '| Stage | Status | Phase / error |', '|---|---|---|']
+            for name, r in records.items():
+                detail = str(r.get('last_phase', r.get('failed_stage', r.get('stage', ''))))
+                if r.get('exception'): detail += ' / ' + str(r['exception'])
+                lines.append('| ' + name + ' | ' + str(r.get('status','unknown')) + ' | ' + detail.replace('|','/').replace('\n',' ') + ' |')
+            experiment = records['report.json']
+            lines += ['', '## Explicit limits',
+                      'This uses the actual pinned V8 image and attempts live CRIU checkpoint/restore.',
+                      'The probe uses verified output APIs and a timed pause window; it does not require the removed shell read() API.',
+                      'Host time continues while the process is stopped. This does NOT claim deterministic clock replay.',
+                      'Exact equality is checked for 4,096 probe words, token, counter and hot-function result, not every byte of V8/JIT/OS state.',
+                      'The model/agent, sockets, cross-host migration and alternative-agent branches are not tested.',
+                      'HTML rewind navigates recorded observations only. No live execution service is embedded.',
+                      'Checkpoint memory images and the runtime container are not retained in the downloadable artifact.',
+                      '', '## Assertions', '| Check | Result |', '|---|---|']
+            for a in experiment.get('assertions', []):
+                lines.append('| ' + str(a['name']).replace('|','/') + ' | ' + ('PASS' if a.get('passed') is True else 'FAIL') + ' |')
+            lines += ['', '## Checkpoint / restore durations', '| Round | Dump seconds | Restore seconds |', '|---|---|---|']
+            for row in experiment.get('rounds',[]):
+                lines.append(f"| {row.get('round')} | {row.get('dump_s','not reached')} | {row.get('restore_s','not reached')} |")
+            text = '\n'.join(lines) + '\n'
+            (ROOT/'summary.md').write_text(text)
+            (ROOT/'overall.json').write_text(json.dumps({'passed': success, 'stages': records}, indent=2)+'\n')
+            print(text, flush=True)
+            dest = os.environ.get('GITHUB_STEP_SUMMARY')
+            if dest:
+                with open(dest,'a') as f: f.write(text)
+            return 0
+
+
+        def inventory():
+            rows=[]
+            for p in sorted(ROOT.rglob('*')):
+                if p.is_symlink() or not p.is_file() or p.name=='artifact-manifest.json': continue
+                # Hash by streaming: verbose logs need not fit in memory.
+                h=hashlib.sha256()
+                with p.open('rb') as f:
+                    while chunk:=f.read(1024*1024): h.update(chunk)
+                rows.append({'path':p.relative_to(ROOT).as_posix(),'bytes':p.stat().st_size,'sha256':h.hexdigest()})
+            report={'created_utc':datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                    'files':rows,'file_count':len(rows),'bytes':sum(r['bytes'] for r in rows),
+                    'manifest_excludes_itself':True,'raw_memory_images_uploaded':False}
+            (ROOT/'artifact-manifest.json').write_text(json.dumps(report,indent=2)+'\n')
+            for r in rows: print(f"ARTIFACT | {r['bytes']:>10} bytes | SHA256 {r['sha256']} | {r['path']}",flush=True)
+            print(f"ARTIFACT TOTAL | files={len(rows)} | bytes={report['bytes']}",flush=True)
+            return 0
+
+
+        def gate():
+            required=('asset-integrity.json','self-tests.json','setup.json','daemon-setup.json','report.json','viewer-build.json')
+            states={n:read(n) for n in required}
+            for n,r in states.items():
+                print(f"FINAL GATE {n} | status={r.get('status')} | phase={r.get('failed_stage',r.get('last_phase',''))} | error={r.get('exception','')}",flush=True)
+            ok=all(r.get('status')=='passed' for r in states.values())
+            print('PASS: finite live-V8 continuity test and HTML generation passed.' if ok else
+                  'NOT DEMONSTRATED. HTML may still be usable; report generation is not checkpoint success.',flush=True)
+            return 0 if ok else 1
+
+
+        if __name__=='__main__':
+            functions={'summary':summary,'inventory':inventory,'gate':gate}
+            if len(sys.argv)!=2 or sys.argv[1] not in functions: raise SystemExit('Use summary, inventory, or gate')
+            raise SystemExit(functions[sys.argv[1]]())
+        EMBED_REPORT_TOOLS_PY_1
+        printf "Embedded report_tools.py part 1/1; cumulative bytes: "
+        wc -c < "$BUNDLE_DIR/report_tools.py"
+    - name: Embed self_tests.py [1/1]
+      shell: bash
+      run: |
+        set -Eeuo pipefail
+        cat > "$BUNDLE_DIR/self_tests.py" <<'EMBED_SELF_TESTS_PY_1'
+        """Local verifier tests, NOT Docker/CRIU proof. Run automatically before installation."""
+        import contextlib
+        import copy
+        import hashlib
+        import importlib.util
+        import io
+        import json
+        import os
+        from pathlib import Path
+        import re
+        import sys
+        import tempfile
+        import traceback
+
+        HERE=Path(__file__).resolve().parent
+        spec=importlib.util.spec_from_file_location('checkpoint_probe',HERE/'checkpoint_probe.py')
+        m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m)
+        results=[]
+
+        def check(name,condition,detail=None):
+            entry={'name':name,'passed':bool(condition),'detail':detail}
+            results.append(entry)
+            print(('PASS ' if condition else 'FAIL ')+name,flush=True)
+            if not condition: raise AssertionError(name+': '+str(detail))
+
+        def marker(e): return 'V8_PROBE '+json.dumps(e,sort_keys=True)+'\n'
+
+        try:
+            for p in HERE.glob('*.py'):
+                compile(p.read_text(),str(p),'exec')
+            check('Every embedded Python source compiles',True)
+            check('HTML has an inert evidence payload placeholder','__EMBEDDED_EVIDENCE__' in (HERE/'viewer-template.html').read_text())
+            check('Timed probe does not call removed shell file APIs',not re.search(r'\b(read|readline)\s*\(',m.PROBE_JS))
+            check('Timed probe has an explicit standard console fallback','globalThis.console.log' in m.PROBE_JS)
+            source=m.probe_source(2,3,45)
+            check('Probe configuration is fully embedded','__PROBE_CONFIG__' not in source and '45000' in source)
+            caps={'console_log':'function','print':'undefined','read':'undefined','uint32array':'function','date_now':'function'}
+            check('Capability parser accepts restricted shell output',m.parse_capabilities('V8_API_CAPABILITIES:'+json.dumps(caps))==caps)
+            check('Capability parser does not invent missing APIs',m.parse_capabilities('ReferenceError')=={})
+            check('Capability parser tolerates diagnostic prefix',m.parse_capabilities('Error: V8_API_CAPABILITIES:'+json.dumps(caps)+' trailing')==caps)
+            check('Capability parser rejects corrupt JSON',m.parse_capabilities('V8_API_CAPABILITIES:{oops}')=={})
+            paused={'event':'paused','ticket':'ticket-1','token':'a'*48,'tick':10,'digest':'12345678','hot':123,'words':4096,'heap_words':list(range(4096))}
+            resumed={**copy.deepcopy(paused),'event':'resumed'}
+            tick={**copy.deepcopy(paused),'event':'tick','tick':11};tick.pop('heap_words')
+            baseline=marker(paused)
+            after=baseline+marker(resumed)+marker(tick)
+            good=m.continuity_checks(paused,baseline,after,'ticket-1',True)
+            check('Valid fixture passes all continuity assertions',all(good.values()),good)
+            for key,value in [('token','b'*48),('tick',0),('digest','00000000'),('hot',999),('words',2048)]:
+                bad=copy.deepcopy(resumed);bad[key]=value
+                checks=m.continuity_checks(paused,baseline,baseline+marker(bad)+marker(tick),'ticket-1',True)
+                check('Changed '+key+' is rejected',not all(checks.values()))
+            bad=copy.deepcopy(resumed);bad['heap_words'][2048]^=1
+            check('One changed array word is rejected',not m.continuity_checks(paused,baseline,baseline+marker(bad)+marker(tick),'ticket-1',True)['all_4096_probe_words_exact'])
+            check('Old logs alone cannot pass',not all(m.continuity_checks(paused,baseline,baseline,'ticket-1',True).values()))
+            check('Cold restart marker is rejected',not m.continuity_checks(paused,baseline,baseline+marker({'event':'boot'})+marker(resumed)+marker(tick),'ticket-1',True)['no_cold_boot_in_new_output'])
+            check('Duplicate resume event is rejected',not m.continuity_checks(paused,baseline,after+marker(resumed),'ticket-1',True)['exactly_one_matching_resume'])
+            check('Changed old-log prefix is rejected',not m.continuity_checks(paused,baseline,'different\n'+after,'ticket-1',True)['old_log_prefix_preserved'])
+            check('Dead process is rejected',not m.continuity_checks(paused,baseline,after,'ticket-1',False)['process_alive_after_restore'])
+            check('Wrong resume ticket is rejected',not all(m.continuity_checks(paused,baseline,after,'wrong',True).values()))
+            check('No progress after resume is rejected',not m.continuity_checks(paused,baseline,baseline+marker(resumed),'ticket-1',True)['execution_advances_after_resume'])
+            original={'log-driver':'json-file','features':{'x':True}}
+            updated=m.merged_daemon_config(original)
+            check('Daemon config keeps unrelated settings',updated['log-driver']=='json-file' and updated['experimental'] is True and 'experimental' not in original)
+            with tempfile.TemporaryDirectory() as td:
+                a=m.Audit(td);a.heartbeat_s=.05
+                capture=io.StringIO()
+                with contextlib.redirect_stdout(capture):
+                    rc,out,err=a.run('streams',[sys.executable,'-u','-c','import sys,time; print("hello"); print("error-text",file=sys.stderr); time.sleep(.18)'])
+                check('Real subprocess stdout/stderr preserved',rc==0 and out=='hello\n' and err=='error-text\n')
+                check('Live command heartbeat emitted','HEARTBEAT' in capture.getvalue())
+                check('Timestamped stream labels emitted','STDOUT | hello' in capture.getvalue() and 'STDERR | error-text' in capture.getvalue())
+                with contextlib.redirect_stdout(io.StringIO()):
+                    rc,_,_=a.run('timeout',[sys.executable,'-c','import time;time.sleep(30)'],timeout=.1)
+                check('Timeout terminates subprocess',rc==124)
+                with contextlib.redirect_stdout(io.StringIO()):
+                    rc,_,_=a.run('nonzero',[sys.executable,'-c','raise SystemExit(7)'])
+                check('Nonzero child exit is preserved',rc==7)
+                with contextlib.redirect_stdout(io.StringIO()):
+                    rc,_,_=a.run('missing',['/nonexistent/v8-audit-command'])
+                check('Missing executable is explicit failure',rc==127)
+                check('Raw stdout and stderr files exist',any(Path(td).glob('*.stdout.txt')) and any(Path(td).glob('*.stderr.txt')))
+                check('Events remain parseable JSONL',all(isinstance(json.loads(x),dict) for x in (Path(td)/'events.jsonl').read_text().splitlines()))
+            # Immediate failure on a dead target, not a heartbeat timeout.
+            with tempfile.TemporaryDirectory() as td:
+                a=m.Audit(td);a.logs=lambda c:'';a.state=lambda c:{'Running':False,'ExitCode':1,'OOMKilled':False}
+                a.run=lambda *args,**kwargs:(0,'','ReferenceError: deliberately missing API')
+                try:
+                    with contextlib.redirect_stdout(io.StringIO()):a.wait_event('test',lambda e:True)
+                    raised=False
+                except RuntimeError as exc:raised='ReferenceError' in str(exc)
+                check('Dead target surfaces its actual stderr immediately',raised)
+            bspec=importlib.util.spec_from_file_location('build_viewer',HERE/'build_viewer.py')
+            builder=importlib.util.module_from_spec(bspec);bspec.loader.exec_module(builder)
+            with tempfile.TemporaryDirectory() as td:
+                root=Path(td);out=root/'trajectory-explorer.html'
+                report={'status':'failed','failed_stage':'unit_fixture','exception':'</script><script>window.__bad=1</script>'}
+                (root/'report.json').write_text(json.dumps(report));(root/'pages-1.img').write_bytes(b'memory')
+                (root/'linked.log').symlink_to(root/'report.json')
+                with contextlib.redirect_stdout(io.StringIO()):payload=builder.collect_files(root,out)
+                names=[f['name'] for f in payload['files']]
+                check('Builder excludes raw memory and symlinks','pages-1.img' not in names and 'linked.log' not in names)
+                text=builder.render(payload)
+                check('Embedded log cannot close its JSON script element','</script><script>window.__bad=1' not in text and '\\u003c/script' in text)
+                check('Builder never changes source evidence',json.loads((root/'report.json').read_text())==report)
+        except Exception:
+            traceback.print_exc()
+            if not results or results[-1]['passed']:
+                results.append({'name':'Unexpected self-test exception','passed':False,'detail':traceback.format_exc()})
+        finally:
+            report={'status':'passed' if results and all(t['passed'] for t in results) else 'failed',
+                    'scope':'Local syntax, verifier, subprocess and packaging tests. NOT Docker/CRIU restoration.',
+                    'tests':results,'passed':sum(t['passed'] for t in results),'failed':sum(not t['passed'] for t in results)}
+            root=Path(os.environ.get('EVIDENCE_DIR','evidence'));root.mkdir(parents=True,exist_ok=True)
+            (root/'self-tests.json').write_text(json.dumps(report,indent=2)+'\n')
+            print('SELF TEST SUMMARY '+json.dumps({k:v for k,v in report.items() if k!='tests'}),flush=True)
+        raise SystemExit(0 if report['status']=='passed' else 1)
+        EMBED_SELF_TESTS_PY_1
+        printf "Embedded self_tests.py part 1/1; cumulative bytes: "
+        wc -c < "$BUNDLE_DIR/self_tests.py"
+    - name: Verify every embedded byte and print the package manifest
+      id: integrity
+      shell: bash
+      run: |
+        set -Eeuo pipefail
+        python3 - <<'PYVERIFY'
+        import hashlib,json,os,pathlib,sys
+        root=pathlib.Path(os.environ['BUNDLE_DIR']); evidence=pathlib.Path(os.environ['EVIDENCE_DIR'])
+        expected={'checkpoint_probe.py': '70e826f0157042bc16f9336c5427e63b67eed00afcd69b8613ccbd61ce8a8638', 'build_viewer.py': '91a6ee15e3863deeea9307fa675c6ac69ffab17be6120d36741fc76295e81556', 'viewer-template.html': 'f0e324b18c0b1d206208fc3b1c0518006c4c8a3023294a5eab96b8ba8dc51b1e', 'install_criu.sh': '8fbe8a11ffaa911f7b89357ea5b5f5f347e09f4fa292f33a53e0c5f021c72757', 'host_diagnostics.sh': '96cfdc39bcc6b5831c7784e140e1c62e45ba1b33ab698f53aaea7e68a0e647b2', 'report_tools.py': 'd421e378c3eb9056d4cba58581706f3deb00f3d6bc9058865725df1e98ee83fd', 'self_tests.py': 'b6c327fd96f351d7fc102ea90dbaaa74e4e7486e448d4c941e430e296c90a545'}
+        rows=[]
+        for name,wanted in expected.items():
+            actual=hashlib.sha256((root/name).read_bytes()).hexdigest()
+            good=actual==wanted
+            rows.append({'path':name,'bytes':(root/name).stat().st_size,'sha256':actual,'expected':wanted,'passed':good})
+            print(('PASS' if good else 'FAIL')+f' ASSET | {name} | bytes={rows[-1]["bytes"]} | SHA256={actual}',flush=True)
+        report={'status':'passed' if all(r['passed'] for r in rows) else 'failed','assets':rows}
+        (evidence/'asset-integrity.json').write_text(json.dumps(report,indent=2)+'\n')
+        raise SystemExit(0 if report['status']=='passed' else 1)
+        PYVERIFY
+        python3 -m py_compile "$BUNDLE_DIR/checkpoint_probe.py" "$BUNDLE_DIR/build_viewer.py" "$BUNDLE_DIR/report_tools.py" "$BUNDLE_DIR/self_tests.py"
+        cp "$BUNDLE_DIR"/*.py "$BUNDLE_DIR"/*.sh "$BUNDLE_DIR"/*.html "$EVIDENCE_DIR/sources/"
+    - name: Run embedded verifier tests (not a claim of CRIU success)
+      id: self_tests
       continue-on-error: true
       shell: bash
       run: |
         set -Eeuo pipefail
-        python3 -u "$RUNNER_TEMP/checkpoint_probe.py" 2>&1 | tee "$EVIDENCE_DIR/experiment-console.log"
-    - name: Collect evidence and report exact failing stage
+        python3 -u "$BUNDLE_DIR/checkpoint_probe.py" stream local-self-tests   python3 -u "$BUNDLE_DIR/self_tests.py" 2>&1 | tee "$EVIDENCE_DIR/self-test-console.log"
+    - name: Stream complete host, resource and runtime diagnostics
+      continue-on-error: true
+      shell: bash
+      run: |
+        set -Eeuo pipefail
+        python3 -u "$BUNDLE_DIR/checkpoint_probe.py" stream host-preflight   bash "$BUNDLE_DIR/host_diagnostics.sh" 2>&1 | tee "$EVIDENCE_DIR/host-console.log"
+    - name: Source-build the pinned CRIU release with live compiler logs
+      id: criu_setup
+      continue-on-error: true
+      if: ${{ steps.self_tests.outcome == 'success' }}
+      shell: bash
+      run: |
+        set -Eeuo pipefail
+        python3 -u "$BUNDLE_DIR/checkpoint_probe.py" stream criu-install   bash "$BUNDLE_DIR/install_criu.sh" 2>&1 | tee "$EVIDENCE_DIR/criu-install-console.log"
+    - name: Configure Docker checkpoint support and print feature diagnostics
+      id: daemon
+      continue-on-error: true
+      if: ${{ steps.criu_setup.outcome == 'success' }}
+      shell: bash
+      run: |
+        set -Eeuo pipefail
+        python3 -u "$BUNDLE_DIR/checkpoint_probe.py" daemon 2>&1 | tee "$EVIDENCE_DIR/daemon-console.log"
+    - name: Attempt real V8 checkpoints and exact probe-state restoration
+      id: experiment
+      continue-on-error: true
+      if: ${{ always() && steps.integrity.outcome == 'success' }}
+      shell: bash
+      run: |
+        set -Eeuo pipefail
+        python3 -u "$BUNDLE_DIR/checkpoint_probe.py" 2>&1 | tee "$EVIDENCE_DIR/experiment-console.log"
+    - name: Summarize exact failures and collect host-side runtime evidence
+      id: summary
       if: ${{ always() }}
+      continue-on-error: true
       shell: bash
       run: |
         set -Eeuo pipefail
         mkdir -p "$EVIDENCE_DIR"
-        python3 - <<'PYSUMMARY'
-        import json, os, pathlib
-        root = pathlib.Path(os.environ['EVIDENCE_DIR'])
-        records = {}
-        for name in ['setup.json', 'daemon-setup.json', 'report.json']:
-            path = root / name
-            try:
-                records[name] = json.loads(path.read_text())
-            except (FileNotFoundError, json.JSONDecodeError) as exc:
-                records[name] = {'status': 'not_run', 'detail': str(exc)}
-        passed = all(v.get('status') == 'passed' for v in records.values())
-        lines = ['# V8 live-process checkpoint feasibility', '',
-                 '**Overall:** ' + ('PASS for this probe only' if passed else 'NOT DEMONSTRATED'), '',
-                 '| Stage | Result | Detail |', '|---|---|---|']
-        for name, record in records.items():
-            detail = record.get('last_phase', record.get('failed_stage', record.get('exception', '')))
-            detail = str(detail).replace('|', '/')
-            lines.append(f"| {name} | {record['status']} | {detail} |")
-        lines += ['', '## Scope',
-            'Installation uses pinned upstream CRIU source; it does not require an Ubuntu criu package.',
-            'The probe compares a random startup token, an exact counter, all 4096 typed-array words,',
-            'a hot-function result, and strictly new output after a stopped checkpoint.',
-            'Success is not proof of arbitrary V8/JIT, networking, full-agent, or cross-host fidelity.',
-            'Raw memory images are deliberately not uploaded.', '', '## Assertions',
-            '| Assertion | Passed |', '|---|---|']
-        for item in records['report.json'].get('assertions', []):
-            lines.append(f"| {item['name']} | {item['passed']} |")
-        text = '\n'.join(lines) + '\n'
-        (root / 'summary.md').write_text(text)
-        with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as f:
-            f.write(text)
-        (root / 'overall.json').write_text(json.dumps({'passed': passed, 'stages': records}, indent=2))
-        print(text)
-        PYSUMMARY
-        # Capture host-side errors even if setup or the experiment failed.
+        python3 -u "$BUNDLE_DIR/report_tools.py" summary
+        # These are diagnostics; an unavailable journal must not prevent HTML generation.
         sudo journalctl -u docker -u containerd --since '1 hour ago' --no-pager > "$EVIDENCE_DIR/runtime-journal.log" 2>&1 || true
         sudo dmesg --ctime > "$EVIDENCE_DIR/dmesg.log" 2>&1 || true
         sudo chown -R "$(id -u):$(id -g)" "$EVIDENCE_DIR"
-    - name: Upload diagnostics even after failure
+        # Logs can be lengthy. Full contents are uploaded; print the final 120 lines here as an extra pointer.
+        printf '
+        === RUNTIME JOURNAL TAIL (FULL JOURNAL IS IN ARTIFACT) ===
+        '
+        tail -n 120 "$EVIDENCE_DIR/runtime-journal.log" || true
+        printf '
+        === KERNEL LOG TAIL (FULL LOG IS IN ARTIFACT) ===
+        '
+        tail -n 120 "$EVIDENCE_DIR/dmesg.log" || true
+    - name: Generate the self-contained HTML5 trajectory explorer even on failure
+      id: viewer
+      if: ${{ always() }}
+      continue-on-error: true
+      shell: bash
+      run: |
+        set -Eeuo pipefail
+        mkdir -p "$EVIDENCE_DIR"
+        python3 -u "$BUNDLE_DIR/build_viewer.py" "$EVIDENCE_DIR" "$EVIDENCE_DIR/trajectory-explorer.html"
+        printf '
+        === HTML OUTPUT ===
+        '
+        ls -lh "$EVIDENCE_DIR/trajectory-explorer.html"
+        sha256sum "$EVIDENCE_DIR/trajectory-explorer.html"
+        printf '
+        Open trajectory-explorer.html from the extracted artifact. No web server or network access is needed.
+        '
+        printf 'Display rewind and branch plans are not a live runtime-control service.
+        '
+    - name: Print an SHA-256 inventory of every evidence file
+      if: ${{ always() }}
+      continue-on-error: true
+      shell: bash
+      run: |
+        set -Eeuo pipefail
+        python3 -u "$BUNDLE_DIR/report_tools.py" inventory
+    - name: Upload HTML, all logs, reports and generated sources even on failure
       if: ${{ always() }}
       uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
       with:
-        name: v8-criu-source-build-evidence-${{ github.run_attempt }}
+        name: v8-checkpoint-atlas-${{ github.run_id }}-${{ github.run_attempt }}
         path: ${{ env.EVIDENCE_DIR }}/
         if-no-files-found: error
         retention-days: 14
-    - name: Fail unless setup and actual checkpoint fidelity passed
+        compression-level: 6
+    - name: Fail closed unless real continuity and report generation both passed
       if: ${{ always() }}
       shell: bash
       run: |
-        python3 - <<'PYGATE'
-        import json, os, pathlib, sys
-        path = pathlib.Path(os.environ['EVIDENCE_DIR']) / 'overall.json'
-        passed = path.exists() and json.loads(path.read_text()).get('passed') is True
-        print('PASS: live d8 probe resumed from checkpoints.' if passed else
-              'NOT DEMONSTRATED: inspect setup.json, daemon-setup.json, report.json and command logs.')
-        sys.exit(0 if passed else 1)
-        PYGATE
+        set -Eeuo pipefail
+        python3 -u "$BUNDLE_DIR/report_tools.py" gate
