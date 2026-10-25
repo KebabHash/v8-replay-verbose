@@ -1,4 +1,4 @@
-name: V8 Full Execution Checkpoint Feasibility (Ultra Verbose)
+name: V8 Full Execution Checkpoint Feasibility (Ultra Verbose, Fixed)
 
 on:
   workflow_dispatch:
@@ -45,12 +45,61 @@ jobs:
           echo '=== CGROUPS ==='; cat /proc/self/cgroup; stat -fc %T /sys/fs/cgroup
           echo '=== SECURITY ==='; grep -E '^(Cap|Seccomp|NoNewPrivs)' /proc/self/status || true
 
-      - name: Install checkpoint tools and record versions
+      - name: Enable Ubuntu Universe, install CRIU, and diagnose compatibility
+        id: criu_setup
         shell: bash
         run: |
           set -uo pipefail
-          { sudo apt-get update; sudo DEBIAN_FRONTEND=noninteractive apt-get install -y criu jq; } 2>&1 | tee evidence/criu-install.log
-          { echo '=== CRIU ==='; criu --version || true; echo '=== CRIU CHECK ==='; sudo criu check -v 4 || true; echo '=== DOCKER EXPERIMENTAL ==='; docker info --format '{{json .}}' | jq '{ServerVersion, ExperimentalBuild, SecurityOptions, CgroupVersion, Driver, Runtimes}' || true; } 2>&1 | tee evidence/criu-preflight.log
+          mkdir -p evidence
+          exec > >(tee evidence/criu-install.log) 2>&1
+          echo '=== EXISTING APT SOURCES ==='
+          sudo find /etc/apt -maxdepth 3 -type f \( -name '*.sources' -o -name '*.list' \) -print -exec cat {} \;
+          echo '=== ENABLE UNIVERSE VIA UBUNTU SOURCES ==='
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y software-properties-common jq || true
+          if command -v add-apt-repository >/dev/null 2>&1; then
+            sudo add-apt-repository -y universe || true
+          fi
+          echo '=== FORCE UNIVERSE IN DEB822 UBUNTU SOURCES IF NEEDED ==='
+          sudo python3 - <<'PYAPT'
+          from pathlib import Path
+          for path in Path('/etc/apt/sources.list.d').glob('*.sources'):
+              text=path.read_text()
+              if 'ubuntu' not in text.lower():
+                  continue
+              lines=[]
+              for line in text.splitlines():
+                  if line.startswith('Components:'):
+                      parts=line.split(':',1)[1].split()
+                      if 'universe' not in parts: parts.append('universe')
+                      line='Components: '+' '.join(parts)
+                  lines.append(line)
+              path.write_text('\n'.join(lines)+'\n')
+          PYAPT
+          echo '=== REFRESH PACKAGE METADATA ==='
+          sudo apt-get update
+          echo '=== CRIU PACKAGE POLICY ==='
+          apt-cache policy criu || true
+          apt-cache search '^criu$' || true
+          echo '=== INSTALL CRIU ==='
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y criu jq
+          install_rc=$?
+          echo "CRIU_INSTALL_EXIT=$install_rc"
+          echo '=== VERIFY TOOLS ==='
+          command -v criu || true
+          criu --version || true
+          echo '=== CRIU FEATURE CHECK (DIAGNOSTIC, MAY FAIL) ==='
+          sudo criu check -v 4 || true
+          echo '=== DOCKER CAPABILITIES ==='
+          docker version || true
+          docker info || true
+          docker checkpoint --help || true
+          if [ "$install_rc" -eq 0 ] && command -v criu >/dev/null 2>&1; then
+            echo 'criu_ready=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'criu_ready=false' >> "$GITHUB_OUTPUT"
+            echo '::warning::CRIU package installation failed. Later experiment will still collect diagnostics.'
+          fi
 
       - name: Pull pinned V8 image and inspect executable availability
         shell: bash
@@ -91,7 +140,7 @@ jobs:
               rc,out,_=run('locate-d8',['docker','run','--rm','--entrypoint','/bin/sh',image,'-c','command -v d8 || find / -type f -name d8 2>/dev/null | head -n 1'],120)
               path=next((x.strip() for x in out.splitlines() if x.strip().startswith('/') and ' ' not in x.strip()),None)
               if not path:
-                  record('real_v8_binary_present',False,'No d8 found; no real V8 execution claim permitted'); return_code=0
+                  record('real_v8_binary_present',False,'No d8 found; no real V8 execution claim permitted')
               else:
                   record('real_v8_binary_present',True,path)
                   run('remove-old-container',['docker','rm','-f',name],30)
@@ -139,9 +188,15 @@ jobs:
               print('\n'+'#'*110+'\nFINAL MACHINE-READABLE REPORT\n'+json.dumps(result,indent=2)+'\n'+'#'*110,flush=True)
           PY
           python3 -u /tmp/checkpoint_probe.py 2>&1 | tee evidence/full-execution-console.log
+          probe_rc=${PIPESTATUS[0]}
+          echo "PROBE_SCRIPT_EXIT=$probe_rc" | tee -a evidence/full-execution-console.log
           # Do not hide feasibility failure: preserve artifacts and set the job outcome after upload.
           python3 - <<'PY'
           import json,os
+          if not os.path.exists('evidence/report.json'):
+              print('No report.json generated: probe failed before finalization')
+              with open(os.environ['GITHUB_OUTPUT'],'a') as f:f.write('feasible=false\n')
+              raise SystemExit(0)
           p=json.load(open('evidence/report.json'))
           required=['real_v8_binary_present','real_v8_running','docker_checkpoint_create','docker_checkpoint_restore','heap_execution_continuity','process_alive_after_restore']
           good=all(p['tests'].get(k,{}).get('passed',False) for k in required)
