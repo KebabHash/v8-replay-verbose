@@ -1,237 +1,627 @@
-name: V8 Full Execution Checkpoint Feasibility (Ultra Verbose, Fixed)
-
-on:
+# Self-contained, manual-only experiment for an ephemeral GitHub-hosted Linux runner.
+# CRIU 4.3 release commit: https://github.com/checkpoint-restore/criu/commit/2b7ac603cda31d015d91c856c34c557cb2300e7d
+# Upstream Noble packaging issue: https://github.com/checkpoint-restore/criu/issues/2404
+# Installation: https://criu.org/Installation
+# Docker checkpoint: https://docs.docker.com/reference/cli/docker/checkpoint/
+# upload-artifact pinned to v6.0.0 (Node 24); no checkout or API keys are needed.
+# This restarts Docker on the disposable runner. Do not move it to a shared host unchanged.
+# Local validation exercises syntax, installer failure paths, and the JS protocol;
+# it does not substitute for a real Docker/CRIU run on GitHub.
+name: V8 live checkpoint - source-built CRIU and strict continuity
+'on':
   workflow_dispatch:
     inputs:
-      image:
-        description: 'V8 ExploitGym Docker image (pin by digest for rigorous comparisons)'
-        required: false
-        default: 'cybergym/v8@sha256:d53b336a90e184fe61c2067342eb278f6d54d009d7b4d93b958029b86904e48a'
-      checkpoint_wait_seconds:
-        description: 'Seconds to allow target to warm up before checkpoint'
-        required: false
-        default: '8'
-
+      restore_rounds:
+        description: Sequential live checkpoint/restore rounds (1-5)
+        type: string
+        default: '2'
+      warmup_seconds:
+        description: V8 warmup before each pause (1-30)
+        type: string
+        default: '3'
 permissions:
   contents: read
-
 jobs:
   feasibility:
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     env:
+      EVIDENCE_DIR: ${{ github.workspace }}/evidence
+      IMAGE: cybergym/v8@sha256:d53b336a90e184fe61c2067342eb278f6d54d009d7b4d93b958029b86904e48a
+      CRIU_VERSION: '4.3'
+      CRIU_COMMIT: 2b7ac603cda31d015d91c856c34c557cb2300e7d
+      RESTORE_ROUNDS: ${{ inputs.restore_rounds || '2' }}
+      WARMUP: ${{ inputs.warmup_seconds || '3' }}
+      PYTHONUNBUFFERED: '1'
       DOCKER_CLI_EXPERIMENTAL: enabled
-      IMAGE: ${{ inputs.image || 'cybergym/v8@sha256:d53b336a90e184fe61c2067342eb278f6d54d009d7b4d93b958029b86904e48a' }}
-      WARMUP: ${{ inputs.checkpoint_wait_seconds || '8' }}
     steps:
-      - name: Host and Docker preflight (never hide errors)
-        shell: bash
-        run: |
-          set -uo pipefail
-          mkdir -p evidence
-          exec > >(tee evidence/host-preflight.log) 2>&1
-          echo '=== UTC ==='; date -u --iso-8601=seconds
-          echo '=== OS ==='; uname -a; cat /etc/os-release
-          echo '=== USER ==='; id; sudo -n true; echo "sudo_status=$?"
-          echo '=== CPU / RAM ==='; nproc; free -h; cat /proc/meminfo | head -n 25
-          echo '=== DISK ==='; df -h; mount | head -n 40
-          echo '=== KERNEL CRIU RELEVANT ==='
-          for f in /proc/sys/kernel/yama/ptrace_scope /proc/sys/kernel/ns_last_pid /proc/sys/kernel/unprivileged_userns_clone /proc/sys/kernel/kptr_restrict; do
-            echo "--- $f"; cat "$f" 2>&1 || true
-          done
-          echo '=== DOCKER ==='; docker version || true; docker info || true
-          echo '=== DOCKER CHECKPOINT COMMAND ==='; docker checkpoint --help || true
-          echo '=== CRIU VERSION (before install) ==='; command -v criu && criu --version || true
-          echo '=== CGROUPS ==='; cat /proc/self/cgroup; stat -fc %T /sys/fs/cgroup
-          echo '=== SECURITY ==='; grep -E '^(Cap|Seccomp|NoNewPrivs)' /proc/self/status || true
+    - name: Write the self-contained checkpoint controller
+      id: prepare
+      shell: bash
+      run: |
+        set -Eeuo pipefail
+        mkdir -p "$EVIDENCE_DIR"
+        cat > "$RUNNER_TEMP/checkpoint_probe.py" <<'PYPROBE'
+        import datetime
+        import hashlib
+        import json
+        import os
+        from pathlib import Path
+        import re
+        import shlex
+        import signal
+        import subprocess
+        import sys
+        import threading
+        import time
+        import traceback
+        import uuid
 
-      - name: Enable Ubuntu Universe, install CRIU, and diagnose compatibility
-        id: criu_setup
-        shell: bash
-        run: |
-          set -uo pipefail
-          mkdir -p evidence
-          exec > >(tee evidence/criu-install.log) 2>&1
-          echo '=== EXISTING APT SOURCES ==='
-          sudo find /etc/apt -maxdepth 3 -type f \( -name '*.sources' -o -name '*.list' \) -print -exec cat {} \;
-          echo '=== ENABLE UNIVERSE VIA UBUNTU SOURCES ==='
-          sudo apt-get update
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y software-properties-common jq || true
-          if command -v add-apt-repository >/dev/null 2>&1; then
-            sudo add-apt-repository -y universe || true
+        # The controller file contains only pause/continue instructions, never heap state.
+        # A cold restart generates a new token and reinitializes the heap.
+        PROBE_JS = r'''
+        "use strict";
+        const controlPath = "/tmp/v8-cp-control.txt";
+        const token = Array.from({length: 6}, () =>
+          Math.floor(Math.random() * 4294967296).toString(16).padStart(8, "0")
+        ).join("") + "-" + Date.now().toString(16);
+        const heap = new Uint32Array(4096);
+        let seed = 2166136261 >>> 0;
+        for (const c of token) seed = Math.imul(seed ^ c.charCodeAt(0), 16777619) >>> 0;
+        for (let i = 0; i < heap.length; i++) {
+          seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0;
+          heap[i] = seed;
+        }
+        let tick = 0;
+        let hotResult = 0;
+        function hot(x) { return (Math.imul(x ^ 0x12345678, 17) + 3) | 0; }
+        function digest() {
+          let h = 2166136261 >>> 0;
+          for (let i = 0; i < heap.length; i++) h = Math.imul(h ^ heap[i], 16777619) >>> 0;
+          return h.toString(16).padStart(8, "0");
+        }
+        function snapshot(event, ticket) {
+          const result = {event, ticket, token, tick, digest: digest(), hot: hotResult, words: heap.length};
+          if (event === "paused" || event === "resumed") result.heap_words = Array.from(heap);
+          return result;
+        }
+        function emit(event, ticket = "") { print("V8_PROBE " + JSON.stringify(snapshot(event, ticket))); }
+        function command() { return read(controlPath).trim(); }
+        function delay(ms) { const end = Date.now() + ms; while (Date.now() < end) {} }
+        emit("boot");
+        while (true) {
+          for (let j = 0; j < 20000; j++) {
+            const i = (j + tick) & (heap.length - 1);
+            hotResult = hot((heap[i] + j) | 0);
+            heap[i] = (heap[i] ^ hotResult) >>> 0;
+          }
+          tick++;
+          emit("tick");
+          const instruction = command();
+          if (instruction.startsWith("pause:")) {
+            const ticket = instruction.slice(6);
+            emit("paused", ticket);
+            while (command() !== "continue:" + ticket) delay(25);
+            // Computed from the live typed array again, not from a cached log message.
+            emit("resumed", ticket);
+          }
+          delay(150);
+        }
+        '''
+
+
+        def marker_events(text):
+            events = []
+            for line in text.splitlines():
+                if line.startswith("V8_PROBE "):
+                    try:
+                        event = json.loads(line[len("V8_PROBE "):])
+                    except json.JSONDecodeError:
+                        continue
+                    if isinstance(event, dict):
+                        events.append(event)
+            return events
+
+
+        def continuity_checks(paused, baseline, after, ticket, running):
+            """Strict evidence checks; synthetic tests must not count as CRIU success."""
+            prefix_ok = after.startswith(baseline)
+            delta = after[len(baseline):] if prefix_ok else ""
+            events = marker_events(delta)
+            resumed = [e for e in events if e.get("event") == "resumed" and e.get("ticket") == ticket]
+            r = resumed[0] if len(resumed) == 1 else {}
+            valid_pause = (paused.get("event") == "paused" and paused.get("ticket") == ticket
+                           and isinstance(paused.get("token"), str) and len(paused["token"]) >= 32
+                           and type(paused.get("tick")) is int and paused["tick"] > 0
+                           and isinstance(paused.get("digest"), str)
+                           and bool(re.fullmatch(r"[0-9a-f]{8}", paused["digest"]))
+                           and type(paused.get("hot")) is int and paused.get("words") == 4096
+                           and isinstance(paused.get("heap_words"), list) and len(paused["heap_words"]) == 4096
+                           and all(type(x) is int and 0 <= x <= 0xffffffff for x in paused["heap_words"]))
+            same = lambda key: bool(valid_pause and r and r.get(key) == paused.get(key))
+            continued = any(e.get("event") == "tick" and e.get("token") == paused.get("token")
+                            and type(e.get("tick")) is int and e["tick"] > paused.get("tick", 10**30)
+                            for e in events)
+            return {
+                "valid_pre_checkpoint_pause": bool(valid_pause),
+                "old_log_prefix_preserved": prefix_ok,
+                "new_output_after_checkpoint": bool(events),
+                "no_cold_boot_in_new_output": bool(events) and not any(e.get("event") == "boot" for e in events),
+                "exactly_one_matching_resume": len(resumed) == 1,
+                "same_in_memory_startup_token": same("token"),
+                "exact_counter_at_resume": same("tick"),
+                "exact_heap_digest_at_resume": same("digest"),
+                "exact_hot_function_result_at_resume": same("hot"),
+                "same_heap_length": same("words"),
+                "all_4096_probe_words_exact": same("heap_words"),
+                "execution_advances_after_resume": continued,
+                "process_alive_after_restore": running is True,
+            }
+
+
+        class Audit:
+            def __init__(self, root):
+                self.root = Path(root).resolve()
+                self.root.mkdir(parents=True, exist_ok=True)
+                self.index = 0
+                self.stage = "setup"
+                self.report = {"status": "not_demonstrated", "scope": "same-host live d8 process",
+                               "started_utc": self.now(), "assertions": [], "rounds": [],
+                               "limitations": ["Not a full VM or agent checkpoint.",
+                                   "Finite probe checks do not prove equality of the entire V8 heap or JIT internals.",
+                                   "Network is disabled; no socket or model-provider state is tested.",
+                                   "The controller intentionally changes an instruction file after restore.",
+                                   "Raw CRIU memory images are not uploaded; this is an in-job feasibility test."]}
+
+            @staticmethod
+            def now():
+                return datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+            def event(self, kind, **fields):
+                event = {"utc": self.now(), "kind": kind, **fields}
+                with (self.root / "events.jsonl").open("a") as f:
+                    f.write(json.dumps(event, sort_keys=True) + "\n")
+                print(json.dumps(event, sort_keys=True), flush=True)
+
+            def run(self, label, argv, timeout=90, required=False):
+                self.index += 1
+                tag = f"{self.index:04d}-{label}"
+                self.event("command_start", label=tag, argv=argv, timeout_s=timeout, stage=self.stage)
+                print("\n" + "=" * 110 + "\n$ " + shlex.join(argv), flush=True)
+                started = time.monotonic()
+                buffers = {"stdout": [], "stderr": []}
+                timed_out = False
+                try:
+                    proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                            text=True, encoding="utf-8", errors="replace", start_new_session=True)
+                    def consume(stream, key):
+                        with (self.root / (tag + "." + key + ".txt")).open("w") as log:
+                            for line in stream:
+                                buffers[key].append(line)
+                                log.write(line)
+                                log.flush()
+                                print(f"[{tag} {key}] {line.rstrip()}", flush=True)
+                    threads = [threading.Thread(target=consume, args=(getattr(proc, key), key), daemon=True)
+                               for key in ("stdout", "stderr")]
+                    for thread in threads:
+                        thread.start()
+                    try:
+                        rc = proc.wait(timeout=timeout)
+                    except subprocess.TimeoutExpired:
+                        timed_out = True
+                        os.killpg(proc.pid, signal.SIGKILL)
+                        proc.wait()
+                        rc = 124
+                    for thread in threads:
+                        thread.join(timeout=10)
+                    for stream in (proc.stdout, proc.stderr):
+                        stream.close()
+                except OSError as exc:
+                    rc = 127
+                    buffers["stderr"].append(str(exc))
+                    (self.root / (tag + ".stderr.txt")).write_text(str(exc))
+                out, err = "".join(buffers["stdout"]), "".join(buffers["stderr"])
+                self.event("command_end", label=tag, exit_code=rc, timed_out=timed_out,
+                           elapsed_s=round(time.monotonic() - started, 4),
+                           stdout_bytes=len(out.encode()), stderr_bytes=len(err.encode()))
+                if required and rc != 0:
+                    raise RuntimeError(f"{tag} failed with exit {rc}; inspect its stderr artifact")
+                return rc, out, err
+
+            def require(self, name, condition, detail=None):
+                item = {"name": name, "passed": bool(condition), "detail": detail, "stage": self.stage}
+                self.report["assertions"].append(item)
+                self.event("assertion", **item)
+                if not condition:
+                    raise RuntimeError(f"Assertion failed: {name}")
+
+            def state(self, container):
+                _, out, _ = self.run("inspect-state", ["docker", "inspect", "--format", "{{json .State}}", container], required=True)
+                return json.loads(out)
+
+            def logs(self, container):
+                return self.run("target-logs", ["docker", "logs", container], required=True)[1]
+
+            def wait_event(self, container, predicate, prefix="", timeout=45):
+                end = time.monotonic() + timeout
+                while time.monotonic() < end:
+                    logs = self.logs(container)
+                    delta = logs[len(prefix):] if prefix and logs.startswith(prefix) else logs if not prefix else ""
+                    matches = [e for e in marker_events(delta) if predicate(e)]
+                    if matches:
+                        return matches[-1], logs
+                    time.sleep(0.5)
+                raise TimeoutError("Expected V8 marker did not appear; see target logs")
+
+            def control(self, container, text):
+                path = self.root / "controller-instruction.txt"
+                path.write_text(text + "\n")
+                self.run("controller-write", ["docker", "cp", str(path), container + ":/tmp/v8-cp-control.txt"], required=True)
+
+            def evidence_for_container(self, container, docker_root):
+                self.run("inspect-complete", ["docker", "inspect", container])
+                self.run("stats", ["docker", "stats", "--no-stream", container], timeout=30)
+                rc, out, _ = self.run("container-id", ["docker", "inspect", "--format", "{{.Id}}", container])
+                cid = out.strip()
+                if rc != 0 or not re.fullmatch(r"[0-9a-f]{64}", cid):
+                    return
+                # Copy logs and inventory only. Do NOT upload raw process-memory images.
+                collect = r'''
+        import json, pathlib, shutil, sys
+        base, dst = map(pathlib.Path, sys.argv[1:])
+        dst.mkdir(parents=True, exist_ok=True)
+        rows = []
+        if base.exists():
+            for path in sorted(base.rglob('*')):
+                if path.is_file() and not path.is_symlink():
+                    rows.append({'path': str(path.relative_to(base)), 'bytes': path.stat().st_size})
+                    if path.suffix in ('.log', '.txt'):
+                        target = dst / str(path.relative_to(base)).replace('/', '__')
+                        shutil.copyfile(path, target)
+        (dst / 'inventory.json').write_text(json.dumps(rows, indent=2))
+        print(json.dumps(rows, indent=2))
+        '''
+                self.run("checkpoint-inventory", ["sudo", "python3", "-c", collect,
+                            str(Path(docker_root) / "containers" / cid / "checkpoints"),
+                            str(self.root / "criu-checkpoint-logs")])
+
+            def main(self):
+                container = "v8-criu-" + uuid.uuid4().hex[:12]
+                created = False
+                docker_root = "/var/lib/docker"
+                try:
+                    for filename in ("setup.json", "daemon-setup.json"):
+                        path = self.root / filename
+                        status = json.loads(path.read_text()) if path.exists() else {"status": "missing"}
+                        self.require(filename + " succeeded", status.get("status") == "passed", status)
+                    rounds = int(os.environ.get("RESTORE_ROUNDS", "2"))
+                    warmup = int(os.environ.get("WARMUP", "3"))
+                    self.require("round count within bounds", 1 <= rounds <= 5, rounds)
+                    self.require("warmup within bounds", 1 <= warmup <= 30, warmup)
+                    image = os.environ["IMAGE"]
+                    self.require("image pinned by SHA256 digest", bool(re.fullmatch(r"[^\s]+@sha256:[0-9a-f]{64}", image)), image)
+                    self.report.update(image=image, requested_rounds=rounds)
+                    self.stage = "image_setup"
+                    self.run("image-pull", ["docker", "pull", image], timeout=600, required=True)
+                    self.run("image-inspect", ["docker", "image", "inspect", image], required=True)
+                    docker_root = self.run("docker-root", ["docker", "info", "--format", "{{.DockerRootDir}}"], required=True)[1].strip()
+                    find_script = 'command -v d8 || find / -xdev -type f -name d8 -executable 2>/dev/null; true'
+                    _, found, _ = self.run("find-d8", ["docker", "run", "--rm", "--network", "none", "--entrypoint", "/bin/sh", image, "-c", find_script], timeout=120, required=True)
+                    candidates = [s.strip() for s in found.splitlines() if s.strip().startswith("/") and " " not in s.strip()]
+                    self.require("real d8 binary found", bool(candidates), found)
+                    d8 = candidates[0]
+                    self.report["d8"] = d8
+                    options = ["--runtime", "runc", "--network", "none", "--memory", "4g", "--memory-swap", "4g",
+                               "--cpus", "2", "--pids-limit", "256", "--security-opt", "seccomp=unconfined",
+                               "--security-opt", "apparmor=unconfined", "--workdir", str(Path(d8).parent)]
+                    self.report["container_options"] = options
+                    self.run("d8-version", ["docker", "run", "--rm", *options, "--entrypoint", d8, image, "--version"], required=True)
+                    self.stage = "v8_start"
+                    self.run("container-create", ["docker", "create", "--name", container, *options,
+                              "--log-driver", "json-file", "--entrypoint", d8, image, "/tmp/v8-checkpoint-probe.js"], required=True)
+                    created = True
+                    js = self.root / "probe.js"
+                    js.write_text(PROBE_JS)
+                    self.report["probe_sha256"] = hashlib.sha256(js.read_bytes()).hexdigest()
+                    self.run("copy-probe", ["docker", "cp", str(js), container + ":/tmp/v8-checkpoint-probe.js"], required=True)
+                    self.control(container, "run")
+                    self.run("container-start", ["docker", "start", container], required=True)
+                    self.wait_event(container, lambda e: e.get("event") == "tick")
+                    for number in range(1, rounds + 1):
+                        ticket = uuid.uuid4().hex
+                        checkpoint = f"round-{number}"
+                        self.event("round_start", number=number, ticket=ticket, checkpoint=checkpoint)
+                        time.sleep(warmup)
+                        self.stage = "pause"
+                        self.control(container, "pause:" + ticket)
+                        paused, _ = self.wait_event(container, lambda e: e.get("event") == "paused" and e.get("ticket") == ticket)
+                        self.require(f"round {number}: alive before dump", self.state(container).get("Running") is True)
+                        self.stage = "checkpoint"
+                        start = time.monotonic()
+                        self.run("checkpoint-create", ["docker", "checkpoint", "create", container, checkpoint], timeout=180, required=True)
+                        dump_s = time.monotonic() - start
+                        self.require(f"round {number}: stopped after dump", self.state(container).get("Running") is False)
+                        # Baseline is taken AFTER dump has stopped the target, not before it.
+                        baseline = self.logs(container)
+                        time.sleep(0.5)
+                        self.require(f"round {number}: logs stable while stopped", self.logs(container) == baseline)
+                        (self.root / f"round-{number}-stopped-baseline.log").write_text(baseline)
+                        self.evidence_for_container(container, docker_root)
+                        self.stage = "restore"
+                        start = time.monotonic()
+                        self.run("checkpoint-restore", ["docker", "start", "--checkpoint", checkpoint, container], timeout=180, required=True)
+                        restore_s = time.monotonic() - start
+                        self.require(f"round {number}: running after restore", self.state(container).get("Running") is True)
+                        self.stage = "fidelity"
+                        self.control(container, "continue:" + ticket)
+                        self.wait_event(container, lambda e: e.get("event") == "resumed" and e.get("ticket") == ticket, prefix=baseline)
+                        _, after = self.wait_event(container, lambda e: e.get("event") == "tick" and e.get("tick", -1) > paused["tick"], prefix=baseline)
+                        running = self.state(container).get("Running") is True
+                        checks = continuity_checks(paused, baseline, after, ticket, running)
+                        record = {"round": number, "checkpoint": checkpoint, "ticket": ticket, "paused": paused,
+                                  "dump_s": dump_s, "restore_s": restore_s, "checks": checks}
+                        self.report["rounds"].append(record)
+                        (self.root / f"round-{number}-resumed.log").write_text(after)
+                        for key, value in checks.items():
+                            self.require(f"round {number}: {key}", value)
+                    self.report["status"] = "passed"
+                    self.stage = "complete"
+                except Exception as exc:
+                    self.report.update(status="failed", failed_stage=self.stage, exception=repr(exc))
+                    traceback.print_exc()
+                    self.event("experiment_failed", stage=self.stage, error=repr(exc))
+                finally:
+                    if created:
+                        try:
+                            self.evidence_for_container(container, docker_root)
+                            self.run("final-target-logs", ["docker", "logs", container])
+                        except Exception as exc:
+                            self.event("diagnostic_collection_failed", error=repr(exc))
+                        self.run("container-cleanup", ["docker", "rm", "-f", container])
+                    self.report.update(finished_utc=self.now(), command_count=self.index)
+                    (self.root / "report.json").write_text(json.dumps(self.report, indent=2) + "\n")
+                    print("\nFINAL REPORT\n" + json.dumps(self.report, indent=2), flush=True)
+                return 0 if self.report["status"] == "passed" else 1
+
+
+        def merged_daemon_config(config):
+            import copy
+            if not isinstance(config, dict):
+                raise ValueError('Docker daemon configuration must be a JSON object')
+            updated = copy.deepcopy(config)
+            updated['experimental'] = True
+            return updated
+
+
+        def configure_daemon(root):
+            audit = Audit(root)
+            audit.stage = 'docker_configuration'
+            result = {'status': 'failed', 'stage': 'docker_configuration'}
+            try:
+                config = Path('/etc/docker/daemon.json')
+                original = config.read_text() if config.exists() else '{}\n'
+                (audit.root / 'docker-daemon-before.json').write_text(original)
+                merged = merged_daemon_config(json.loads(original))
+                pending = audit.root / 'docker-daemon-requested.json'
+                pending.write_text(json.dumps(merged, indent=2) + '\n')
+                audit.run('daemon-config-validate', ['sudo', 'dockerd', '--validate', '--config-file', str(pending)], required=True)
+                # This workflow is fixed to an ephemeral GitHub-hosted runner. Do not run
+                # this service restart on a shared host with unrelated live containers.
+                audit.run('docker-config-dir', ['sudo', 'mkdir', '-p', '/etc/docker'], required=True)
+                audit.run('install-daemon-config', ['sudo', 'install', '-m', '0644', str(pending), str(config)], required=True)
+                audit.run('restart-docker', ['sudo', 'systemctl', 'restart', 'docker'], timeout=120, required=True)
+                audit.run('docker-version', ['docker', 'version'], required=True)
+                audit.run('docker-info', ['docker', 'info'], required=True)
+                _, enabled, _ = audit.run('docker-experimental', ['docker', 'info', '--format', '{{.ExperimentalBuild}}'], required=True)
+                audit.require('server experimental mode enabled', enabled.strip().lower() == 'true')
+                audit.run('checkpoint-help', ['docker', 'checkpoint', '--help'], required=True)
+                audit.run('criu-version-as-root', ['sudo', '/usr/sbin/criu', '--version'], required=True)
+                # Informative only: optional CRIU features can fail while this particular
+                # workload remains checkpointable. The actual dump/restore is decisive.
+                rc, _, _ = audit.run('criu-kernel-check', ['sudo', '/usr/sbin/criu', 'check', '-v4'], timeout=90)
+                result.update(status='passed', criu_check_exit=rc,
+                              note='A successful setup does not imply checkpoint feasibility.')
+            except Exception as exc:
+                traceback.print_exc()
+                result['exception'] = repr(exc)
+            finally:
+                result['utc'] = audit.now()
+                (audit.root / 'daemon-setup.json').write_text(json.dumps(result, indent=2) + '\n')
+                print('DAEMON_SETUP_REPORT=' + json.dumps(result), flush=True)
+            return 0 if result['status'] == 'passed' else 1
+
+
+        if __name__ == "__main__":
+            root = os.environ.get("EVIDENCE_DIR", "evidence")
+            sys.exit(configure_daemon(root) if len(sys.argv) > 1 and sys.argv[1] == "daemon" else Audit(root).main())
+
+
+        PYPROBE
+        python3 -m py_compile "$RUNNER_TEMP/checkpoint_probe.py"
+    - name: Print host diagnostics
+      continue-on-error: true
+      shell: bash
+      run: |
+        set -Eeuo pipefail
+        mkdir -p "$EVIDENCE_DIR"
+        exec > >(tee "$EVIDENCE_DIR/host.log") 2>&1
+        printf '\n=== HOST ===\n'
+        date -u --iso-8601=seconds
+        uname -a
+        cat /etc/os-release
+        id
+        free -h
+        df -h
+        printf '\n=== CAPABILITIES ===\n'
+        grep -E '^(Cap|Seccomp|NoNewPrivs)' /proc/self/status || true
+        printf '\n=== DOCKER ===\n'
+        docker version
+        docker info
+        printf '\n=== NO MODEL KEYS OR EXPLOIT PAYLOADS ARE USED ===\n'
+    - name: Build and install exact upstream CRIU commit
+      id: criu_setup
+      continue-on-error: true
+      shell: bash
+      run: |
+        set -Eeuo pipefail
+        export LC_ALL=C
+        EVIDENCE_DIR="${EVIDENCE_DIR:-$PWD/evidence}"
+        CRIU_SBINDIR="${CRIU_SBINDIR:-/usr/sbin}"
+        mkdir -p "$EVIDENCE_DIR"
+        EVIDENCE_DIR="$(realpath "$EVIDENCE_DIR")"
+        export EVIDENCE_DIR
+        exec > >(tee "$EVIDENCE_DIR/criu-install.log") 2>&1
+        phase=initialization
+        source_commit=''
+        finish() {
+          rc=$?
+          trap - EXIT
+          set +e
+          python3 - "$EVIDENCE_DIR" "$rc" "$phase" "$source_commit" <<'PY'
+        import datetime, json, pathlib, sys
+        root, rc, phase, commit = sys.argv[1:]
+        report = {"stage": "criu_setup", "status": "passed" if rc == "0" else "failed",
+                  "exit_code": int(rc), "last_phase": phase, "source_commit": commit,
+                  "method": "upstream_source_build", "utc": datetime.datetime.now(datetime.timezone.utc).isoformat()}
+        p = pathlib.Path(root) / 'setup.json'
+        p.write_text(json.dumps(report, indent=2) + '\n')
+        print('CRIU_SETUP_REPORT=' + json.dumps(report), flush=True)
+        PY
+          if [ -n "${GITHUB_OUTPUT:-}" ]; then
+            if [ "$rc" -eq 0 ]; then echo 'criu_ready=true' >> "$GITHUB_OUTPUT";
+            else echo 'criu_ready=false' >> "$GITHUB_OUTPUT"; fi
           fi
-          echo '=== FORCE UNIVERSE IN DEB822 UBUNTU SOURCES IF NEEDED ==='
-          sudo python3 - <<'PYAPT'
-          from pathlib import Path
-          for path in Path('/etc/apt/sources.list.d').glob('*.sources'):
-              text=path.read_text()
-              if 'ubuntu' not in text.lower():
-                  continue
-              lines=[]
-              for line in text.splitlines():
-                  if line.startswith('Components:'):
-                      parts=line.split(':',1)[1].split()
-                      if 'universe' not in parts: parts.append('universe')
-                      line='Components: '+' '.join(parts)
-                  lines.append(line)
-              path.write_text('\n'.join(lines)+'\n')
-          PYAPT
-          echo '=== REFRESH PACKAGE METADATA ==='
-          sudo apt-get update
-          echo '=== CRIU PACKAGE POLICY ==='
-          apt-cache policy criu || true
-          apt-cache search '^criu$' || true
-          echo '=== INSTALL CRIU ==='
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y criu jq
-          install_rc=$?
-          echo "CRIU_INSTALL_EXIT=$install_rc"
-          echo '=== VERIFY TOOLS ==='
-          command -v criu || true
-          criu --version || true
-          echo '=== CRIU FEATURE CHECK (DIAGNOSTIC, MAY FAIL) ==='
-          sudo criu check -v 4 || true
-          echo '=== DOCKER CAPABILITIES ==='
-          docker version || true
-          docker info || true
-          docker checkpoint --help || true
-          if [ "$install_rc" -eq 0 ] && command -v criu >/dev/null 2>&1; then
-            echo 'criu_ready=true' >> "$GITHUB_OUTPUT"
-          else
-            echo 'criu_ready=false' >> "$GITHUB_OUTPUT"
-            echo '::warning::CRIU package installation failed. Later experiment will still collect diagnostics.'
-          fi
+          exit "$rc"
+        }
+        trap finish EXIT
+        : "${CRIU_COMMIT:?A full upstream CRIU commit is required}"
+        : "${CRIU_VERSION:?Expected CRIU release version is required}"
+        : "${RUNNER_TEMP:?RUNNER_TEMP must be defined}"
+        [[ "$CRIU_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+        [ "$(uname -m)" = x86_64 ]
 
-      - name: Pull pinned V8 image and inspect executable availability
-        shell: bash
-        run: |
-          set -uo pipefail
-          { echo "IMAGE=$IMAGE"; docker pull "$IMAGE"; docker image inspect "$IMAGE"; echo '=== D8 CANDIDATES ==='; docker run --rm --entrypoint /bin/sh "$IMAGE" -c 'pwd; id; command -v d8 || true; find / -type f \( -name d8 -o -name "d8.*" \) 2>/dev/null | head -n 30' || true; } 2>&1 | tee evidence/v8-image-inspection.log
-
-      - name: Run native V8 heap-and-JIT continuity test with Docker checkpoint/restore
-        id: experiment
-        shell: bash
-        run: |
-          set -uo pipefail
-          cat > /tmp/checkpoint_probe.py <<'PY'
-          import datetime, hashlib, json, os, pathlib, shlex, subprocess, sys, time, traceback
-          root=pathlib.Path('evidence'); root.mkdir(exist_ok=True)
-          image=os.environ['IMAGE']; warmup=max(2,min(30,int(os.environ.get('WARMUP','8'))))
-          result={'image':image,'started_utc':datetime.datetime.now(datetime.timezone.utc).isoformat(),'tests':{},'caveats':[]}
-          def run(label,cmd,timeout=120):
-              print('\n'+'='*110,flush=True); print('COMMAND:',label,'\nARGV:',repr(cmd),'\nTIME:',datetime.datetime.now(datetime.timezone.utc).isoformat(),flush=True)
-              t=time.monotonic()
-              try:
-                  p=subprocess.run(cmd,text=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=timeout)
-                  rc=p.returncode; out=p.stdout; err=p.stderr
-              except subprocess.TimeoutExpired as e:
-                  rc=124; out=(e.stdout or b'').decode(errors='replace') if isinstance(e.stdout,bytes) else (e.stdout or ''); err=(e.stderr or b'').decode(errors='replace') if isinstance(e.stderr,bytes) else (e.stderr or '')
-              elapsed=time.monotonic()-t
-              (root/(label+'.stdout.txt')).write_text(out); (root/(label+'.stderr.txt')).write_text(err)
-              print('EXIT:',rc,'ELAPSED_SEC:',round(elapsed,3),'\nSTDOUT:\n',out[-16000:],'\nSTDERR:\n',err[-16000:],flush=True)
-              return rc,out,err
-          def record(key,passed,detail):
-              result['tests'][key]={'passed':bool(passed),'detail':detail}; print(('PASS' if passed else 'FAIL')+' '+key+' '+str(detail),flush=True)
-          name='v8-criu-fidelity-'+os.environ.get('GITHUB_RUN_ID','local')
-          try:
-              # This JS mutates a live heap object, exercises hot function calls, and emits monotonically increasing markers.
-              js='''let count=0; let heap={token:"V8-HEAP-STATE-UNIQUE-6f8c", history:[]}; function hot(x){return (x*17+3)|0;} while(true){count++; let value=hot(count); if(count%500000===0){heap.history.push(value); if(heap.history.length>40)heap.history.shift(); print("V8_LIVE_MARKER count="+count+" heap="+heap.token+" value="+value+" history="+heap.history.length); } }'''
-              (root/'probe.js').write_text(js)
-              # Locate a real d8 binary; do not substitute a fake executable.
-              rc,out,_=run('locate-d8',['docker','run','--rm','--entrypoint','/bin/sh',image,'-c','command -v d8 || find / -type f -name d8 2>/dev/null | head -n 1'],120)
-              path=next((x.strip() for x in out.splitlines() if x.strip().startswith('/') and ' ' not in x.strip()),None)
-              if not path:
-                  record('real_v8_binary_present',False,'No d8 found; no real V8 execution claim permitted')
-              else:
-                  record('real_v8_binary_present',True,path)
-                  run('remove-old-container',['docker','rm','-f',name],30)
-                  # Mount JS from workspace: Docker checkpoint cannot preserve external file mutations, so keep it immutable.
-                  script=str((root/'probe.js').resolve())
-                  cmd=['docker','run','-d','--name',name,'--memory','4g','--cpus','2','-v',script+':/tmp/checkpoint_probe.js:ro','--entrypoint',path,image,'/tmp/checkpoint_probe.js']
-                  rc,_,_=run('start-real-v8',cmd,90)
-                  if rc:
-                      record('real_v8_started',False,'d8 invocation failed; inspect command stderr')
-                  else:
-                      time.sleep(warmup)
-                      rc,logs,_=run('before-checkpoint-logs',['docker','logs','--tail','80',name],30)
-                      marker_lines=[l for l in logs.splitlines() if 'V8_LIVE_MARKER count=' in l]
-                      running=run('before-checkpoint-inspect',['docker','inspect','-f','{{.State.Running}} {{.State.Pid}} {{.State.ExitCode}}',name],30)[1]
-                      record('real_v8_running',bool(marker_lines) and 'true' in running,{'markers':len(marker_lines),'inspect':running.strip()})
-                      if marker_lines and 'true' in running:
-                          last=marker_lines[-1]
-                          print('LAST PRE-CHECKPOINT MARKER:',last,flush=True)
-                          # IMPORTANT: this is a real process-memory checkpoint attempt, not docker commit.
-                          rc,_,err=run('docker-checkpoint-create',['docker','checkpoint','create',name,'checkpoint0'],180)
-                          record('docker_checkpoint_create',rc==0,err[-2000:])
-                          if rc==0:
-                              run('checkpoint-container-inspect',['docker','inspect',name],30)
-                              rc,_,err=run('docker-checkpoint-restore',['docker','start','--checkpoint','checkpoint0',name],180)
-                              record('docker_checkpoint_restore',rc==0,err[-2000:])
-                              if rc==0:
-                                  time.sleep(3)
-                                  _,after,_=run('after-restore-logs',['docker','logs','--tail','150',name],30)
-                                  post=[l for l in after.splitlines() if 'V8_LIVE_MARKER count=' in l]
-                                  def extract(line):
-                                      try:return int(line.split('count=')[1].split()[0])
-                                      except Exception:return -1
-                                  before_count=extract(last)
-                                  after_count=max((extract(l) for l in post),default=-1)
-                                  record('heap_execution_continuity',after_count>before_count and 'V8-HEAP-STATE-UNIQUE-6f8c' in after,{'before_count':before_count,'after_max_count':after_count,'note':'Log persistence alone is insufficient; post-checkpoint count must advance.'})
-                                  record('process_alive_after_restore','true' in run('after-restore-inspect',['docker','inspect','-f','{{.State.Running}} {{.State.Pid}}',name],30)[1],'Inspect state')
-                          else:
-                              result['caveats'].append('Docker daemon may not enable CRIU checkpoint/restore on GitHub-hosted runners; see checkpoint stderr. This is an environment feasibility result, not proof the approach is impossible.')
-          except Exception as e:
-              traceback.print_exc(); result['exception']=repr(e)
-          finally:
-              run('cleanup',['docker','rm','-f',name],45)
-              result['finished_utc']=datetime.datetime.now(datetime.timezone.utc).isoformat()
-              (root/'report.json').write_text(json.dumps(result,indent=2))
-              print('\n'+'#'*110+'\nFINAL MACHINE-READABLE REPORT\n'+json.dumps(result,indent=2)+'\n'+'#'*110,flush=True)
-          PY
-          python3 -u /tmp/checkpoint_probe.py 2>&1 | tee evidence/full-execution-console.log
-          probe_rc=${PIPESTATUS[0]}
-          echo "PROBE_SCRIPT_EXIT=$probe_rc" | tee -a evidence/full-execution-console.log
-          # Do not hide feasibility failure: preserve artifacts and set the job outcome after upload.
-          python3 - <<'PY'
-          import json,os
-          if not os.path.exists('evidence/report.json'):
-              print('No report.json generated: probe failed before finalization')
-              with open(os.environ['GITHUB_OUTPUT'],'a') as f:f.write('feasible=false\n')
-              raise SystemExit(0)
-          p=json.load(open('evidence/report.json'))
-          required=['real_v8_binary_present','real_v8_running','docker_checkpoint_create','docker_checkpoint_restore','heap_execution_continuity','process_alive_after_restore']
-          good=all(p['tests'].get(k,{}).get('passed',False) for k in required)
-          with open(os.environ['GITHUB_OUTPUT'],'a') as f:f.write(f'feasible={str(good).lower()}\n')
-          print('FULL_EXECUTION_CHECKPOINT_FEASIBLE=',good)
-          PY
-
-      - name: Explain results in GitHub summary
-        if: always()
-        shell: bash
-        run: |
-          python3 - <<'PY'
-          import json,os,pathlib
-          p=pathlib.Path('evidence/report.json')
-          lines=['# Full V8 execution checkpoint feasibility','', '**Scope:** Live `d8` process checkpoint/restore via Docker/CRIU, not filesystem-only `docker commit`.','', '| Assertion | Outcome |','|---|---|']
-          if p.exists():
-              d=json.loads(p.read_text())
-              for k,v in d.get('tests',{}).items():lines.append(f"| `{k}` | {'PASS' if v['passed'] else 'FAIL'} |")
-              lines+=['','**Interpretation:** Failure on GitHub-hosted runners may reflect unavailable kernel/daemon checkpoint features. Success demonstrates continuity for this V8 probe only, not fidelity for every ExploitGym target, network socket, or agent process.','', '**Next validation:** Repeat checkpoint/restore at multiple pause points; verify object/heap contents, open FDs, sockets, threads, ASLR, JIT state, and exploit outcomes; repeat on self-hosted Linux with configured CRIU.']
-          else:lines+=['','No report generated; inspect logs.']
-          with open(os.environ['GITHUB_STEP_SUMMARY'],'a') as f:f.write('\n'.join(lines)+'\n')
-          PY
-
-      - name: Upload all evidence including failure diagnostics
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: v8-full-execution-checkpoint-evidence
-          path: evidence/
-          if-no-files-found: warn
-          retention-days: 14
-
-      - name: Mark experiment failed when real execution checkpoint is unproven
-        if: always() && steps.experiment.outputs.feasible != 'true'
-        shell: bash
-        run: |
-          echo 'FAIL-CLOSED: Full V8 execution checkpoint continuity was NOT demonstrated. Read uploaded evidence and job summary.'
-          exit 1
+        echo '=== CRIU INSTALLATION: SOURCE BUILD, NOT apt-get install criu ==='
+        echo "Requested release: $CRIU_VERSION"
+        echo "Pinned source commit: $CRIU_COMMIT"
+        echo "Installation directory: $CRIU_SBINDIR"
+        echo 'Ubuntu Noble package availability is NOT a prerequisite for this installer.'
+        phase=apt_metadata
+        sudo -n true
+        sudo env DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=3 update
+        # Diagnostic only. A missing package is expected on affected Noble archives.
+        if apt-cache policy criu; then :; else echo 'WARN: apt-cache policy unavailable'; fi
+        phase=build_dependencies
+        sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+          ca-certificates git build-essential pkg-config python3 python3-protobuf \
+          libprotobuf-dev libprotobuf-c-dev protobuf-c-compiler protobuf-compiler \
+          libnl-3-dev libnet1-dev libcap-dev libbsd-dev uuid-dev libgnutls28-dev \
+          libnftables-dev libaio-dev liblz4-dev iproute2 iptables
+        phase=source_fetch
+        source_dir="$(mktemp -d "$RUNNER_TEMP/criu-source.XXXXXX")"
+        echo "Source directory: $source_dir"
+        git init "$source_dir"
+        git -C "$source_dir" remote add origin https://github.com/checkpoint-restore/criu.git
+        git -C "$source_dir" fetch --depth=1 origin "$CRIU_COMMIT"
+        git -C "$source_dir" checkout --detach FETCH_HEAD
+        phase=source_verification
+        source_commit="$(git -C "$source_dir" rev-parse HEAD)"
+        [ "$source_commit" = "$CRIU_COMMIT" ]
+        git -C "$source_dir" show -s --format=fuller HEAD | tee "$EVIDENCE_DIR/criu-source.txt"
+        phase=compile
+        # Only the native CRIU target: no Python pip installation or documentation build.
+        # Limit compile parallelism to keep RAM use predictable on standard runners.
+        make -C "$source_dir" -j2 V=1 WERROR=0 PYTHON=/usr/bin/python3 criu \
+          2>&1 | tee "$EVIDENCE_DIR/criu-build.log"
+        phase=install
+        sudo make -C "$source_dir" V=1 WERROR=0 PYTHON=/usr/bin/python3 \
+          PREFIX=/usr/local "SBINDIR=$CRIU_SBINDIR" install-criu
+        phase=binary_verification
+        binary="$CRIU_SBINDIR/criu"
+        [ -x "$binary" ]
+        version_output="$(sudo "$binary" --version)"
+        printf '%s\n' "$version_output" | tee "$EVIDENCE_DIR/criu-version.txt"
+        [[ "$version_output" == *"Version: $CRIU_VERSION"* ]]
+        sha256sum "$binary" | tee "$EVIDENCE_DIR/criu-binary.sha256"
+        if ldd "$binary"; then :; else echo 'WARN: ldd unavailable; the version check above executed the binary'; fi
+        phase=complete
+        echo 'CRIU native binary is installed and its --version invocation succeeded.'
+        echo 'This is NOT a claim that kernel or Docker checkpoint/restore works.'
+    - name: Enable and verify Docker server experimental mode
+      id: daemon_setup
+      if: ${{ !cancelled() && steps.criu_setup.outcome == 'success' }}
+      continue-on-error: true
+      shell: bash
+      run: |
+        python3 -u "$RUNNER_TEMP/checkpoint_probe.py" daemon
+    - name: Checkpoint and restore a live d8 heap (or report the blocking setup stage)
+      id: experiment
+      if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
+      continue-on-error: true
+      shell: bash
+      run: |
+        set -Eeuo pipefail
+        python3 -u "$RUNNER_TEMP/checkpoint_probe.py" 2>&1 | tee "$EVIDENCE_DIR/experiment-console.log"
+    - name: Collect evidence and report exact failing stage
+      if: ${{ always() }}
+      shell: bash
+      run: |
+        set -Eeuo pipefail
+        mkdir -p "$EVIDENCE_DIR"
+        python3 - <<'PYSUMMARY'
+        import json, os, pathlib
+        root = pathlib.Path(os.environ['EVIDENCE_DIR'])
+        records = {}
+        for name in ['setup.json', 'daemon-setup.json', 'report.json']:
+            path = root / name
+            try:
+                records[name] = json.loads(path.read_text())
+            except (FileNotFoundError, json.JSONDecodeError) as exc:
+                records[name] = {'status': 'not_run', 'detail': str(exc)}
+        passed = all(v.get('status') == 'passed' for v in records.values())
+        lines = ['# V8 live-process checkpoint feasibility', '',
+                 '**Overall:** ' + ('PASS for this probe only' if passed else 'NOT DEMONSTRATED'), '',
+                 '| Stage | Result | Detail |', '|---|---|---|']
+        for name, record in records.items():
+            detail = record.get('last_phase', record.get('failed_stage', record.get('exception', '')))
+            detail = str(detail).replace('|', '/')
+            lines.append(f"| {name} | {record['status']} | {detail} |")
+        lines += ['', '## Scope',
+            'Installation uses pinned upstream CRIU source; it does not require an Ubuntu criu package.',
+            'The probe compares a random startup token, an exact counter, all 4096 typed-array words,',
+            'a hot-function result, and strictly new output after a stopped checkpoint.',
+            'Success is not proof of arbitrary V8/JIT, networking, full-agent, or cross-host fidelity.',
+            'Raw memory images are deliberately not uploaded.', '', '## Assertions',
+            '| Assertion | Passed |', '|---|---|']
+        for item in records['report.json'].get('assertions', []):
+            lines.append(f"| {item['name']} | {item['passed']} |")
+        text = '\n'.join(lines) + '\n'
+        (root / 'summary.md').write_text(text)
+        with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as f:
+            f.write(text)
+        (root / 'overall.json').write_text(json.dumps({'passed': passed, 'stages': records}, indent=2))
+        print(text)
+        PYSUMMARY
+        # Capture host-side errors even if setup or the experiment failed.
+        sudo journalctl -u docker -u containerd --since '1 hour ago' --no-pager > "$EVIDENCE_DIR/runtime-journal.log" 2>&1 || true
+        sudo dmesg --ctime > "$EVIDENCE_DIR/dmesg.log" 2>&1 || true
+        sudo chown -R "$(id -u):$(id -g)" "$EVIDENCE_DIR"
+    - name: Upload diagnostics even after failure
+      if: ${{ always() }}
+      uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+      with:
+        name: v8-criu-source-build-evidence-${{ github.run_attempt }}
+        path: ${{ env.EVIDENCE_DIR }}/
+        if-no-files-found: error
+        retention-days: 14
+    - name: Fail unless setup and actual checkpoint fidelity passed
+      if: ${{ always() }}
+      shell: bash
+      run: |
+        python3 - <<'PYGATE'
+        import json, os, pathlib, sys
+        path = pathlib.Path(os.environ['EVIDENCE_DIR']) / 'overall.json'
+        passed = path.exists() and json.loads(path.read_text()).get('passed') is True
+        print('PASS: live d8 probe resumed from checkpoints.' if passed else
+              'NOT DEMONSTRATED: inspect setup.json, daemon-setup.json, report.json and command logs.')
+        sys.exit(0 if passed else 1)
+        PYGATE
