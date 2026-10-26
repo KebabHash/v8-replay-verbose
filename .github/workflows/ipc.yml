@@ -1,0 +1,2433 @@
+name: ExploitGym CRIU Stage 1 - all target images
+
+on:
+  workflow_dispatch:
+    inputs:
+      exploitgym_ref:
+        description: ExploitGym git ref used to resolve the v1 task list and image metadata
+        type: string
+        default: main
+      expected_task_count:
+        description: Expected ExploitGym v1 task count; guards against silent corpus drift
+        type: string
+        default: '869'
+      user_mode:
+        description: Userspace image mode from metadata.json
+        type: choice
+        options:
+          - exp.none
+          - exp.canary
+          - exp.pie
+          - exp.relro
+          - exp.hardened
+        default: exp.none
+      v8_variant:
+        description: V8 image variant; nosandbox falls back to main if unavailable
+        type: choice
+        options:
+          - main
+          - nosandbox
+        default: main
+      shard_count:
+        description: Parallel shard count. Keep at 20 for GitHub Free concurrency.
+        type: string
+        default: '20'
+      per_image_timeout_seconds:
+        description: Hard timeout for pull/checkpoint/restore subprocesses per image
+        type: string
+        default: '420'
+      network_policy:
+        description: Network mode for the minimal probe. auto uses the retained loopback-only namespace fixture on the pinned Docker 27 runtime.
+        type: choice
+        options:
+          - auto
+          - host
+          - isolated
+        default: auto
+      publish_release:
+        description: Archive the complete sweep as a GitHub Release
+        type: boolean
+        default: true
+      fail_on_incompatibility:
+        description: Fail the final job if any image does not pass the smoke test
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+env:
+  SWEEP_REVISION: stage1-image-smoke-9-limitations-report
+  DOCKER_ENGINE_VERSION: '5:27.5.1-1~ubuntu.24.04~noble'
+  CONTAINERD_VERSION: '1.7.25-1'
+  CRIU_VERSION: '4.3'
+  CRIU_COMMIT: 2b7ac603cda31d015d91c856c34c557cb2300e7d
+  SHARD_COUNT: ${{ inputs.shard_count || '20' }}
+  PER_IMAGE_TIMEOUT: ${{ inputs.per_image_timeout_seconds || '420' }}
+  NETWORK_POLICY: ${{ inputs.network_policy || 'auto' }}
+  RESTORE_MAX_ATTEMPTS: '5'
+  RESTORE_SETTLE_SECONDS: '1'
+
+jobs:
+  prepare:
+    name: Resolve and deduplicate target images
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    outputs:
+      image_count: ${{ steps.manifest.outputs.image_count }}
+      task_count: ${{ steps.manifest.outputs.task_count }}
+      exploitgym_sha: ${{ steps.manifest.outputs.exploitgym_sha }}
+    steps:
+      - name: Resolve pinned ExploitGym commit and fetch only required metadata
+        id: upstream
+        shell: bash
+        env:
+          EXPLOITGYM_REF: ${{ inputs.exploitgym_ref || 'main' }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -Eeuo pipefail
+          mkdir -p stage1-upstream/data/task_ids stage1-upstream/src/cybergym/task
+          python3 - <<'PYUPSTREAM'
+          import json, os, pathlib, urllib.parse, urllib.request
+
+          owner_repo = 'sunblaze-ucb/exploitgym'
+          ref = os.environ['EXPLOITGYM_REF']
+          token = os.environ.get('GH_TOKEN','')
+
+          def request(url, accept=None):
+              headers = {'User-Agent':'exploitgym-criu-stage1'}
+              if accept:
+                  headers['Accept'] = accept
+              if token:
+                  headers['Authorization'] = 'Bearer ' + token
+              req = urllib.request.Request(url, headers=headers)
+              with urllib.request.urlopen(req, timeout=60) as r:
+                  return r.read()
+
+          # Resolve a branch/tag/SHA once, then fetch every metadata file by immutable SHA.
+          api = 'https://api.github.com/repos/' + owner_repo + '/commits/' + urllib.parse.quote(ref, safe='')
+          commit = json.loads(request(api, 'application/vnd.github+json'))
+          sha = commit.get('sha','')
+          if len(sha) != 40 or any(c not in '0123456789abcdef' for c in sha.lower()):
+              raise SystemExit('Could not resolve ExploitGym ref to a full commit SHA: ' + repr(sha))
+
+          files = [
+              'data/task_ids/v1.txt',
+              'src/cybergym/task/metadata.json',
+              'src/cybergym/task/v8_metadata.json',
+              'src/cybergym/task/kernel_metadata.json',
+          ]
+          base = 'https://raw.githubusercontent.com/' + owner_repo + '/' + sha + '/'
+          root = pathlib.Path('stage1-upstream')
+          inventory=[]
+          import hashlib
+          for rel in files:
+              data = request(base + rel)
+              path = root / rel
+              path.parent.mkdir(parents=True, exist_ok=True)
+              path.write_bytes(data)
+              inventory.append({'path':rel,'bytes':len(data),'sha256':hashlib.sha256(data).hexdigest()})
+
+          (root/'upstream.json').write_text(json.dumps({
+              'repository': owner_repo,
+              'requested_ref': ref,
+              'resolved_sha': sha,
+              'files': inventory,
+          }, indent=2) + '\n')
+          with open(os.environ['GITHUB_OUTPUT'],'a') as f:
+              f.write('exploitgym_sha=' + sha + '\n')
+          print('Pinned ExploitGym', ref, '->', sha)
+          for row in inventory:
+              print('FETCHED', row['path'], row['bytes'], row['sha256'])
+          PYUPSTREAM
+
+      - name: Build unique-image manifest and 20 shards
+        id: manifest
+        shell: bash
+        env:
+          EXPECTED_TASK_COUNT: ${{ inputs.expected_task_count || '869' }}
+          USER_MODE: ${{ inputs.user_mode || 'exp.none' }}
+          V8_VARIANT: ${{ inputs.v8_variant || 'main' }}
+        run: |
+          set -Eeuo pipefail
+          mkdir -p stage1-manifest/shards
+          python3 - <<'PY'
+          import json, os, pathlib
+
+          root = pathlib.Path('stage1-upstream')
+          tasks_path = root / 'data/task_ids/v1.txt'
+          task_ids = [x.strip() for x in tasks_path.read_text().splitlines() if x.strip() and not x.lstrip().startswith('#')]
+          expected = int(os.environ['EXPECTED_TASK_COUNT'])
+          if len(task_ids) != expected:
+              raise SystemExit(f'ExploitGym corpus drift: expected {expected} tasks, found {len(task_ids)}')
+
+          def load(name):
+              return json.loads((root / 'src/cybergym/task' / name).read_text())
+
+          def build_index(rows, family):
+              # ExploitGym's v1.txt intentionally uses human-readable aliases such as
+              # user:cybergym/arvo_1461 and kernel:kernelctf/CVE-2023-3776_lts,
+              # while metadata.json also carries an opaque hashed task_id. Upstream's
+              # metadata.py indexes BOTH forms; mirror that behavior exactly here.
+              index = {}
+              for row in rows:
+                  hashed = row.get('task_id')
+                  entry = row.get('entry_name')
+                  if not isinstance(hashed, str) or not hashed.startswith(family + ':'):
+                      raise ValueError(f'{family} metadata row has invalid task_id: {hashed!r}')
+                  if not isinstance(entry, str) or not entry:
+                      raise ValueError(f'{family} metadata row has invalid entry_name: {entry!r}')
+                  alias = f'{family}:{entry}'
+                  for key in (hashed, alias):
+                      old = index.get(key)
+                      if old is not None and old is not row:
+                          raise ValueError(f'duplicate metadata key {key!r}')
+                      index[key] = row
+              return index
+
+          user_rows = load('metadata.json')
+          v8_rows = load('v8_metadata.json')
+          kernel_rows = load('kernel_metadata.json')
+          if not all(isinstance(x, list) for x in (user_rows, v8_rows, kernel_rows)):
+              raise SystemExit('One or more ExploitGym metadata files are not JSON arrays')
+          users = build_index(user_rows, 'user')
+          v8s = build_index(v8_rows, 'v8')
+          kernels = build_index(kernel_rows, 'kernel')
+          user_mode = os.environ['USER_MODE']
+          v8_variant = os.environ['V8_VARIANT']
+
+          grouped = {}
+          unresolved = []
+          resolved_tasks = []
+          family_counts = {'user': 0, 'v8': 0, 'kernel': 0}
+          for tid in task_ids:
+              try:
+                  if tid.startswith('user:'):
+                      row = users[tid]
+                      image = row.get('images', {}).get(user_mode)
+                      if not image:
+                          raise KeyError(f'user image mode {user_mode!r} unavailable')
+                      family = 'user'
+                      source = f'images[{user_mode}]'
+                  elif tid.startswith('v8:'):
+                      row = v8s[tid]
+                      if v8_variant == 'nosandbox' and row.get('image_no_sandbox'):
+                          image = row['image_no_sandbox']
+                          source = 'image_no_sandbox'
+                      else:
+                          image = row.get('image')
+                          source = 'image'
+                      if not image:
+                          raise KeyError(f'v8 image variant {v8_variant!r} unavailable')
+                      family = 'v8'
+                  elif tid.startswith('kernel:'):
+                      row = kernels[tid]
+                      image = row.get('image_name')
+                      if not image:
+                          raise KeyError('kernel image_name unavailable')
+                      family = 'kernel'
+                      source = 'image_name'
+                  else:
+                      raise KeyError('unknown family')
+              except Exception as exc:
+                  unresolved.append({'task_id': tid, 'error': repr(exc)})
+                  continue
+
+              family_counts[family] += 1
+              resolved_tasks.append({
+                  'task_id': tid,
+                  'metadata_task_id': row.get('task_id'),
+                  'entry_name': row.get('entry_name'),
+                  'family': family,
+                  'image': image,
+                  'metadata_source': source,
+              })
+              item = grouped.setdefault(image, {
+                  'image': image,
+                  'families': set(),
+                  'task_ids': [],
+                  'metadata_task_ids': set(),
+                  'metadata_sources': set(),
+              })
+              item['families'].add(family)
+              item['task_ids'].append(tid)
+              item['metadata_task_ids'].add(row.get('task_id'))
+              item['metadata_sources'].add(source)
+
+          pathlib.Path('stage1-manifest/unresolved.json').write_text(json.dumps(unresolved, indent=2) + '\n')
+          pathlib.Path('stage1-manifest/resolved-tasks.json').write_text(json.dumps(resolved_tasks, indent=2) + '\n')
+          if unresolved:
+              examples = ', '.join(x['task_id'] for x in unresolved[:5])
+              raise SystemExit(f'{len(unresolved)} task IDs could not be resolved; examples: {examples}; see unresolved.json')
+          if len(resolved_tasks) != len(task_ids):
+              raise SystemExit(f'Resolver completeness failure: {len(resolved_tasks)} resolved of {len(task_ids)}')
+
+          images = []
+          for image, item in sorted(grouped.items()):
+              images.append({
+                  'image': image,
+                  'families': sorted(item['families']),
+                  'task_count': len(item['task_ids']),
+                  'task_ids': item['task_ids'],
+                  'metadata_task_ids': sorted(x for x in item['metadata_task_ids'] if isinstance(x, str)),
+                  'metadata_sources': sorted(item['metadata_sources']),
+              })
+
+          shard_count = int(os.environ.get('SHARD_COUNT', '20'))
+          if not 1 <= shard_count <= 20:
+              raise SystemExit('shard_count must be between 1 and 20')
+          shards = [[] for _ in range(shard_count)]
+          # Round-robin after sorting by descending task multiplicity. This spreads
+          # heavily shared kernel images instead of clustering them in one shard.
+          for i, item in enumerate(sorted(images, key=lambda x: (-x['task_count'], x['image']))):
+              shards[i % shard_count].append(item)
+
+          upstream = json.loads((root/'upstream.json').read_text())
+          sha = upstream['resolved_sha']
+          manifest = {
+              'schema': 'exploitgym-criu-stage1/v1',
+              'workflow_revision': os.environ.get('SWEEP_REVISION'),
+              'exploitgym_ref_requested': upstream['requested_ref'],
+              'exploitgym_sha': sha,
+              'task_count': len(task_ids),
+              'resolved_task_count': len(resolved_tasks),
+              'family_task_counts': family_counts,
+              'unique_image_count': len(images),
+              'user_mode': user_mode,
+              'v8_variant': v8_variant,
+              'shard_count': shard_count,
+              'images': images,
+              'scope': 'Image-level CRIU smoke compatibility: one minimal in-image process, one checkpoint, one restore. Not native exploit-server workload fidelity.',
+          }
+          pathlib.Path('stage1-manifest/manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
+          for i, rows in enumerate(shards):
+              pathlib.Path(f'stage1-manifest/shards/shard-{i:02d}.json').write_text(json.dumps(rows, indent=2) + '\n')
+          pathlib.Path('stage1-manifest/task_ids.txt').write_text('\n'.join(task_ids) + '\n')
+          pathlib.Path('stage1-manifest/upstream.json').write_text(json.dumps(upstream, indent=2) + '\n')
+          print(f'TASKS={len(task_ids)} RESOLVED={len(resolved_tasks)} UNIQUE_IMAGES={len(images)} SHARDS={shard_count} SHA={sha}')
+          print('FAMILY_COUNTS=' + json.dumps(family_counts, sort_keys=True))
+          for row in resolved_tasks[:6]:
+              print('RESOLVED_EXAMPLE', row['task_id'], '->', row['metadata_task_id'], '->', row['image'])
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+              f.write(f'task_count={len(task_ids)}\n')
+              f.write(f'image_count={len(images)}\n')
+              f.write(f'exploitgym_sha={sha}\n')
+          PY
+
+      - name: Upload immutable sweep manifest
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stage1-manifest
+          path: stage1-manifest/
+          if-no-files-found: warn
+          retention-days: 14
+
+  sweep:
+    name: CRIU shard ${{ matrix.shard }}
+    needs: prepare
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
+    steps:
+      - name: Download unique-image shards
+        uses: actions/download-artifact@v4
+        with:
+          name: stage1-manifest
+          path: stage1-manifest
+
+      - name: Ignore unused matrix slots when shard_count is lower than 20
+        id: enabled
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          if [ "${{ matrix.shard }}" -lt "${SHARD_COUNT}" ]; then
+            echo 'run=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'run=false' >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Pin Docker runtime, build pinned CRIU, and verify checkpoint support
+        if: steps.enabled.outputs.run == 'true'
+        shell: bash
+        env:
+          SHARD: ${{ matrix.shard }}
+        run: |
+          set -Eeuo pipefail
+          export LC_ALL=C
+          out="evidence/shard-${SHARD}"
+          mkdir -p "$out"
+          exec > >(tee "$out/runtime-setup.log") 2>&1
+          phase=initialization
+          source_commit=''
+          finish() {
+            rc=$?
+            trap - EXIT
+            set +e
+            python3 - "$out" "$rc" "$phase" "$source_commit" <<'PYREPORT'
+          import datetime,json,pathlib,sys
+          root,rc,phase,commit=sys.argv[1:]
+          pathlib.Path(root,'runtime-setup.json').write_text(json.dumps({
+              'status':'passed' if rc=='0' else 'failed',
+              'exit_code':int(rc),'last_phase':phase,'source_commit':commit,
+              'method':'pinned_criu_source_build',
+              'utc':datetime.datetime.now(datetime.timezone.utc).isoformat(),
+          },indent=2)+'\n')
+          PYREPORT
+            exit "$rc"
+          }
+          trap finish EXIT
+
+          : "${CRIU_COMMIT:?CRIU_COMMIT is required}"
+          : "${CRIU_VERSION:?CRIU_VERSION is required}"
+          : "${RUNNER_TEMP:?RUNNER_TEMP is required}"
+          [[ "$CRIU_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+          [ "$(uname -m)" = x86_64 ]
+          sudo -n true
+
+          phase=apt_metadata
+          sudo env DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=3 update
+
+          phase=build_dependencies
+          # Noble does not reliably expose a binary `criu` package on hosted runners.
+          # Install only build/runtime dependencies and compile the pinned upstream source.
+          sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            ca-certificates curl gnupg git build-essential libc6-dev file pkg-config python3 python3-protobuf \
+            libprotobuf-dev libprotobuf-c-dev protobuf-c-compiler protobuf-compiler \
+            libnl-3-dev libnet1-dev libcap-dev libbsd-dev uuid-dev libgnutls28-dev \
+            libnftables-dev libaio-dev liblz4-dev iproute2 iptables util-linux
+
+          phase=source_fetch
+          src="$(mktemp -d "$RUNNER_TEMP/criu-source.XXXXXX")"
+          git init -q "$src"
+          git -C "$src" remote add origin https://github.com/checkpoint-restore/criu.git
+          git -C "$src" fetch --depth=1 origin "$CRIU_COMMIT"
+          git -C "$src" checkout --detach FETCH_HEAD
+
+          phase=source_verification
+          source_commit="$(git -C "$src" rev-parse HEAD)"
+          [ "$source_commit" = "$CRIU_COMMIT" ]
+          git -C "$src" show -s --format=fuller HEAD | tee "$out/criu-source.txt"
+
+          phase=compile
+          make -C "$src" -j2 V=1 WERROR=0 PYTHON=/usr/bin/python3 criu \
+            2>&1 | tee "$out/criu-build.log"
+
+          phase=install
+          # `make install-criu` re-enters the build and also touches optional Python
+          # installation paths. Docker only needs the CRIU executable. Install the
+          # exact binary we just built directly, plus criu-ns when present.
+          test -x "$src/criu/criu"
+          sudo install -m 0755 "$src/criu/criu" /usr/sbin/criu
+          if [ -x "$src/scripts/criu-ns" ]; then
+            sudo install -m 0755 "$src/scripts/criu-ns" /usr/sbin/criu-ns
+          fi
+
+          phase=criu_verification
+          [ -x /usr/sbin/criu ]
+          version="$(sudo /usr/sbin/criu --version)"
+          printf '%s\n' "$version" | tee "$out/criu-version.txt"
+          [[ "$version" == *"Version: $CRIU_VERSION"* ]]
+          sha256sum /usr/sbin/criu | tee "$out/criu-binary.sha256"
+          phase=source_cleanup
+          rm -rf "$src"
+          sudo apt-get clean
+
+          phase=docker_runtime_pin
+          # GitHub's hosted image currently carries Docker >=28, where checkpoint
+          # restore has a known network-namespace regression. Newer hosted images
+          # also carry containerd 2.x, and the checkpoint content-store path has
+          # produced `content sha256:... already exists` failures. Pin the tested
+          # Docker 27.5.1 + containerd 1.7.25 pair for the scientific sweep.
+          : "${DOCKER_ENGINE_VERSION:?DOCKER_ENGINE_VERSION is required}"
+          : "${CONTAINERD_VERSION:?CONTAINERD_VERSION is required}"
+          sudo install -m 0755 -d /etc/apt/keyrings
+          curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
+            | sudo tee /etc/apt/keyrings/docker.asc >/dev/null
+          sudo chmod a+r /etc/apt/keyrings/docker.asc
+          printf '%s\n' \
+            'deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu noble stable' \
+            | sudo tee /etc/apt/sources.list.d/docker-stage1.list >/dev/null
+          sudo env DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=3 update
+          apt-cache madison docker-ce | tee "$out/docker-ce-available.txt"
+          apt-cache madison containerd.io | tee "$out/containerd-available.txt"
+          apt-cache madison docker-ce | awk '{print $3}' | grep -Fx -- "$DOCKER_ENGINE_VERSION"
+          apt-cache madison containerd.io | awk '{print $3}' | grep -Fx -- "$CONTAINERD_VERSION"
+
+          sudo systemctl stop docker.service docker.socket containerd.service 2>/dev/null || true
+          # Hosted images may hold runtime packages to prevent accidental upgrades;
+          # explicitly unhold before installing the experiment's pinned runtime.
+          sudo apt-mark unhold docker-ce docker-ce-cli docker-ce-rootless-extras containerd.io >/dev/null 2>&1 || true
+          sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y --allow-downgrades --no-install-recommends \
+            "docker-ce=$DOCKER_ENGINE_VERSION" \
+            "docker-ce-cli=$DOCKER_ENGINE_VERSION" \
+            "docker-ce-rootless-extras=$DOCKER_ENGINE_VERSION" \
+            "containerd.io=$CONTAINERD_VERSION"
+          sudo apt-mark hold docker-ce docker-ce-cli docker-ce-rootless-extras containerd.io >/dev/null
+
+          phase=docker_configuration
+          sudo mkdir -p /etc/docker
+          python3 - <<'PYDOCKER'
+          import json,pathlib
+          p=pathlib.Path('/etc/docker/daemon.json')
+          try:
+              obj=json.loads(p.read_text()) if p.exists() else {}
+              if not isinstance(obj,dict): raise ValueError('daemon.json is not an object')
+          except Exception:
+              obj={}
+          obj['experimental']=True
+          # Docker 27 defaults to the legacy image store. Force that mode explicitly
+          # so the test runtime does not inherit a containerd-snapshotter setting
+          # from the preinstalled GitHub runner daemon configuration.
+          features=obj.get('features')
+          if not isinstance(features,dict): features={}
+          features['containerd-snapshotter']=False
+          obj['features']=features
+          pathlib.Path('/tmp/stage1-daemon.json').write_text(json.dumps(obj,indent=2)+'\n')
+          PYDOCKER
+          sudo dockerd --validate --config-file /tmp/stage1-daemon.json
+          sudo install -m 0644 /tmp/stage1-daemon.json /etc/docker/daemon.json
+          sudo systemctl daemon-reload
+          sudo systemctl restart containerd
+          sudo systemctl restart docker
+
+          phase=docker_verification
+          docker version | tee "$out/docker-version-setup.txt"
+          docker info | tee "$out/docker-info-setup.txt"
+          docker version --format '{{.Server.Version}}' | tee "$out/docker-server-version.txt"
+          [ "$(docker version --format '{{.Server.Version}}')" = '27.5.1' ]
+          containerd --version | tee "$out/containerd-version.txt"
+          containerd --version | grep -F ' 1.7.25 ' >/dev/null
+          dpkg-query -W -f='${Package}=${Version}\n' docker-ce docker-ce-cli docker-ce-rootless-extras containerd.io \
+            | tee "$out/runtime-packages.txt"
+          experimental="$(docker info --format '{{.ExperimentalBuild}}')"
+          [ "${experimental,,}" = true ]
+          docker checkpoint --help > "$out/docker-checkpoint-help.txt"
+          # Informative only: optional kernel features can make `criu check` non-zero while
+          # a concrete Docker checkpoint still succeeds. The per-image test is authoritative.
+          sudo /usr/sbin/criu check -v4 > "$out/criu-check.txt" 2>&1 || true
+
+          # Fail fast on runtime-wide Docker/CRIU problems before testing dozens of
+          # ExploitGym images. This canary is built entirely on the runner, so it
+          # adds no registry/network dependency. Host networking intentionally avoids
+          # Moby #50750 on Docker >=28.
+          phase=runtime_canary_compile
+          cat > "$RUNNER_TEMP/stage1-probe.c" <<'CANARY_C'
+          #include <signal.h>
+          #include <stdint.h>
+          #include <stdio.h>
+          #include <string.h>
+          #include <time.h>
+          #include <unistd.h>
+          #include <sys/syscall.h>
+          static volatile sig_atomic_t stopflag = 0;
+          static volatile sig_atomic_t snapshotflag = 0;
+          static volatile uint64_t counter = 0;
+          static uint64_t nonce = 0;
+          static void stop_handler(int sig) { (void)sig; stopflag = 1; }
+          static void snapshot_handler(int sig) { (void)sig; snapshotflag = 1; }
+          static uint64_t make_nonce(void) {
+              uint64_t v = 0;
+          #ifdef SYS_getrandom
+              if (syscall(SYS_getrandom, &v, sizeof(v), 0) == (long)sizeof(v) && v != 0) return v;
+          #endif
+              struct timespec ts;
+              clock_gettime(CLOCK_REALTIME, &ts);
+              v = ((uint64_t)(unsigned long)getpid() << 32) ^ (uint64_t)ts.tv_sec ^ (uint64_t)ts.tv_nsec;
+              return v ? v : UINT64_C(0x9e3779b97f4a7c15);
+          }
+          static void emit_state(const char *event) {
+              char buf[256];
+              int n = snprintf(buf, sizeof(buf),
+                  "STAGE1_PROBE event=%s nonce=%016llx counter=%llu pid=%ld\n",
+                  event, (unsigned long long)nonce, (unsigned long long)counter, (long)getpid());
+              if (n > 0) (void)!write(STDOUT_FILENO, buf, (size_t)n);
+          }
+          int main(int argc, char **argv) {
+              if (argc > 1 && strcmp(argv[1], "--check") == 0) {
+                  (void)!write(STDOUT_FILENO, "probe-ok\n", 9);
+                  return 0;
+              }
+              nonce = make_nonce();
+              signal(SIGTERM, stop_handler);
+              signal(SIGINT, stop_handler);
+              signal(SIGUSR1, snapshot_handler);
+              emit_state("start");
+              while (!stopflag) {
+                  struct timespec req = {0, 100000000L};
+                  (void)nanosleep(&req, NULL);
+                  counter++;
+                  if (snapshotflag) {
+                      snapshotflag = 0;
+                      emit_state("snapshot");
+                  }
+                  if ((counter % 10) == 0) emit_state("heartbeat");
+              }
+              emit_state("stop");
+              return 0;
+          }
+          CANARY_C
+          gcc -static -O2 -s -o "$RUNNER_TEMP/stage1-probe" "$RUNNER_TEMP/stage1-probe.c"
+          file "$RUNNER_TEMP/stage1-probe" | tee "$out/runtime-canary-binary.txt"
+
+          phase=runtime_canary_image
+          canary_root="$RUNNER_TEMP/stage1-canary-root"
+          rm -rf "$canary_root"
+          mkdir -p "$canary_root"
+          install -m 0755 "$RUNNER_TEMP/stage1-probe" "$canary_root/probe"
+          tar -C "$canary_root" -cf "$RUNNER_TEMP/stage1-canary-root.tar" .
+          docker import "$RUNNER_TEMP/stage1-canary-root.tar" stage1-criu-canary:local \
+            > "$out/runtime-canary-image-id.txt"
+
+          phase=runtime_canary_checkpoint
+          canary_name=stage1-criu-runtime-canary
+          canary_keeper=stage1-criu-runtime-canary-netns
+          docker rm -f "$canary_name" "$canary_keeper" >/dev/null 2>&1 || true
+          docker create --name "$canary_keeper" --runtime runc --network none \
+            --security-opt seccomp=unconfined --security-opt apparmor=unconfined \
+            --entrypoint /probe stage1-criu-canary:local > "$out/runtime-canary-keeper-id.txt"
+          docker start "$canary_keeper" | tee "$out/runtime-canary-keeper-start.txt"
+          keeper_cid="$(cat "$out/runtime-canary-keeper-id.txt")"
+          [ "$(docker inspect --format '{{.State.Running}}' "$canary_keeper")" = true ]
+          docker create --name "$canary_name" --runtime runc --network "container:$keeper_cid" \
+            --security-opt seccomp=unconfined --security-opt apparmor=unconfined \
+            --entrypoint /probe stage1-criu-canary:local > "$out/runtime-canary-container-id.txt"
+          docker start "$canary_name" | tee "$out/runtime-canary-start.txt"
+          sleep 0.5
+          [ "$(docker inspect --format '{{.State.Running}}' "$canary_name")" = true ]
+          docker kill --signal USR1 "$canary_name" >/dev/null
+          sleep 0.35
+          docker logs "$canary_name" > "$out/runtime-canary-probe-pre.txt" 2>&1
+          docker checkpoint create "$canary_name" stage1-canary \
+            > "$out/runtime-canary-checkpoint.txt" 2>&1
+          [ "$(docker inspect --format '{{.State.Running}}' "$canary_name")" = false ]
+          [ "$(docker inspect --format '{{.State.Running}}' "$canary_keeper")" = true ]
+
+          phase=runtime_canary_restore
+          # Docker/containerd has a long-standing transient race when a checkpoint is
+          # restored immediately after creation. CRIU's own Docker CI retries this exact
+          # `failed to upload checkpoint ... already exists` signature. Do the same,
+          # with bounded retries and one narrowly-scoped last-resort cleanup of the
+          # temporary checkpoint blob in containerd's `moby` namespace.
+          : "${RESTORE_MAX_ATTEMPTS:=5}"
+          : "${RESTORE_SETTLE_SECONDS:=1}"
+          sleep "$RESTORE_SETTLE_SECONDS"
+          canary_rc=1
+          canary_attempt=0
+          canary_repair_used=false
+          : > "$out/runtime-canary-restore-attempts.txt"
+          while [ "$canary_attempt" -lt "$RESTORE_MAX_ATTEMPTS" ]; do
+            canary_attempt=$((canary_attempt + 1))
+            attempt_log="$out/runtime-canary-restore-attempt-${canary_attempt}.txt"
+            set +e
+            docker start --checkpoint stage1-canary "$canary_name" > "$attempt_log" 2>&1
+            canary_rc=$?
+            set -e
+            {
+              printf 'attempt=%s rc=%s\n' "$canary_attempt" "$canary_rc"
+              cat "$attempt_log"
+              printf '%s\n' '---'
+            } >> "$out/runtime-canary-restore-attempts.txt"
+            if [ "$canary_rc" -eq 0 ] || [ "$(docker inspect --format '{{.State.Running}}' "$canary_name" 2>/dev/null || true)" = true ]; then
+              canary_rc=0
+              break
+            fi
+            if grep -Eq 'failed to upload checkpoint to containerd: commit failed: content sha256:[0-9a-f]{64}: already exists|content digest .*: not found' "$attempt_log"; then
+              # On the third collision only, inspect and remove exactly the temporary
+              # checkpoint content digest named by Docker. This runner is disposable;
+              # do not touch unrelated content. A failed removal is non-fatal and the
+              # remaining retries still run.
+              if [ "$canary_attempt" -eq 3 ]; then
+                digest="$(grep -Eo 'sha256:[0-9a-f]{64}' "$attempt_log" | tail -n1 || true)"
+                if [ -n "$digest" ]; then
+                  printf '%s\n' "$digest" > "$out/runtime-canary-collision-digest.txt"
+                  sudo ctr -n moby content ls > "$out/runtime-canary-content-before.txt" 2>&1 || true
+                  if sudo ctr -n moby content ls 2>/dev/null | grep -Fq "$digest"; then
+                    sudo ctr -n moby content rm "$digest" > "$out/runtime-canary-content-repair.txt" 2>&1 || true
+                    canary_repair_used=true
+                  fi
+                  sudo ctr -n moby content ls > "$out/runtime-canary-content-after.txt" 2>&1 || true
+                fi
+              fi
+              sleep "$canary_attempt"
+              continue
+            fi
+            break
+          done
+          printf 'restore_attempts=%s\ncontent_store_repair_used=%s\n' "$canary_attempt" "$canary_repair_used" \
+            | tee "$out/runtime-canary-restore-summary.txt"
+          if [ "$canary_rc" -ne 0 ]; then
+            sudo journalctl -u docker -u containerd --since '10 minutes ago' --no-pager -n 250 \
+              > "$out/runtime-canary-journal.txt" 2>&1 || true
+            root="$(docker info --format '{{.DockerRootDir}}')"
+            cid="$(cat "$out/runtime-canary-container-id.txt")"
+            sudo find "$root/containers/$cid/checkpoints/stage1-canary" -maxdepth 4 -type f \
+              -name '*.log' -print -exec tail -n 200 {} \; \
+              > "$out/runtime-canary-criu-logs.txt" 2>&1 || true
+            cat "$out/runtime-canary-restore-attempts.txt" >&2 || true
+            exit "$canary_rc"
+          fi
+          sleep 0.5
+          [ "$(docker inspect --format '{{.State.Running}}' "$canary_name")" = true ]
+          [ "$(docker inspect --format '{{.State.Running}}' "$canary_keeper")" = true ]
+          docker exec "$canary_name" /probe --check | grep -Fx 'probe-ok'
+          docker kill --signal USR1 "$canary_name" >/dev/null
+          sleep 0.35
+          docker logs "$canary_name" > "$out/runtime-canary-probe-post.txt" 2>&1
+          python3 - "$out/runtime-canary-probe-pre.txt" "$out/runtime-canary-probe-post.txt" <<'PYCANARY'
+          import pathlib,re,sys
+          pat=re.compile(r'^STAGE1_PROBE event=snapshot nonce=([0-9a-f]{16}) counter=(\d+) pid=(\d+)$',re.M)
+          pre=pat.findall(pathlib.Path(sys.argv[1]).read_text(errors='replace'))
+          post=pat.findall(pathlib.Path(sys.argv[2]).read_text(errors='replace'))
+          if not pre or not post:
+              raise SystemExit('runtime canary did not emit auditable snapshot state')
+          a,b=pre[-1],post[-1]
+          if a[0] != b[0] or int(b[1]) < int(a[1]):
+              raise SystemExit(f'runtime canary memory continuity failed: pre={a!r} post={b!r}')
+          print(f'CANARY_MEMORY_CONTINUITY VERIFIED nonce={a[0]} counter={a[1]}->{b[1]} pid={a[2]}->{b[2]}')
+          PYCANARY
+          printf 'runtime canary checkpoint+restore+memory-continuity PASS\n' | tee "$out/runtime-canary-pass.txt"
+          docker rm -f "$canary_name" >/dev/null 2>&1 || true
+          docker rm -f "$canary_keeper" >/dev/null 2>&1 || true
+          docker image rm -f stage1-criu-canary:local >/dev/null 2>&1 || true
+          rm -rf "$canary_root" "$RUNNER_TEMP/stage1-probe.c" "$RUNNER_TEMP/stage1-canary-root.tar"
+          phase=complete
+
+      - name: Run image-level checkpoint/restore smoke tests
+        if: steps.enabled.outputs.run == 'true'
+        shell: bash
+        env:
+          SHARD: ${{ matrix.shard }}
+        run: |
+          set -Eeuo pipefail
+          mkdir -p "results/shard-${SHARD}" "evidence/shard-${SHARD}"
+          cat > /tmp/stage1_sweep.py <<'PY'
+          import datetime, hashlib, json, math, os, pathlib, re, shutil, statistics, subprocess, sys, time, traceback
+
+          SHARD = int(os.environ['SHARD'])
+          TIMEOUT = int(os.environ.get('PER_IMAGE_TIMEOUT', '420'))
+          shard_file = pathlib.Path(f'stage1-manifest/shards/shard-{SHARD:02d}.json')
+          items = json.loads(shard_file.read_text())
+          out_root = pathlib.Path(f'results/shard-{SHARD}')
+          ev_root = pathlib.Path(f'evidence/shard-{SHARD}')
+          out_root.mkdir(parents=True, exist_ok=True)
+          ev_root.mkdir(parents=True, exist_ok=True)
+          probe_host = pathlib.Path(os.environ['RUNNER_TEMP']) / 'stage1-probe'
+          if not probe_host.is_file():
+              raise SystemExit('runtime setup did not leave the static Stage-1 probe at ' + str(probe_host))
+
+          def now():
+              return datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+          def run(argv, timeout=None, check=False):
+              started = time.monotonic()
+              try:
+                  p = subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                     text=True, errors='replace', timeout=timeout or TIMEOUT)
+                  result = {'argv': argv, 'returncode': p.returncode, 'stdout': p.stdout,
+                            'stderr': p.stderr, 'elapsed_s': round(time.monotonic()-started, 4)}
+              except subprocess.TimeoutExpired as exc:
+                  result = {'argv': argv, 'returncode': 124,
+                            'stdout': exc.stdout.decode(errors='replace') if isinstance(exc.stdout, bytes) else (exc.stdout or ''),
+                            'stderr': exc.stderr.decode(errors='replace') if isinstance(exc.stderr, bytes) else (exc.stderr or ''),
+                            'elapsed_s': round(time.monotonic()-started, 4), 'timed_out': True}
+              if check and result['returncode'] != 0:
+                  raise RuntimeError('command failed: ' + ' '.join(argv) + '\n' + result['stderr'][-3000:])
+              return result
+
+          def pull_with_retry(image, attempts=3):
+              history=[]
+              for attempt in range(1, attempts+1):
+                  q=run(['docker','pull',image], timeout=TIMEOUT)
+                  q['attempt']=attempt; history.append(q)
+                  if q['returncode']==0:
+                      return q,history
+                  if attempt<attempts:
+                      time.sleep(5 * attempt)
+              return history[-1],history
+
+          RESTORE_MAX_ATTEMPTS = max(1, int(os.environ.get('RESTORE_MAX_ATTEMPTS', '5')))
+          RESTORE_SETTLE_SECONDS = max(0.0, float(os.environ.get('RESTORE_SETTLE_SECONDS', '1')))
+          _restore_race = re.compile(
+              r'failed to upload checkpoint to containerd: commit failed: content sha256:[0-9a-f]{64}: already exists'
+              r'|content digest .*: not found', re.I)
+          _digest_re = re.compile(r'sha256:[0-9a-f]{64}', re.I)
+
+          def restore_with_retry(cid, checkpoint):
+              """Restore one Docker checkpoint, retrying only known Docker/containerd races.
+
+              CRIU upstream's Docker CI retries the `content ... already exists` race.
+              After three collisions on this disposable runner, remove only the exact
+              temporary checkpoint digest named by Docker from containerd's `moby`
+              namespace, then continue the bounded retry loop. Genuine restore errors
+              are returned immediately and are never hidden.
+              """
+              history=[]
+              repairs=[]
+              if RESTORE_SETTLE_SECONDS:
+                  time.sleep(RESTORE_SETTLE_SECONDS)
+              last=None
+              for attempt in range(1, RESTORE_MAX_ATTEMPTS + 1):
+                  q=run(['docker','start','--checkpoint',checkpoint,cid], timeout=TIMEOUT)
+                  q['attempt']=attempt
+                  history.append(q)
+                  last=q
+                  state=docker_state(cid)
+                  msg=(q.get('stderr','')+' '+q.get('stdout','')).strip().replace('\n',' ')[:500]
+                  race=bool(_restore_race.search(msg))
+                  print(f'  RESTORE_DEBUG cid={cid[:12]} checkpoint={checkpoint} attempt={attempt}/{RESTORE_MAX_ATTEMPTS} rc={q["returncode"]} running={bool(state and state.get("Running") is True)} race_signature={race} msg={msg!r}', flush=True)
+                  if q['returncode']==0:
+                      return q,history,repairs
+                  if state and state.get('Running') is True:
+                      q['accepted_because_container_is_running']=True
+                      q['returncode']=0
+                      return q,history,repairs
+                  msg=(q.get('stderr','')+'\n'+q.get('stdout','')).strip()
+                  if not _restore_race.search(msg):
+                      return q,history,repairs
+                  if attempt == 3:
+                      matches=_digest_re.findall(msg)
+                      digest=matches[-1].lower() if matches else None
+                      repair={'attempt':attempt,'digest':digest,'used':False}
+                      listing=run(['sudo','-n','ctr','-n','moby','content','ls'], timeout=30)
+                      repair['content_ls_before']={**listing,'stdout':listing.get('stdout','')[-12000:],'stderr':listing.get('stderr','')[-4000:]}
+                      if digest and listing['returncode']==0 and digest in listing.get('stdout',''):
+                          rm=run(['sudo','-n','ctr','-n','moby','content','rm',digest], timeout=30)
+                          repair['remove']={**rm,'stdout':rm.get('stdout','')[-4000:],'stderr':rm.get('stderr','')[-4000:]}
+                          repair['used']=rm['returncode']==0
+                      repairs.append(repair)
+                      print(f'  RESTORE_REPAIR cid={cid[:12]} digest={digest} used={repair.get("used")} remove_rc={(repair.get("remove") or {}).get("returncode")}', flush=True)
+                  if attempt < RESTORE_MAX_ATTEMPTS:
+                      time.sleep(min(float(attempt), 5.0))
+              return last,history,repairs
+
+          def safe_name(image):
+              return re.sub(r'[^A-Za-z0-9_.-]+', '_', image)[:180]
+
+          def docker_state(name):
+              r = run(['docker', 'inspect', '--format', '{{json .State}}', name], timeout=30)
+              if r['returncode'] != 0:
+                  return None
+              try: return json.loads(r['stdout'])
+              except Exception: return None
+
+          def docker_server_version():
+              r = run(['docker', 'version', '--format', '{{.Server.Version}}'], timeout=30)
+              version = r['stdout'].strip() if r['returncode'] == 0 else ''
+              m = re.match(r'^(\d+)', version)
+              return version, (int(m.group(1)) if m else None)
+
+          def select_network_strategy():
+              policy = os.environ.get('NETWORK_POLICY', 'auto').strip().lower()
+              version, major = docker_server_version()
+              if policy not in ('auto','host','isolated'):
+                  raise ValueError('NETWORK_POLICY must be auto, host, or isolated')
+              if policy == 'host':
+                  return 'host-workaround', version, major
+              if policy == 'isolated':
+                  return 'retained-loopback-only-keeper', version, major
+              # Docker/Moby #50750 breaks restore of private network namespaces from
+              # Docker 28 onward. The minimal Stage-1 probe performs no networking, so
+              # host networking avoids that runtime regression without changing the
+              # process/rootfs checkpoint question being measured.
+              return ('host-workaround' if major is not None and major >= 28 else 'retained-loopback-only-keeper'), version, major
+
+          def checkpoint_diagnostics(cid, checkpoint):
+              out = {'files': [], 'log_tails': {}}
+              r = run(['docker','info','--format','{{.DockerRootDir}}'], timeout=30)
+              root = r['stdout'].strip() if r['returncode'] == 0 else '/var/lib/docker'
+              base = pathlib.Path(root) / 'containers' / cid / 'checkpoints' / checkpoint
+              q = run(['sudo','-n','find',str(base),'-maxdepth','4','-type','f','-printf','%p\n'], timeout=30)
+              if q['returncode'] == 0:
+                  for raw in q['stdout'].splitlines():
+                      path = pathlib.Path(raw)
+                      try:
+                          rel = path.relative_to(base).as_posix()
+                      except Exception:
+                          rel = path.name
+                      out['files'].append(rel)
+                      if path.suffix == '.log' or path.name.endswith('.log'):
+                          t = run(['sudo','-n','tail','-n','160',str(path)], timeout=30)
+                          out['log_tails'][rel] = (t['stdout'] + '\n' + t['stderr'])[-24000:]
+              j = run(['sudo','-n','journalctl','-u','docker','-u','containerd','--since','5 minutes ago','--no-pager','-n','180'], timeout=30)
+              out['runtime_journal_tail'] = (j['stdout'] + '\n' + j['stderr'])[-32000:]
+              return out
+
+          def checkpoint_inventory(cid, checkpoint):
+              r = run(['docker', 'info', '--format', '{{.DockerRootDir}}'], timeout=30)
+              root = r['stdout'].strip() if r['returncode'] == 0 else '/var/lib/docker'
+              base = pathlib.Path(root) / 'containers' / cid / 'checkpoints' / checkpoint
+              q = run(['sudo', '-n', 'find', str(base), '-maxdepth', '2', '-type', 'f', '-printf', '%P\t%s\n'], timeout=30)
+              if q['returncode'] != 0:
+                  return {'exists': False, 'error': q['stderr'][-1000:]}
+              rows=[]
+              for line in q['stdout'].splitlines():
+                  if '\t' not in line: continue
+                  name,size=line.rsplit('\t',1)
+                  try: size=int(size)
+                  except ValueError: continue
+                  rows.append({'path':name,'bytes':size})
+              return {'exists': True, 'files': rows}
+
+          _probe_event = re.compile(
+              r'^STAGE1_PROBE event=(?P<event>\w+) nonce=(?P<nonce>[0-9a-f]{16}) '
+              r'counter=(?P<counter>\d+) pid=(?P<pid>\d+)$', re.M)
+
+          def probe_snapshot(cid, commands, label):
+              """Ask the original PID 1 probe to expose its in-memory state.
+
+              This is deliberately not docker exec: SIGUSR1 is delivered to the
+              long-lived process that is being checkpointed/restored. A fresh process
+              restart would generate a different 64-bit nonce.
+              """
+              sig = run(['docker', 'kill', '--signal', 'USR1', cid], timeout=30)
+              commands.append(sig)
+              if sig['returncode'] != 0:
+                  raise RuntimeError(f'{label}: could not signal checkpointed probe: ' + sig['stderr'][-2000:])
+              time.sleep(0.35)
+              logs = run(['docker', 'logs', cid], timeout=30)
+              commands.append(logs)
+              if logs['returncode'] != 0:
+                  raise RuntimeError(f'{label}: could not read checkpointed probe logs: ' + logs['stderr'][-2000:])
+              matches = list(_probe_event.finditer(logs.get('stdout','')))
+              snaps = [m for m in matches if m.group('event') == 'snapshot']
+              if not snaps:
+                  raise RuntimeError(f'{label}: original probe emitted no snapshot event')
+              m = snaps[-1]
+              return {
+                  'event': m.group('event'),
+                  'nonce': m.group('nonce'),
+                  'counter': int(m.group('counter')),
+                  'container_pid': int(m.group('pid')),
+                  'raw': m.group(0),
+                  'docker_log_sha256': hashlib.sha256(logs.get('stdout','').encode()).hexdigest(),
+              }
+
+          def _parse_kb_map(text):
+              out = {}
+              for line in text.splitlines():
+                  if ':' not in line:
+                      continue
+                  key, value = line.split(':', 1)
+                  m = re.match(r'\s*(\d+)\s+kB\s*$', value)
+                  if m:
+                      out[key] = int(m.group(1)) * 1024
+              return out
+
+          def _parse_human_bytes(value):
+              """Parse Docker-style byte strings such as 1.2MiB, 15.61GiB, 0B."""
+              if value is None:
+                  return None
+              text = str(value).strip()
+              m = re.match(r'^([0-9]+(?:\.[0-9]+)?)\s*([KMGTPE]?i?B)?$', text, re.I)
+              if not m:
+                  return None
+              number = float(m.group(1))
+              unit = (m.group(2) or 'B').upper()
+              factors = {
+                  'B':1, 'KB':1000, 'MB':1000**2, 'GB':1000**3, 'TB':1000**4,
+                  'KIB':1024, 'MIB':1024**2, 'GIB':1024**3, 'TIB':1024**4,
+              }
+              factor = factors.get(unit)
+              return int(number * factor) if factor else None
+
+          def _parse_memory_stat(text):
+              out = {}
+              for line in text.splitlines():
+                  parts = line.split()
+                  if len(parts) == 2:
+                      try: out[parts[0]] = int(parts[1])
+                      except ValueError: pass
+              return out
+
+          def _host_memory_evidence():
+              q = run(['cat','/proc/meminfo'], timeout=10)
+              parsed = _parse_kb_map(q.get('stdout','')) if q['returncode'] == 0 else {}
+              total = parsed.get('MemTotal')
+              avail = parsed.get('MemAvailable')
+              return {
+                  'mem_total_bytes': total,
+                  'mem_available_bytes': avail,
+                  'mem_used_estimate_bytes': (total-avail if isinstance(total,int) and isinstance(avail,int) else None),
+                  'swap_total_bytes': parsed.get('SwapTotal'),
+                  'swap_free_bytes': parsed.get('SwapFree'),
+              }
+
+          def process_memory_evidence(cid):
+              """Collect independent target/container/runner memory evidence.
+
+              RAM is deliberately reported at several layers:
+              * process RSS/PSS/VmHWM from /proc
+              * cgroup-v2 memory.current and memory.peak for the whole container
+              * cgroup memory.stat components (anon/file/kernel/shmem/slab/sock)
+              * Docker's own stats formatting
+              * runner MemTotal/MemAvailable for context
+              """
+              ev = {'captured_utc': now(), 'host_memory': _host_memory_evidence()}
+              st = docker_state(cid)
+              ev['docker_state'] = st
+              pid = int((st or {}).get('Pid') or 0)
+              ev['host_pid'] = pid
+              stats = run(['docker','stats','--no-stream','--format','{{json .}}',cid], timeout=30)
+              ev['docker_stats_command'] = {
+                  'returncode': stats['returncode'],
+                  'stdout': stats.get('stdout','').strip(),
+                  'stderr': stats.get('stderr','')[-1000:],
+              }
+              if stats['returncode'] == 0 and stats.get('stdout','').strip():
+                  try:
+                      ds = json.loads(stats['stdout'].splitlines()[-1])
+                      ev['docker_stats'] = ds
+                      usage = str(ds.get('MemUsage') or '')
+                      if '/' in usage:
+                          left, right = [x.strip() for x in usage.split('/',1)]
+                          ev['docker_stats_memory_usage_bytes'] = _parse_human_bytes(left)
+                          ev['docker_stats_memory_limit_bytes'] = _parse_human_bytes(right)
+                      mp = str(ds.get('MemPerc') or '').strip().rstrip('%')
+                      try: ev['docker_stats_memory_percent'] = float(mp)
+                      except ValueError: pass
+                      try: ev['docker_stats_pids'] = int(str(ds.get('PIDs') or '').strip())
+                      except ValueError: pass
+                  except Exception:
+                      ev['docker_stats'] = {'raw': stats['stdout'].strip()}
+              if pid <= 0:
+                  return ev
+
+              def sudo_text(path):
+                  q = run(['sudo','-n','cat',path], timeout=15)
+                  return q.get('stdout','') if q['returncode'] == 0 else ''
+
+              status_txt = sudo_text(f'/proc/{pid}/status')
+              smaps_txt = sudo_text(f'/proc/{pid}/smaps_rollup')
+              stat_txt = sudo_text(f'/proc/{pid}/stat').strip()
+              cgroup_txt = sudo_text(f'/proc/{pid}/cgroup')
+              ev['proc_status_bytes'] = _parse_kb_map(status_txt)
+              ev['smaps_rollup_bytes'] = _parse_kb_map(smaps_txt)
+              ev['cgroup_membership'] = cgroup_txt.strip()
+              if stat_txt:
+                  try:
+                      tail = stat_txt[stat_txt.rfind(')')+2:].split()
+                      ev['proc_starttime_ticks'] = int(tail[19])
+                  except Exception:
+                      pass
+              namespaces = {}
+              for ns in ('pid','mnt','net','user','uts','ipc','cgroup','time'):
+                  q = run(['sudo','-n','readlink',f'/proc/{pid}/ns/{ns}'], timeout=10)
+                  if q['returncode'] == 0:
+                      namespaces[ns] = q['stdout'].strip()
+              ev['namespaces'] = namespaces
+              for line in cgroup_txt.splitlines():
+                  if line.startswith('0::'):
+                      rel = line[3:].strip().lstrip('/')
+                      base = pathlib.Path('/sys/fs/cgroup') / rel
+                      ev['cgroup_path'] = str(base)
+                      for key in ('memory.current','memory.peak','memory.max','memory.swap.current','memory.swap.peak','pids.current'):
+                          q = run(['sudo','-n','cat',str(base / key)], timeout=10)
+                          if q['returncode'] == 0:
+                              raw = q['stdout'].strip()
+                              try: ev[key.replace('.','_')] = int(raw)
+                              except ValueError: ev[key.replace('.','_')] = raw
+                      mstat = sudo_text(str(base / 'memory.stat'))
+                      ev['memory_stat_bytes'] = _parse_memory_stat(mstat)
+                      break
+              return ev
+
+          def mib(value):
+              if not isinstance(value, (int,float)):
+                  return 'n/a'
+              return f'{value / (1024*1024):.2f}MiB'
+
+          def primary_rss(ev):
+              return (ev.get('smaps_rollup_bytes') or {}).get('Rss') or (ev.get('proc_status_bytes') or {}).get('VmRSS')
+
+          def primary_pss(ev):
+              return (ev.get('smaps_rollup_bytes') or {}).get('Pss')
+
+          def proc_metric(ev, key):
+              return (ev.get('proc_status_bytes') or {}).get(key)
+
+          def smaps_metric(ev, key):
+              return (ev.get('smaps_rollup_bytes') or {}).get(key)
+
+          def cgroup_stat(ev, key):
+              return (ev.get('memory_stat_bytes') or {}).get(key)
+
+          def checkpoint_summary(inv):
+              files = inv.get('files') or [] if isinstance(inv, dict) else []
+              return len(files), sum(x.get('bytes',0) for x in files if isinstance(x,dict))
+
+          def write_result(path, obj):
+              tmp = path.with_suffix('.tmp')
+              tmp.write_text(json.dumps(obj, indent=2) + '\n')
+              tmp.replace(path)
+
+          summary = []
+          network_strategy, docker_version, docker_major = select_network_strategy()
+          print(f'STAGE1 RUNTIME | docker={docker_version or "unknown"} | network_strategy={network_strategy} | policy={os.environ.get("NETWORK_POLICY","auto")}', flush=True)
+          for index, item in enumerate(items, 1):
+              image = item['image']
+              slug = safe_name(image)
+              container = f'criu-s1-{SHARD:02d}-{index:03d}'
+              keeper = container + '-net'
+              checkpoint = 'stage1'
+              record = {
+                  'schema': 'exploitgym-criu-stage1/result-v4-memory-aggregate',
+                  'workflow_revision': os.environ.get('SWEEP_REVISION'),
+                  'shard': SHARD, 'index_in_shard': index,
+                  'image': image, 'families': item.get('families', []),
+                  'task_count': item.get('task_count'), 'example_task': (item.get('task_ids') or [None])[0],
+                  'started_utc': now(), 'status': 'failed', 'phase': 'initialization',
+                  'scope': 'One minimal long-lived process created inside this target image; one Docker/CRIU checkpoint and one restore. This does not prove the native ExploitGym server workload is checkpointable.',
+                  'docker_server_version': docker_version,
+                  'docker_major': docker_major,
+                  'network_strategy': network_strategy,
+                  'network_namespace_restore_tested': network_strategy != 'host-workaround',
+                  'network_caveat': ('Host network is used only for the non-networking Stage-1 probe to avoid Docker/Moby #50750; network-namespace restore is not claimed.' if network_strategy == 'host-workaround' else 'A retained loopback-only namespace is external and not checkpointed.')
+              }
+              commands = []
+              keeper_cid = None
+              try:
+                  record['phase'] = 'pull'
+                  q,pulls = pull_with_retry(image)
+                  commands.extend(pulls)
+                  record['pull_attempts']=len(pulls)
+                  if q['returncode'] != 0:
+                      msg=(q.get('stderr','')+'\n'+q.get('stdout','')).lower()
+                      cls='registry_rate_limited' if ('toomanyrequests' in msg or 'rate limit' in msg or '429' in msg) else 'pull_failed'
+                      record.update(status='failed', classification=cls)
+                      raise RuntimeError(q['stderr'][-2000:] or q['stdout'][-2000:])
+
+                  record['phase'] = 'image_inspect'
+                  inspect = run(['docker', 'image', 'inspect', image], timeout=60)
+                  commands.append(inspect)
+                  if inspect['returncode'] != 0: raise RuntimeError('image inspect failed')
+                  img = json.loads(inspect['stdout'])[0]
+                  record['image_id'] = img.get('Id')
+                  record['repo_digests'] = img.get('RepoDigests') or []
+                  record['architecture'] = img.get('Architecture')
+                  record['os'] = img.get('Os')
+                  record['image_size_bytes'] = img.get('Size')
+                  record['image_virtual_size_bytes'] = img.get('VirtualSize')
+                  record['native_entrypoint'] = img.get('Config', {}).get('Entrypoint')
+                  record['native_cmd'] = img.get('Config', {}).get('Cmd')
+
+                  # Every image runs the exact same statically linked probe copied into
+                  # its writable container layer. This avoids depending on image-specific
+                  # shells, libc, coreutils, or sleep implementations.
+                  record['probe'] = 'runner-built static ELF /stage1-probe'
+
+                  # Docker 28+ has an open restore regression for private network namespaces
+                  # (Moby #50750). In automatic mode Stage 1 uses host networking on those
+                  # versions because this probe performs no networking. On older Docker, or
+                  # when explicitly requested, retain a loopback-only external namespace.
+                  network_args = []
+                  if network_strategy == 'host-workaround':
+                      record['phase'] = 'network_host_workaround'
+                      network_args = ['--network', 'host']
+                  else:
+                      record['phase'] = 'network_keeper_create'
+                      keep = run(['docker', 'create', '--name', keeper, '--network', 'none',
+                                  '--user', '0', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges',
+                                  '--entrypoint', '/stage1-probe', image], timeout=60)
+                      commands.append(keep)
+                      if keep['returncode'] != 0:
+                          record.update(classification='network_keeper_create_failed')
+                          raise RuntimeError(keep['stderr'][-2000:] or keep['stdout'][-2000:])
+                      keeper_cid = keep['stdout'].strip()
+                      record['network_keeper_id'] = keeper_cid
+                      keep_copy = run(['docker','cp',str(probe_host),keeper_cid + ':/stage1-probe'], timeout=60)
+                      commands.append(keep_copy)
+                      if keep_copy['returncode'] != 0:
+                          record.update(classification='network_keeper_probe_copy_failed')
+                          raise RuntimeError(keep_copy['stderr'][-2000:] or keep_copy['stdout'][-2000:])
+                      keep_start = run(['docker', 'start', keeper_cid], timeout=60)
+                      commands.append(keep_start)
+                      if keep_start['returncode'] != 0:
+                          record.update(classification='network_keeper_start_failed')
+                          raise RuntimeError(keep_start['stderr'][-2000:] or keep_start['stdout'][-2000:])
+                      time.sleep(0.3)
+                      keeper_state = docker_state(keeper_cid)
+                      if not keeper_state or keeper_state.get('Running') is not True:
+                          record.update(classification='network_keeper_not_running')
+                          raise RuntimeError('external network namespace keeper is not running')
+                      network_args = ['--network', 'container:' + keeper_cid]
+
+                  record['phase'] = 'create'
+                  create = run(['docker', 'create', '--name', container, '--runtime', 'runc',
+                                *network_args, '--user', '0',
+                                '--security-opt', 'seccomp=unconfined', '--security-opt', 'apparmor=unconfined',
+                                '--entrypoint', '/stage1-probe', image], timeout=60)
+                  commands.append(create)
+                  if create['returncode'] != 0:
+                      record.update(classification='create_failed')
+                      raise RuntimeError(create['stderr'][-2000:])
+                  cid = create['stdout'].strip()
+                  record['container_id'] = cid
+                  copy_probe = run(['docker','cp',str(probe_host),cid + ':/stage1-probe'], timeout=60)
+                  commands.append(copy_probe)
+                  if copy_probe['returncode'] != 0:
+                      record.update(classification='probe_copy_failed')
+                      raise RuntimeError(copy_probe['stderr'][-2000:] or copy_probe['stdout'][-2000:])
+
+                  record['phase'] = 'start'
+                  start = run(['docker', 'start', cid], timeout=60)
+                  commands.append(start)
+                  if start['returncode'] != 0:
+                      record.update(classification='start_failed')
+                      raise RuntimeError(start['stderr'][-2000:])
+                  time.sleep(1)
+                  before = docker_state(cid)
+                  record['state_before_checkpoint'] = before
+                  if not before or before.get('Running') is not True:
+                      record.update(classification='not_running_before_checkpoint')
+                      raise RuntimeError('probe container is not running before checkpoint')
+                  health = run(['docker', 'exec', cid, '/stage1-probe', '--check'], timeout=30)
+                  commands.append(health)
+                  record['pre_checkpoint_exec_probe'] = health.get('stdout','').strip()
+                  if health['returncode'] != 0 or 'probe-ok' not in health['stdout']:
+                      record.update(classification='pre_checkpoint_health_failed')
+                      raise RuntimeError('pre-checkpoint static-probe exec health check failed')
+                  pre_probe = probe_snapshot(cid, commands, 'pre-checkpoint')
+                  record['probe_state_before_checkpoint'] = pre_probe
+                  pre_mem = process_memory_evidence(cid)
+                  record['memory_before_checkpoint'] = pre_mem
+                  print(f'  PRE_DEBUG image={image} image_id={(record.get("image_id") or "")[:24]} container={cid[:12]} host_pid={pre_mem.get("host_pid")} start_ticks={pre_mem.get("proc_starttime_ticks")} probe_nonce={pre_probe["nonce"]} counter={pre_probe["counter"]} image_disk={mib(record.get("image_size_bytes"))} ram_cgroup={mib(pre_mem.get("memory_current"))} ram_peak={mib(pre_mem.get("memory_peak"))} rss={mib(primary_rss(pre_mem))} pss={mib(primary_pss(pre_mem))} vmhwm={mib(proc_metric(pre_mem,"VmHWM"))} vmsize={mib(proc_metric(pre_mem,"VmSize"))} anon={mib(cgroup_stat(pre_mem,"anon"))} file={mib(cgroup_stat(pre_mem,"file"))} kernel={mib(cgroup_stat(pre_mem,"kernel"))} host_avail={mib((pre_mem.get("host_memory") or {}).get("mem_available_bytes"))} mntns={(pre_mem.get("namespaces") or {}).get("mnt")} netns={(pre_mem.get("namespaces") or {}).get("net")}', flush=True)
+
+                  record['phase'] = 'checkpoint'
+                  t0 = time.monotonic()
+                  cp = run(['docker', 'checkpoint', 'create', cid, checkpoint], timeout=TIMEOUT)
+                  record['checkpoint_s'] = round(time.monotonic() - t0, 4)
+                  commands.append(cp)
+                  if cp['returncode'] != 0:
+                      record.update(classification='checkpoint_failed')
+                      raise RuntimeError(cp['stderr'][-3000:] or cp['stdout'][-3000:])
+                  stopped = docker_state(cid)
+                  record['state_after_checkpoint'] = stopped
+                  if not stopped or stopped.get('Running') is not False:
+                      record.update(classification='checkpoint_did_not_stop_container')
+                      raise RuntimeError('container still running after checkpoint create')
+                  record['checkpoint_inventory'] = checkpoint_inventory(cid, checkpoint)
+                  ckpt_ls = run(['docker','checkpoint','ls',cid], timeout=30)
+                  commands.append(ckpt_ls)
+                  record['docker_checkpoint_ls'] = ckpt_ls.get('stdout','').strip()
+                  inv_count, inv_bytes = checkpoint_summary(record['checkpoint_inventory'])
+                  record['checkpoint_file_count'] = inv_count
+                  record['checkpoint_bytes_visible'] = inv_bytes
+                  print(f'  CKPT_DEBUG image={image} container={cid[:12]} stopped={bool(stopped and stopped.get("Running") is False)} files={inv_count} visible_bytes={inv_bytes} docker_checkpoint_ls={record["docker_checkpoint_ls"]!r}', flush=True)
+
+                  record['phase'] = 'restore'
+                  t0 = time.monotonic()
+                  restore, restore_attempts, restore_repairs = restore_with_retry(cid, checkpoint)
+                  record['restore_s'] = round(time.monotonic() - t0, 4)
+                  record['restore_attempt_count'] = len(restore_attempts)
+                  record['restore_transport_retries'] = max(0, len(restore_attempts)-1)
+                  record['restore_content_store_repairs'] = restore_repairs
+                  commands.extend(restore_attempts)
+                  if restore['returncode'] != 0:
+                      msg = (restore.get('stderr','') + '\n' + restore.get('stdout','')).strip()
+                      record['restore_diagnostics'] = checkpoint_diagnostics(cid, checkpoint)
+                      if _restore_race.search(msg):
+                          record.update(classification='docker_containerd_restore_race_exhausted')
+                      elif '/proc/0/ns/net' in msg or ('bind-mount' in msg and '/ns/net' in msg):
+                          record.update(classification='docker_network_namespace_restore_bug')
+                      else:
+                          record.update(classification='restore_failed')
+                      raise RuntimeError(msg[-6000:] or 'docker checkpoint restore failed without stderr')
+                  time.sleep(1)
+                  after = docker_state(cid)
+                  record['state_after_restore'] = after
+                  if not after or after.get('Running') is not True:
+                      record.update(classification='not_running_after_restore')
+                      raise RuntimeError('container not running after restore')
+                  if keeper_cid:
+                      keeper_after = docker_state(keeper_cid)
+                      record['network_keeper_state_after_restore'] = keeper_after
+                      if not keeper_after or keeper_after.get('Running') is not True:
+                          record.update(classification='network_keeper_lost_during_restore')
+                          raise RuntimeError('external network namespace keeper stopped during target restore')
+
+                  post = run(['docker', 'exec', cid, '/stage1-probe', '--check'], timeout=30)
+                  commands.append(post)
+                  record['post_restore_exec_probe'] = post.get('stdout','').strip()
+                  if post['returncode'] != 0 or 'probe-ok' not in post['stdout']:
+                      record.update(classification='post_restore_health_failed')
+                      raise RuntimeError('post-restore static-probe exec health check failed')
+
+                  post_probe = probe_snapshot(cid, commands, 'post-restore')
+                  record['probe_state_after_restore'] = post_probe
+                  continuity = (post_probe['nonce'] == pre_probe['nonce'] and post_probe['counter'] >= pre_probe['counter'])
+                  record['memory_continuity_verified'] = continuity
+                  record['probe_counter_delta'] = post_probe['counter'] - pre_probe['counter']
+                  if not continuity:
+                      record.update(classification='memory_continuity_failed')
+                      raise RuntimeError(f'checkpointed process memory continuity failed: pre={pre_probe!r} post={post_probe!r}')
+                  post_mem = process_memory_evidence(cid)
+                  record['memory_after_restore'] = post_mem
+                  record.update({
+                      'rss_before_bytes': primary_rss(pre_mem), 'rss_after_bytes': primary_rss(post_mem),
+                      'pss_before_bytes': primary_pss(pre_mem), 'pss_after_bytes': primary_pss(post_mem),
+                      'vmrss_before_bytes': proc_metric(pre_mem,'VmRSS'), 'vmrss_after_bytes': proc_metric(post_mem,'VmRSS'),
+                      'vmhwm_before_bytes': proc_metric(pre_mem,'VmHWM'), 'vmhwm_after_bytes': proc_metric(post_mem,'VmHWM'),
+                      'vmsize_before_bytes': proc_metric(pre_mem,'VmSize'), 'vmsize_after_bytes': proc_metric(post_mem,'VmSize'),
+                      'rss_anon_before_bytes': proc_metric(pre_mem,'RssAnon'), 'rss_anon_after_bytes': proc_metric(post_mem,'RssAnon'),
+                      'rss_file_before_bytes': proc_metric(pre_mem,'RssFile'), 'rss_file_after_bytes': proc_metric(post_mem,'RssFile'),
+                      'private_dirty_before_bytes': smaps_metric(pre_mem,'Private_Dirty'), 'private_dirty_after_bytes': smaps_metric(post_mem,'Private_Dirty'),
+                      'anonymous_before_bytes': smaps_metric(pre_mem,'Anonymous'), 'anonymous_after_bytes': smaps_metric(post_mem,'Anonymous'),
+                      'cgroup_memory_before_bytes': pre_mem.get('memory_current'), 'cgroup_memory_after_bytes': post_mem.get('memory_current'),
+                      'cgroup_memory_peak_before_bytes': pre_mem.get('memory_peak'), 'cgroup_memory_peak_after_bytes': post_mem.get('memory_peak'),
+                      'cgroup_anon_before_bytes': cgroup_stat(pre_mem,'anon'), 'cgroup_anon_after_bytes': cgroup_stat(post_mem,'anon'),
+                      'cgroup_file_before_bytes': cgroup_stat(pre_mem,'file'), 'cgroup_file_after_bytes': cgroup_stat(post_mem,'file'),
+                      'cgroup_kernel_before_bytes': cgroup_stat(pre_mem,'kernel'), 'cgroup_kernel_after_bytes': cgroup_stat(post_mem,'kernel'),
+                      'cgroup_shmem_before_bytes': cgroup_stat(pre_mem,'shmem'), 'cgroup_shmem_after_bytes': cgroup_stat(post_mem,'shmem'),
+                      'cgroup_swap_before_bytes': pre_mem.get('memory_swap_current'), 'cgroup_swap_after_bytes': post_mem.get('memory_swap_current'),
+                      'docker_memory_before_bytes': pre_mem.get('docker_stats_memory_usage_bytes'), 'docker_memory_after_bytes': post_mem.get('docker_stats_memory_usage_bytes'),
+                      'docker_memory_percent_before': pre_mem.get('docker_stats_memory_percent'), 'docker_memory_percent_after': post_mem.get('docker_stats_memory_percent'),
+                      'host_mem_total_before_bytes': (pre_mem.get('host_memory') or {}).get('mem_total_bytes'),
+                      'host_mem_total_after_bytes': (post_mem.get('host_memory') or {}).get('mem_total_bytes'),
+                      'host_mem_available_before_bytes': (pre_mem.get('host_memory') or {}).get('mem_available_bytes'),
+                      'host_mem_available_after_bytes': (post_mem.get('host_memory') or {}).get('mem_available_bytes'),
+                      'host_pid_before': pre_mem.get('host_pid'), 'host_pid_after': post_mem.get('host_pid'),
+                      'proc_starttime_before_ticks': pre_mem.get('proc_starttime_ticks'), 'proc_starttime_after_ticks': post_mem.get('proc_starttime_ticks'),
+                      'probe_nonce_before': pre_probe.get('nonce'), 'probe_nonce_after': post_probe.get('nonce'),
+                      'probe_counter_before': pre_probe.get('counter'), 'probe_counter_after': post_probe.get('counter'),
+                  })
+                  print(f'  POST_DEBUG image={image} container={cid[:12]} host_pid={post_mem.get("host_pid")} start_ticks={post_mem.get("proc_starttime_ticks")} probe_nonce={post_probe["nonce"]} counter={post_probe["counter"]} delta={record["probe_counter_delta"]} continuity=VERIFIED ram_cgroup={mib(post_mem.get("memory_current"))} ram_peak={mib(post_mem.get("memory_peak"))} rss={mib(primary_rss(post_mem))} pss={mib(primary_pss(post_mem))} vmhwm={mib(proc_metric(post_mem,"VmHWM"))} vmsize={mib(proc_metric(post_mem,"VmSize"))} anon={mib(cgroup_stat(post_mem,"anon"))} file={mib(cgroup_stat(post_mem,"file"))} kernel={mib(cgroup_stat(post_mem,"kernel"))} host_avail={mib((post_mem.get("host_memory") or {}).get("mem_available_bytes"))}', flush=True)
+                  print(f'  RAM_DEBUG image={image} cgroup_current={mib(pre_mem.get("memory_current"))}->{mib(post_mem.get("memory_current"))} cgroup_peak={mib(pre_mem.get("memory_peak"))}->{mib(post_mem.get("memory_peak"))} process_rss={mib(primary_rss(pre_mem))}->{mib(primary_rss(post_mem))} process_pss={mib(primary_pss(pre_mem))}->{mib(primary_pss(post_mem))} vmhwm={mib(proc_metric(pre_mem,"VmHWM"))}->{mib(proc_metric(post_mem,"VmHWM"))} docker_mem={mib(pre_mem.get("docker_stats_memory_usage_bytes"))}->{mib(post_mem.get("docker_stats_memory_usage_bytes"))} checkpoint_visible={mib(record.get("checkpoint_bytes_visible"))} image_disk={mib(record.get("image_size_bytes"))}', flush=True)
+
+                  record.update(status='passed', classification='checkpoint_restore_passed_memory_verified', phase='complete')
+              except Exception as exc:
+                  record['exception'] = repr(exc)
+                  record['traceback'] = traceback.format_exc()
+              finally:
+                  record['finished_utc'] = now()
+                  # Keep command output bounded but sufficient for diagnosis.
+                  record['commands'] = [{**x, 'stdout': x.get('stdout','')[-8000:], 'stderr': x.get('stderr','')[-8000:]} for x in commands]
+                  try:
+                      logs = run(['docker', 'logs', container], timeout=20)
+                      record['container_logs_tail'] = (logs['stdout'] + '\n' + logs['stderr'])[-12000:]
+                  except Exception:
+                      pass
+                  # Remove the checkpointed target before releasing its external
+                  # network namespace keeper. Both commands are idempotent for partial failures.
+                  run(['docker', 'rm', '-f', container], timeout=30)
+                  if keeper_cid:
+                      run(['docker', 'rm', '-f', keeper], timeout=30)
+                  # Hosted runners have limited local disk. Remove each tested image
+                  # immediately so dozens of large targets do not accumulate per shard.
+                  cleanup_image = run(['docker', 'image', 'rm', '-f', image], timeout=60)
+                  record['image_cleanup_returncode'] = cleanup_image['returncode']
+                  path = out_root / f'{index:03d}-{slug}.json'
+                  write_result(path, record)
+                  flat_summary = {k: record.get(k) for k in ('image','families','task_count','status','classification','phase','checkpoint_s','restore_s','exception','image_size_bytes','restore_attempt_count','restore_transport_retries','checkpoint_file_count','checkpoint_bytes_visible','memory_continuity_verified','probe_counter_delta')}
+                  pre_m = record.get('memory_before_checkpoint') or {}
+                  post_m = record.get('memory_after_restore') or {}
+                  pre_p = record.get('probe_state_before_checkpoint') or {}
+                  post_p = record.get('probe_state_after_restore') or {}
+                  flat_summary.update({
+                      'shard': SHARD,
+                      'rss_before_bytes': primary_rss(pre_m), 'rss_after_bytes': primary_rss(post_m),
+                      'pss_before_bytes': primary_pss(pre_m), 'pss_after_bytes': primary_pss(post_m),
+                      'vmhwm_before_bytes': proc_metric(pre_m,'VmHWM'), 'vmhwm_after_bytes': proc_metric(post_m,'VmHWM'),
+                      'vmsize_before_bytes': proc_metric(pre_m,'VmSize'), 'vmsize_after_bytes': proc_metric(post_m,'VmSize'),
+                      'cgroup_memory_before_bytes': pre_m.get('memory_current'), 'cgroup_memory_after_bytes': post_m.get('memory_current'),
+                      'cgroup_memory_peak_before_bytes': pre_m.get('memory_peak'), 'cgroup_memory_peak_after_bytes': post_m.get('memory_peak'),
+                      'cgroup_anon_before_bytes': cgroup_stat(pre_m,'anon'), 'cgroup_anon_after_bytes': cgroup_stat(post_m,'anon'),
+                      'cgroup_file_before_bytes': cgroup_stat(pre_m,'file'), 'cgroup_file_after_bytes': cgroup_stat(post_m,'file'),
+                      'cgroup_kernel_before_bytes': cgroup_stat(pre_m,'kernel'), 'cgroup_kernel_after_bytes': cgroup_stat(post_m,'kernel'),
+                      'docker_memory_before_bytes': pre_m.get('docker_stats_memory_usage_bytes'), 'docker_memory_after_bytes': post_m.get('docker_stats_memory_usage_bytes'),
+                      'host_mem_available_before_bytes': (pre_m.get('host_memory') or {}).get('mem_available_bytes'),
+                      'host_mem_available_after_bytes': (post_m.get('host_memory') or {}).get('mem_available_bytes'),
+                      'host_pid_before': pre_m.get('host_pid'), 'host_pid_after': post_m.get('host_pid'),
+                      'probe_nonce_before': pre_p.get('nonce'), 'probe_nonce_after': post_p.get('nonce'),
+                      'probe_counter_before': pre_p.get('counter'), 'probe_counter_after': post_p.get('counter'),
+                  })
+                  summary.append(flat_summary)
+                  err = str(record.get('exception',''))[-800:]
+                  proof = 'continuity=VERIFIED' if record.get('memory_continuity_verified') else 'continuity=NOT_VERIFIED'
+                  print(f"[{index:03d}/{len(items):03d}] {record['status'].upper():6s} {image} | {record.get('classification')} | {proof} | network={network_strategy} | checkpoint={record.get('checkpoint_s')} restore={record.get('restore_s')} attempts={record.get('restore_attempt_count')} | RAM cgroup={mib(pre_m.get('memory_current'))}->{mib(post_m.get('memory_current'))} peak={mib(pre_m.get('memory_peak'))}->{mib(post_m.get('memory_peak'))} rss={mib(primary_rss(pre_m))}->{mib(primary_rss(post_m))} pss={mib(primary_pss(pre_m))}->{mib(primary_pss(post_m))} | ckpt={mib(record.get('checkpoint_bytes_visible'))} image_disk={mib(record.get('image_size_bytes'))}" + (f" | error={err}" if err else ''), flush=True)
+
+          def _vals(rows, key):
+              return [x.get(key) for x in rows if isinstance(x.get(key),(int,float))]
+
+          def _simple_stats(values):
+              values = sorted(values)
+              if not values: return {'count':0,'sum':0,'mean':None,'median':None,'p95':None,'max':None}
+              n=len(values); p95=values[max(0, min(n-1, int(math.ceil(0.95*n))-1))]
+              return {'count':n,'sum':sum(values),'mean':sum(values)/n,'median':statistics.median(values),'p95':p95,'max':values[-1]}
+
+          shard_memory = {
+              'rss_before_bytes': _simple_stats(_vals(summary,'rss_before_bytes')),
+              'rss_after_bytes': _simple_stats(_vals(summary,'rss_after_bytes')),
+              'pss_before_bytes': _simple_stats(_vals(summary,'pss_before_bytes')),
+              'pss_after_bytes': _simple_stats(_vals(summary,'pss_after_bytes')),
+              'cgroup_memory_before_bytes': _simple_stats(_vals(summary,'cgroup_memory_before_bytes')),
+              'cgroup_memory_after_bytes': _simple_stats(_vals(summary,'cgroup_memory_after_bytes')),
+              'cgroup_memory_peak_after_bytes': _simple_stats(_vals(summary,'cgroup_memory_peak_after_bytes')),
+          }
+          shard_summary = {
+              'schema': 'exploitgym-criu-stage1/shard-v4-memory-aggregate',
+              'shard': SHARD,
+              'images': len(summary),
+              'passed': sum(x['status'] == 'passed' for x in summary),
+              'failed': sum(x['status'] != 'passed' for x in summary),
+              'task_references': sum(int(x.get('task_count') or 0) for x in summary),
+              'memory_statistics': shard_memory,
+              'total_image_bytes_observation_sum': sum(_vals(summary,'image_size_bytes')),
+              'total_checkpoint_bytes_visible': sum(_vals(summary,'checkpoint_bytes_visible')),
+              'total_checkpoint_seconds': sum(_vals(summary,'checkpoint_s')),
+              'total_restore_seconds': sum(_vals(summary,'restore_s')),
+              'results': summary,
+          }
+          write_result(out_root / 'shard-summary.json', shard_summary)
+          print(f"SHARD_AGGREGATE shard={SHARD} images={len(summary)} passed={shard_summary['passed']} failed={shard_summary['failed']} task_refs={shard_summary['task_references']} rss_mean={mib(shard_memory['rss_before_bytes']['mean'])} rss_max={mib(shard_memory['rss_before_bytes']['max'])} cgroup_mean={mib(shard_memory['cgroup_memory_before_bytes']['mean'])} cgroup_peak_max={mib(shard_memory['cgroup_memory_peak_after_bytes']['max'])} checkpoint_total={mib(shard_summary['total_checkpoint_bytes_visible'])} image_disk_observation_sum={mib(shard_summary['total_image_bytes_observation_sum'])}", flush=True)
+          # Always return zero: incompatibilities are data. The aggregate job decides policy.
+          PY
+          python3 -u /tmp/stage1_sweep.py 2>&1 | tee "evidence/shard-${SHARD}/console.log"
+
+      - name: Collect Docker/CRIU diagnostics
+        if: always() && steps.enabled.outputs.run == 'true'
+        shell: bash
+        env:
+          SHARD: ${{ matrix.shard }}
+        run: |
+          set -Eeuo pipefail
+          mkdir -p "evidence/shard-${SHARD}"
+          docker version > "evidence/shard-${SHARD}/docker-version.txt" 2>&1 || true
+          docker info > "evidence/shard-${SHARD}/docker-info.txt" 2>&1 || true
+          sudo /usr/sbin/criu --version > "evidence/shard-${SHARD}/criu-version.txt" 2>&1 || true
+          sudo journalctl -u docker -u containerd --since '6 hours ago' --no-pager > "evidence/shard-${SHARD}/runtime-journal.log" 2>&1 || true
+          sudo dmesg --ctime > "evidence/shard-${SHARD}/dmesg.log" 2>&1 || true
+
+      - name: Upload shard results
+        if: always() && steps.enabled.outputs.run == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: stage1-shard-${{ matrix.shard }}
+          path: |
+            results/shard-${{ matrix.shard }}/
+            evidence/shard-${{ matrix.shard }}/
+          if-no-files-found: error
+          retention-days: 14
+
+  limitations:
+    name: Validate CRIU limitation relevance
+    needs: prepare
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Download immutable sweep manifest
+        uses: actions/download-artifact@v4
+        with:
+          name: stage1-manifest
+          path: stage1-manifest
+
+      - name: Pin Docker runtime and build pinned CRIU
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          export LC_ALL=C
+          mkdir -p limitations-evidence
+          exec > >(tee limitations-evidence/runtime-setup.log) 2>&1
+
+          sudo -n true
+          sudo env DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=3 update
+          sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            ca-certificates curl gnupg git build-essential libc6-dev file pkg-config python3 python3-protobuf \
+            libprotobuf-dev libprotobuf-c-dev protobuf-c-compiler protobuf-compiler \
+            libnl-3-dev libnet1-dev libcap-dev libbsd-dev uuid-dev libgnutls28-dev \
+            libnftables-dev libaio-dev liblz4-dev iproute2 iptables util-linux
+
+          src="$(mktemp -d "$RUNNER_TEMP/criu-source.XXXXXX")"
+          git init -q "$src"
+          git -C "$src" remote add origin https://github.com/checkpoint-restore/criu.git
+          git -C "$src" fetch --depth=1 origin "$CRIU_COMMIT"
+          git -C "$src" checkout --detach FETCH_HEAD
+          [ "$(git -C "$src" rev-parse HEAD)" = "$CRIU_COMMIT" ]
+          make -C "$src" -j2 V=1 WERROR=0 PYTHON=/usr/bin/python3 criu \
+            2>&1 | tee limitations-evidence/criu-build.log
+          test -x "$src/criu/criu"
+          sudo install -m 0755 "$src/criu/criu" /usr/sbin/criu
+          if [ -x "$src/scripts/criu-ns" ]; then
+            sudo install -m 0755 "$src/scripts/criu-ns" /usr/sbin/criu-ns
+          fi
+          sudo /usr/sbin/criu --version | tee limitations-evidence/criu-version.txt
+          sudo /usr/sbin/criu --version | grep -F "Version: $CRIU_VERSION"
+          rm -rf "$src"
+
+          sudo install -m 0755 -d /etc/apt/keyrings
+          curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
+            | sudo tee /etc/apt/keyrings/docker.asc >/dev/null
+          sudo chmod a+r /etc/apt/keyrings/docker.asc
+          printf '%s\n' \
+            'deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu noble stable' \
+            | sudo tee /etc/apt/sources.list.d/docker-stage1.list >/dev/null
+          sudo env DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=3 update
+          apt-cache madison docker-ce | awk '{print $3}' | grep -Fx -- "$DOCKER_ENGINE_VERSION"
+          apt-cache madison containerd.io | awk '{print $3}' | grep -Fx -- "$CONTAINERD_VERSION"
+          sudo systemctl stop docker.service docker.socket containerd.service 2>/dev/null || true
+          sudo apt-mark unhold docker-ce docker-ce-cli docker-ce-rootless-extras containerd.io >/dev/null 2>&1 || true
+          sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y --allow-downgrades --no-install-recommends \
+            "docker-ce=$DOCKER_ENGINE_VERSION" \
+            "docker-ce-cli=$DOCKER_ENGINE_VERSION" \
+            "docker-ce-rootless-extras=$DOCKER_ENGINE_VERSION" \
+            "containerd.io=$CONTAINERD_VERSION"
+          sudo apt-mark hold docker-ce docker-ce-cli docker-ce-rootless-extras containerd.io >/dev/null
+
+          sudo mkdir -p /etc/docker
+          python3 - <<'PYDOCKER'
+          import json,pathlib
+          p=pathlib.Path('/etc/docker/daemon.json')
+          try:
+              obj=json.loads(p.read_text()) if p.exists() else {}
+              if not isinstance(obj,dict): obj={}
+          except Exception:
+              obj={}
+          obj['experimental']=True
+          features=obj.get('features') if isinstance(obj.get('features'),dict) else {}
+          features['containerd-snapshotter']=False
+          obj['features']=features
+          pathlib.Path('/tmp/stage1-daemon.json').write_text(json.dumps(obj,indent=2)+'\n')
+          PYDOCKER
+          sudo dockerd --validate --config-file /tmp/stage1-daemon.json
+          sudo install -m 0644 /tmp/stage1-daemon.json /etc/docker/daemon.json
+          sudo systemctl daemon-reload
+          sudo systemctl restart containerd
+          sudo systemctl restart docker
+          [ "$(docker version --format '{{.Server.Version}}')" = '27.5.1' ]
+          containerd --version | grep -F ' 1.7.25 ' >/dev/null
+          [ "$(docker info --format '{{.ExperimentalBuild}}' | tr '[:upper:]' '[:lower:]')" = true ]
+          docker version > limitations-evidence/docker-version.txt
+          docker info > limitations-evidence/docker-info.txt
+          sudo /usr/sbin/criu check -v4 > limitations-evidence/criu-check.txt 2>&1 || true
+
+      - name: Run semantic fidelity and limitation probes
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p limitations-evidence limitations-result
+
+          cat > "$RUNNER_TEMP/semantic-probe.c" <<'SEMANTIC_C'
+          #define _GNU_SOURCE
+          #include <errno.h>
+          #include <fcntl.h>
+          #include <pthread.h>
+          #include <signal.h>
+          #include <stdint.h>
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <string.h>
+          #include <sys/mman.h>
+          #include <sys/socket.h>
+          #include <sys/stat.h>
+          #include <sys/types.h>
+          #include <sys/ucontext.h>
+          #include <sys/wait.h>
+          #include <time.h>
+          #include <unistd.h>
+
+          static volatile sig_atomic_t stopflag=0, snapshotflag=0, verifyflag=0;
+          static volatile uint64_t counter=0;
+          static uint64_t nonce=UINT64_C(0x4d69746967617465);
+          static int state_fd=-1, mmap_fd=-1, pipefd_[2]={-1,-1}, unixfd[2]={-1,-1};
+          static pid_t child=-1;
+          static volatile uint64_t *shared_counter=NULL;
+          static unsigned char *heap_state=NULL, *anon_map=NULL, *file_map=NULL, *jit_page=NULL;
+          static size_t heap_n=(4u<<20), anon_n=(2u<<20), file_n=(1u<<20);
+          static pthread_t state_thread, register_thread_id;
+          static volatile unsigned char *thread_stack_ptr=NULL;
+          static volatile uint64_t *thread_tls_ptr=NULL;
+          static _Thread_local uint64_t thread_tls_magic=0;
+          static volatile sig_atomic_t reg_capture_ready=0;
+          static volatile uint64_t cap_r12=0,cap_r13=0,cap_r14=0,cap_r15=0;
+          static const uint64_t R12_MAGIC=UINT64_C(0x12121212a1a1a1a1);
+          static const uint64_t R13_MAGIC=UINT64_C(0x13131313b2b2b2b2);
+          static const uint64_t R14_MAGIC=UINT64_C(0x14141414c3c3c3c3);
+          static const uint64_t R15_MAGIC=UINT64_C(0x15151515d4d4d4d4);
+          static const uint64_t TLS_MAGIC=UINT64_C(0x746c732d6d616769);
+          static const uint64_t JIT_MAGIC=UINT64_C(0x4a49542d53544154);
+          static const char *file_payload="HEAD|FD-OFFSET-MARKER|TAIL";
+          static const char *pipe_payload="PIPE-QUEUED-BEFORE-CHECKPOINT";
+          static const char *unix_payload="UNIX-QUEUED-BEFORE-CHECKPOINT";
+
+          static void on_stop(int s){(void)s;stopflag=1;}
+          static void on_snapshot(int s){(void)s;snapshotflag=1;}
+          static void on_verify(int s){(void)s;verifyflag=1;}
+          static void on_reg_capture(int sig, siginfo_t *si, void *ctx){
+              (void)sig;(void)si;
+          #if defined(__x86_64__)
+              ucontext_t *u=(ucontext_t*)ctx;
+              cap_r12=(uint64_t)u->uc_mcontext.gregs[REG_R12];
+              cap_r13=(uint64_t)u->uc_mcontext.gregs[REG_R13];
+              cap_r14=(uint64_t)u->uc_mcontext.gregs[REG_R14];
+              cap_r15=(uint64_t)u->uc_mcontext.gregs[REG_R15];
+              reg_capture_ready=1;
+          #else
+              reg_capture_ready=-1;
+          #endif
+          }
+          static uint64_t digest_bytes(const unsigned char *p,size_t n){
+              uint64_t h=UINT64_C(1469598103934665603);
+              for(size_t i=0;i<n;i++){h^=p[i];h*=UINT64_C(1099511628211);}
+              return h;
+          }
+          static uint64_t heap_digest(void){return digest_bytes(heap_state,heap_n);}
+          static int check_pattern(const unsigned char *p,size_t n,uint32_t salt){
+              for(size_t i=0;i<n;i++) if(p[i]!=(unsigned char)((i*131u+(i>>7)+salt)&0xff)) return 0;
+              return 1;
+          }
+          static int check_stack_pattern(void){
+              if(!thread_stack_ptr) return 0;
+              for(size_t i=0;i<4096;i++) if(thread_stack_ptr[i]!=(unsigned char)((i*29u+0x6d)&0xff)) return 0;
+              return 1;
+          }
+          static void *state_thread_fn(void *arg){
+              (void)arg;
+              volatile unsigned char stack_state[4096];
+              for(size_t i=0;i<sizeof(stack_state);i++) stack_state[i]=(unsigned char)((i*29u+0x6d)&0xff);
+              thread_tls_magic=TLS_MAGIC;
+              thread_stack_ptr=stack_state;
+              thread_tls_ptr=&thread_tls_magic;
+              while(!stopflag){
+                  /* Keep both the stack frame and TLS object live across checkpoint. */
+                  if(stack_state[17]==0xff) thread_tls_magic^=1;
+                  struct timespec ts={0,20000000L}; nanosleep(&ts,NULL);
+              }
+              return NULL;
+          }
+          static void *register_thread_fn(void *arg){
+              (void)arg;
+          #if defined(__x86_64__)
+              asm volatile(
+                  "mov %[a], %%r12\n\t"
+                  "mov %[b], %%r13\n\t"
+                  "mov %[c], %%r14\n\t"
+                  "mov %[d], %%r15\n\t"
+                  "1:\n\t"
+                  "pause\n\t"
+                  "cmpb $0, %[stop]\n\t"
+                  "je 1b\n\t"
+                  :
+                  : [a]"r"(R12_MAGIC),[b]"r"(R13_MAGIC),[c]"r"(R14_MAGIC),[d]"r"(R15_MAGIC),[stop]"m"(stopflag)
+                  : "r12","r13","r14","r15","memory");
+          #else
+              while(!stopflag){struct timespec ts={0,20000000L};nanosleep(&ts,NULL);}
+          #endif
+              return NULL;
+          }
+          static int capture_registers(void){
+              reg_capture_ready=0; cap_r12=cap_r13=cap_r14=cap_r15=0;
+              if(pthread_kill(register_thread_id,SIGURG)!=0) return 0;
+              for(int i=0;i<100 && reg_capture_ready==0;i++){struct timespec ts={0,1000000L};nanosleep(&ts,NULL);}
+          #if defined(__x86_64__)
+              return reg_capture_ready==1 && cap_r12==R12_MAGIC && cap_r13==R13_MAGIC && cap_r14==R14_MAGIC && cap_r15==R15_MAGIC;
+          #else
+              return reg_capture_ready==-1;
+          #endif
+          }
+          static uint64_t call_jit(void){
+              uint64_t (*fn)(void)=(uint64_t(*)(void))jit_page;
+              return fn();
+          }
+          static void emit_snapshot(const char *event){
+              off_t off=lseek(state_fd,0,SEEK_CUR);
+              int child_alive=(child>0 && kill(child,0)==0);
+              int regs_ok=capture_registers();
+              printf("SEMANTIC_STATE event=%s nonce=%016llx counter=%llu heap=%016llx anon=%016llx filemap=%016llx stack=%d tls=%d jit=%016llx regs=%d fd_offset=%lld child_alive=%d child_counter=%llu pid=%ld child=%ld\n",
+                     event,(unsigned long long)nonce,(unsigned long long)counter,
+                     (unsigned long long)heap_digest(),(unsigned long long)digest_bytes(anon_map,anon_n),
+                     (unsigned long long)digest_bytes(file_map,file_n),check_stack_pattern(),
+                     (thread_tls_ptr && *thread_tls_ptr==TLS_MAGIC),
+                     (unsigned long long)call_jit(),regs_ok,(long long)off,child_alive,
+                     (unsigned long long)(shared_counter?*shared_counter:0),(long)getpid(),(long)child);
+              fflush(stdout);
+          }
+          static int exact_read(int fd,const char *expected){
+              char buf[128]={0}; size_t n=strlen(expected); ssize_t r=read(fd,buf,n);
+              return r==(ssize_t)n && memcmp(buf,expected,n)==0;
+          }
+          static void verify_semantics(void){
+              uint64_t expected=0; memcpy(&expected,heap_state,sizeof(expected));
+              uint64_t actual=UINT64_C(1469598103934665603);
+              for(size_t i=8;i<heap_n;i++){actual^=heap_state[i];actual*=UINT64_C(1099511628211);}
+              int heap_ok=(actual==expected);
+              int anon_ok=check_pattern(anon_map,anon_n,0x31);
+              int filemap_ok=check_pattern(file_map,file_n,0x47);
+              int stack_ok=check_stack_pattern();
+              int tls_ok=(thread_tls_ptr && *thread_tls_ptr==TLS_MAGIC);
+              int jit_ok=(call_jit()==JIT_MAGIC);
+              int regs_ok=capture_registers();
+              off_t before=lseek(state_fd,0,SEEK_CUR);
+              const char *fd_expected="FD-OFFSET-MARKER|TAIL";
+              int fd_ok=exact_read(state_fd,fd_expected);
+              int pipe_ok=exact_read(pipefd_[0],pipe_payload);
+              int unix_ok=exact_read(unixfd[1],unix_payload);
+              int child_ok=(child>0 && kill(child,0)==0 && shared_counter && *shared_counter>0);
+              struct stat st; int rootfs_ok=(stat("/work/created-before-checkpoint.txt",&st)==0 && st.st_size>0);
+              printf("SEMANTIC_VERIFY heap=%d anon_mmap=%d file_mmap=%d thread_stack=%d tls=%d jit_exec=%d registers=%d fd=%d fd_offset_before=%lld pipe=%d unix=%d child=%d shared_mmap=%d rootfs_same_container=%d child_counter=%llu\n",
+                     heap_ok,anon_ok,filemap_ok,stack_ok,tls_ok,jit_ok,regs_ok,fd_ok,(long long)before,
+                     pipe_ok,unix_ok,child_ok,(shared_counter && *shared_counter>0),rootfs_ok,
+                     (unsigned long long)(shared_counter?*shared_counter:0));
+              fflush(stdout);
+          }
+          int main(void){
+              signal(SIGTERM,on_stop); signal(SIGINT,on_stop); signal(SIGUSR1,on_snapshot); signal(SIGUSR2,on_verify);
+              struct sigaction sa={0}; sa.sa_sigaction=on_reg_capture; sa.sa_flags=SA_SIGINFO; sigemptyset(&sa.sa_mask); sigaction(SIGURG,&sa,NULL);
+              mkdir("/work",0755);
+              int wf=open("/work/created-before-checkpoint.txt",O_CREAT|O_TRUNC|O_WRONLY,0644);
+              if(wf<0) return 10;
+              if(write(wf,"WRITABLE-LAYER-STATE\n",21)!=21) return 11;
+              close(wf);
+
+              state_fd=open("/work/fd-state.txt",O_CREAT|O_TRUNC|O_RDWR,0644);
+              if(state_fd<0) return 12;
+              if(write(state_fd,file_payload,strlen(file_payload))!=(ssize_t)strlen(file_payload)) return 13;
+              if(lseek(state_fd,5,SEEK_SET)!=5) return 14;
+              if(pipe(pipefd_)!=0) return 15;
+              if(write(pipefd_[1],pipe_payload,strlen(pipe_payload))!=(ssize_t)strlen(pipe_payload)) return 16;
+              if(socketpair(AF_UNIX,SOCK_STREAM,0,unixfd)!=0) return 17;
+              if(write(unixfd[0],unix_payload,strlen(unix_payload))!=(ssize_t)strlen(unix_payload)) return 18;
+
+              heap_state=malloc(heap_n); if(!heap_state) return 19;
+              for(size_t i=8;i<heap_n;i++) heap_state[i]=(unsigned char)((i*131u+(i>>7)+0x5a)&0xff);
+              uint64_t h=UINT64_C(1469598103934665603);
+              for(size_t i=8;i<heap_n;i++){h^=heap_state[i];h*=UINT64_C(1099511628211);}
+              memcpy(heap_state,&h,sizeof(h));
+
+              anon_map=mmap(NULL,anon_n,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
+              if(anon_map==MAP_FAILED) return 20;
+              for(size_t i=0;i<anon_n;i++) anon_map[i]=(unsigned char)((i*131u+(i>>7)+0x31)&0xff);
+
+              mmap_fd=open("/work/file-backed-map.bin",O_CREAT|O_TRUNC|O_RDWR,0644); if(mmap_fd<0) return 21;
+              if(ftruncate(mmap_fd,(off_t)file_n)!=0) return 22;
+              file_map=mmap(NULL,file_n,PROT_READ|PROT_WRITE,MAP_SHARED,mmap_fd,0); if(file_map==MAP_FAILED) return 23;
+              for(size_t i=0;i<file_n;i++) file_map[i]=(unsigned char)((i*131u+(i>>7)+0x47)&0xff);
+              if(msync(file_map,file_n,MS_SYNC)!=0) return 24;
+
+              shared_counter=mmap(NULL,4096,PROT_READ|PROT_WRITE,MAP_SHARED|MAP_ANONYMOUS,-1,0);
+              if(shared_counter==MAP_FAILED) return 25;
+
+              jit_page=mmap(NULL,4096,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0); if(jit_page==MAP_FAILED) return 26;
+          #if defined(__x86_64__)
+              unsigned char code[11]={0x48,0xb8,0,0,0,0,0,0,0,0,0xc3}; memcpy(code+2,&(uint64_t){JIT_MAGIC},8); memcpy(jit_page,code,sizeof(code));
+              if(mprotect(jit_page,4096,PROT_READ|PROT_EXEC)!=0) return 27;
+              if(call_jit()!=JIT_MAGIC) return 28;
+          #else
+              memset(jit_page,0x5a,4096); if(mprotect(jit_page,4096,PROT_READ|PROT_EXEC)!=0) return 27;
+          #endif
+
+              if(pthread_create(&state_thread,NULL,state_thread_fn,NULL)!=0) return 29;
+              if(pthread_create(&register_thread_id,NULL,register_thread_fn,NULL)!=0) return 30;
+
+              child=fork(); if(child<0) return 31;
+              if(child==0){
+                  signal(SIGTERM,on_stop); signal(SIGINT,on_stop);
+                  while(!stopflag){(*shared_counter)++; struct timespec ts={0,20000000L}; nanosleep(&ts,NULL);}
+                  _exit(0);
+              }
+              for(int i=0;i<100 && (!thread_stack_ptr || !thread_tls_ptr);i++){struct timespec ts={0,1000000L};nanosleep(&ts,NULL);}
+              emit_snapshot("start");
+              while(!stopflag){
+                  struct timespec ts={0,100000000L}; nanosleep(&ts,NULL); counter++;
+                  if(snapshotflag){snapshotflag=0;emit_snapshot("snapshot");}
+                  if(verifyflag){verifyflag=0;verify_semantics();}
+              }
+              if(child>0){kill(child,SIGTERM);waitpid(child,NULL,0);}
+              pthread_join(state_thread,NULL); pthread_join(register_thread_id,NULL);
+              return 0;
+          }
+          SEMANTIC_C
+
+          cat > "$RUNNER_TEMP/ptrace-probe.c" <<'PTRACE_C'
+          #define _GNU_SOURCE
+          #include <signal.h>
+          #include <stdio.h>
+          #include <sys/ptrace.h>
+          #include <sys/wait.h>
+          #include <time.h>
+          #include <unistd.h>
+          static volatile sig_atomic_t stopflag=0;
+          static void stop(int s){(void)s;stopflag=1;}
+          int main(void){
+              signal(SIGTERM,stop); signal(SIGINT,stop);
+              pid_t child=fork(); if(child<0)return 2;
+              if(child==0){while(1){struct timespec ts={0,100000000L};nanosleep(&ts,NULL);}return 0;}
+              if(ptrace(PTRACE_ATTACH,child,NULL,NULL)!=0){perror("PTRACE_ATTACH");return 3;}
+              if(waitpid(child,NULL,0)<0)return 4;
+              if(ptrace(PTRACE_CONT,child,NULL,NULL)!=0){perror("PTRACE_CONT");return 5;}
+              printf("PTRACE_READY tracer=%ld tracee=%ld\n",(long)getpid(),(long)child);fflush(stdout);
+              while(!stopflag){struct timespec ts={0,100000000L};nanosleep(&ts,NULL);}
+              kill(child,SIGKILL);waitpid(child,NULL,0);return 0;
+          }
+          PTRACE_C
+
+          cat > "$RUNNER_TEMP/tcp-probe.c" <<'TCP_C'
+          #define _GNU_SOURCE
+          #include <arpa/inet.h>
+          #include <netinet/in.h>
+          #include <signal.h>
+          #include <stdio.h>
+          #include <string.h>
+          #include <sys/socket.h>
+          #include <time.h>
+          #include <unistd.h>
+          static volatile sig_atomic_t stopflag=0;
+          static void stop(int s){(void)s;stopflag=1;}
+          int main(void){
+              signal(SIGTERM,stop);signal(SIGINT,stop);
+              int l=socket(AF_INET,SOCK_STREAM,0), c=socket(AF_INET,SOCK_STREAM,0); if(l<0||c<0)return 2;
+              struct sockaddr_in a={0};a.sin_family=AF_INET;a.sin_addr.s_addr=htonl(INADDR_LOOPBACK);a.sin_port=0;
+              if(bind(l,(struct sockaddr*)&a,sizeof(a))||listen(l,1))return 3;
+              socklen_t alen=sizeof(a);if(getsockname(l,(struct sockaddr*)&a,&alen))return 4;
+              if(connect(c,(struct sockaddr*)&a,sizeof(a)))return 5;
+              int s=accept(l,NULL,NULL);if(s<0)return 6;
+              const char *msg="TCP-QUEUED-BEFORE-CHECKPOINT";
+              if(write(c,msg,strlen(msg))!=(ssize_t)strlen(msg))return 7;
+              printf("TCP_READY port=%u\n",(unsigned)ntohs(a.sin_port));fflush(stdout);
+              while(!stopflag){struct timespec ts={0,100000000L};nanosleep(&ts,NULL);}
+              close(s);close(c);close(l);return 0;
+          }
+          TCP_C
+
+          gcc -static -O2 -pthread -o "$RUNNER_TEMP/semantic-probe" "$RUNNER_TEMP/semantic-probe.c"
+          gcc -static -O2 -o "$RUNNER_TEMP/ptrace-probe" "$RUNNER_TEMP/ptrace-probe.c"
+          gcc -static -O2 -o "$RUNNER_TEMP/tcp-probe" "$RUNNER_TEMP/tcp-probe.c"
+          file "$RUNNER_TEMP"/*-probe | tee limitations-evidence/probe-binaries.txt
+
+          python3 - <<'PYLIMIT'
+          import datetime,json,os,pathlib,re,shutil,subprocess,time
+
+          root=pathlib.Path('limitations-result'); root.mkdir(exist_ok=True)
+          ev=pathlib.Path('limitations-evidence'); ev.mkdir(exist_ok=True)
+          temp=pathlib.Path(os.environ['RUNNER_TEMP'])
+          results=[]
+
+          def run(argv,timeout=120):
+              t=time.monotonic()
+              try:
+                  p=subprocess.run(argv,text=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=timeout)
+                  return {'argv':argv,'returncode':p.returncode,'stdout':p.stdout,'stderr':p.stderr,'elapsed_s':round(time.monotonic()-t,4)}
+              except subprocess.TimeoutExpired as e:
+                  return {'argv':argv,'returncode':124,'stdout':e.stdout or '','stderr':e.stderr or '','elapsed_s':round(time.monotonic()-t,4),'timed_out':True}
+
+          def local_image(name,binary):
+              d=temp/(name+'-root'); shutil.rmtree(d,ignore_errors=True); d.mkdir()
+              shutil.copy2(binary,d/'probe'); os.chmod(d/'probe',0o755)
+              tar=temp/(name+'.tar')
+              run(['tar','-C',str(d),'-cf',str(tar),'.'])
+              q=run(['docker','import',str(tar),name+':local'])
+              if q['returncode']!=0: raise RuntimeError(q['stderr'])
+              return name+':local'
+
+          semantic_image=local_image('stage1-semantic',temp/'semantic-probe')
+          ptrace_image=local_image('stage1-ptrace',temp/'ptrace-probe')
+          tcp_image=local_image('stage1-tcp',temp/'tcp-probe')
+
+          def state(name):
+              q=run(['docker','inspect','--format','{{json .State}}',name],30)
+              if q['returncode']!=0:return None
+              try:return json.loads(q['stdout'])
+              except:return None
+
+          def cleanup(name,image=None):
+              run(['docker','rm','-f',name],30)
+              if image: run(['docker','image','rm','-f',image],30)
+
+          def restore(name,checkpoint='stage1'):
+              time.sleep(1)
+              attempts=[]
+              for i in range(1,6):
+                  q=run(['docker','start','--checkpoint',checkpoint,name],120); q['attempt']=i; attempts.append(q)
+                  if q['returncode']==0 or bool((state(name) or {}).get('Running')): return True,attempts
+                  msg=(q.get('stdout','')+'\n'+q.get('stderr',''))
+                  if not re.search(r'already exists|content digest .*not found',msg,re.I): break
+                  time.sleep(i)
+              return False,attempts
+
+          # 1. Semantic resources + direct private network namespace + default Docker security policy.
+          name='stage1-semantic-limitations'
+          cleanup(name)
+          create=run(['docker','create','--name',name,'--runtime','runc','--network','none','--entrypoint','/probe',semantic_image])
+          start=run(['docker','start',name]) if create['returncode']==0 else {'returncode':1,'stdout':'','stderr':'create failed'}
+          time.sleep(1)
+          run(['docker','kill','--signal','USR1',name],30)
+          time.sleep(.3)
+          pre=run(['docker','logs',name],30)
+          diff_before=run(['docker','diff',name],30)
+          cp=run(['docker','checkpoint','create',name,'stage1'],180) if start['returncode']==0 else {'returncode':1,'stdout':'','stderr':'start failed'}
+          restored,attempts=(restore(name) if cp['returncode']==0 else (False,[]))
+          if restored:
+              run(['docker','kill','--signal','USR1',name],30); time.sleep(.25)
+              run(['docker','kill','--signal','USR2',name],30); time.sleep(.35)
+          post=run(['docker','logs',name],30)
+          verify=re.findall(r'SEMANTIC_VERIFY ([^\n]+)',post.get('stdout',''))
+          fields={}
+          if verify:
+              for token in verify[-1].split():
+                  if '=' in token:
+                      k,v=token.split('=',1); fields[k]=v
+          semantic_required=('heap','anon_mmap','file_mmap','thread_stack','tls','jit_exec','registers','fd','pipe','unix','child','shared_mmap','rootfs_same_container')
+          semantic_ok=(cp['returncode']==0 and restored and all(fields.get(k)=='1' for k in semantic_required))
+          results.append({
+              'id':'semantic_process_resources','category':'process_state','status':'PASS' if semantic_ok else 'FAIL',
+              'matters':'yes','why':'Tests the state classes most likely to carry exploit progress: allocator/heap bytes, anonymous mappings, file-backed mappings, live thread stack and TLS, executable/JIT-like mappings, callee-saved register context, shared memory, FD offsets, queued IPC, child-process continuity, and writable-layer references.',
+              'evidence':{'checkpoint_returncode':cp['returncode'],'restored':restored,'required_invariants':list(semantic_required),'verify':fields,'pre_logs':pre.get('stdout','')[-6000:],'post_logs':post.get('stdout','')[-12000:],'docker_diff_before':diff_before.get('stdout','')[-4000:],'restore_attempts':attempts}
+          })
+          results.append({
+              'id':'private_network_namespace','category':'namespaces','status':'PASS' if (cp['returncode']==0 and restored) else 'FAIL',
+              'matters':'yes for networked targets','why':'The corpus-wide sweep intentionally retained an external network namespace. This dedicated probe instead checkpoints a private --network none namespace directly on the pinned Docker 27 runtime.',
+              'evidence':{'same_semantic_probe':True,'network_mode':'none','checkpoint_returncode':cp['returncode'],'restored':restored}
+          })
+          results.append({
+              'id':'default_docker_security_profile','category':'security_policy','status':'PASS' if (cp['returncode']==0 and restored) else 'FAIL',
+              'matters':'conditional','why':'The corpus sweep uses seccomp=unconfined and apparmor=unconfined. This probe omits those overrides and therefore tests Docker\'s runner-default security configuration, though not every target-specific profile.',
+              'evidence':{'security_opt_overrides':[],'checkpoint_returncode':cp['returncode'],'restored':restored}
+          })
+          results.append({
+              'id':'writable_layer_same_container','category':'filesystem','status':'PASS' if fields.get('rootfs_same_container')=='1' else 'FAIL',
+              'matters':'yes','why':'Agent trajectories create binaries, edits, logs and temporary files. Same-container restore preserves the existing writable layer, but the CRIU artifact alone is not a cross-host rootfs snapshot.',
+              'evidence':{'rootfs_same_container':fields.get('rootfs_same_container'),'docker_diff_before':diff_before.get('stdout','')[-4000:]},
+              'portable_release_verdict':'RELEVANT: package a rootfs delta/volume state separately for cross-runner restore.'
+          })
+          results.append({
+              'id':'benchmark_relevant_memory_regions','category':'memory_fidelity','status':'PASS' if all(fields.get(k)=='1' for k in ('heap','anon_mmap','file_mmap','thread_stack','tls','jit_exec','registers','shared_mmap')) else 'FAIL',
+              'matters':'yes, especially for V8 and userspace exploitation',
+              'why':'Exploit progress commonly resides in heap/allocator objects, stack frames, mapped buffers, thread-local data, register context, shared state, and executable/JIT pages. These are tested directly instead of hashing an unrelated random allocation.',
+              'evidence':{k:fields.get(k) for k in ('heap','anon_mmap','file_mmap','thread_stack','tls','jit_exec','registers','shared_mmap')},
+              'remaining_caveat':'This validates representative region classes, not target-specific semantic objects. Stage 2 should additionally assert exploit-milestone invariants inside the native target workload.'
+          })
+          results.append({
+              'id':'v8_jit_like_state','category':'v8','status':'PASS' if fields.get('jit_exec')=='1' else 'FAIL',
+              'matters':'yes for V8/JIT targets',
+              'why':'The probe creates an anonymous mapping, writes machine code, changes it to RX, checkpoints it, restores it, and executes the restored code. This exercises the memory-permission/executable-page class that is closer to V8 JIT state than ordinary heap hashing.',
+              'evidence':{'jit_exec':fields.get('jit_exec'),'architecture':'x86_64 on the GitHub runner'},
+              'remaining_caveat':'It is JIT-like rather than a native V8 isolate/code-space checkpoint. A native V8 Stage-2 test should verify selected isolate/heap/code-space invariants at an exploit milestone.'
+          })
+          cleanup(name)
+
+          # 2. ptrace/debugger attachment. A failure is evidence of the known limitation, not a workflow failure.
+          name='stage1-ptrace-limit'
+          cleanup(name)
+          c=run(['docker','create','--name',name,'--runtime','runc','--network','none','--cap-add','SYS_PTRACE','--security-opt','seccomp=unconfined','--entrypoint','/probe',ptrace_image])
+          s=run(['docker','start',name]) if c['returncode']==0 else {'returncode':1,'stdout':'','stderr':'create failed'}
+          time.sleep(1)
+          logs=run(['docker','logs',name],30)
+          cp_ptrace=run(['docker','checkpoint','create',name,'stage1'],120) if s['returncode']==0 else {'returncode':1,'stdout':'','stderr':'start failed'}
+          ptrace_status='CONFIRMED_LIMITATION' if cp_ptrace['returncode']!=0 else 'SUPPORTED_IN_THIS_CONFIGURATION'
+          ptrace_restore=None
+          if cp_ptrace['returncode']==0:
+              ok,ats=restore(name); ptrace_restore={'restored':ok,'attempts':ats}
+          results.append({
+              'id':'ptrace_attached_process','category':'debugger','status':ptrace_status,
+              'matters':'yes if GDB/strace/ptrace remains attached at snapshot time',
+              'why':'Autonomous exploit agents may debug targets. If this probe fails, MitigationGym should detach and save debugger state separately before checkpointing, then reattach after restore.',
+              'evidence':{'ready_log':logs.get('stdout','')[-2000:],'checkpoint':cp_ptrace,'restore':ptrace_restore}
+          })
+          cleanup(name)
+
+          # 3. Established TCP connection. Docker does not expose every CRIU TCP option; record empirical behavior.
+          name='stage1-tcp-limit'
+          cleanup(name)
+          c=run(['docker','create','--name',name,'--runtime','runc','--network','host','--security-opt','seccomp=unconfined','--entrypoint','/probe',tcp_image])
+          s=run(['docker','start',name]) if c['returncode']==0 else {'returncode':1,'stdout':'','stderr':'create failed'}
+          time.sleep(1)
+          logs=run(['docker','logs',name],30)
+          cp_tcp=run(['docker','checkpoint','create',name,'stage1'],120) if s['returncode']==0 else {'returncode':1,'stdout':'','stderr':'start failed'}
+          tcp_restore=None
+          if cp_tcp['returncode']==0:
+              ok,ats=restore(name); tcp_restore={'restored':ok,'attempts':ats}
+          tcp_status=('PASS' if cp_tcp['returncode']==0 and tcp_restore and tcp_restore['restored'] else 'RELEVANT_LIMITATION')
+          results.append({
+              'id':'established_tcp','category':'network','status':tcp_status,
+              'matters':'yes if a snapshot boundary crosses a live TCP session',
+              'why':'Exploit sessions may depend on a live target connection. A failure means snapshot boundaries should occur between connections or the network endpoint/state must be reconstructed explicitly.',
+              'evidence':{'ready_log':logs.get('stdout','')[-2000:],'checkpoint':cp_tcp,'restore':tcp_restore,'network_mode':'host'}
+          })
+          cleanup(name)
+
+          # Architectural limits that cannot be honestly proven away by a userspace CRIU probe.
+          manifest=json.loads(pathlib.Path('stage1-manifest/manifest.json').read_text())
+          fam=manifest.get('family_task_counts') or {}
+          kernel_tasks=int(fam.get('kernel') or 0)
+          results.append({
+              'id':'kernel_resident_exploit_state','category':'kernel_state','status':'REQUIRES_VM' if kernel_tasks else 'NOT_APPLICABLE',
+              'matters':'yes for kernel tasks after the exploit mutates guest-kernel state' if kernel_tasks else 'no kernel tasks in manifest',
+              'why':'CRIU checkpoints process/container resources, not arbitrary guest-kernel heap/object history. A kernel exploit can depend on slab layout, freed/reused objects, timers, or corrupted kernel structures that process-only restore cannot rewind.',
+              'evidence':{'kernel_task_references':kernel_tasks,'source':'ExploitGym manifest family counts'},
+              'mitigation':'Use a VM-level snapshot backend (for example KVM/QEMU or a compatible microVM snapshot) when kernel-resident state is part of the replay invariant.'
+          })
+          results.append({
+              'id':'device_or_accelerator_state','category':'devices','status':'UNASSESSED_CONDITIONAL',
+              'matters':'only for tasks whose correctness depends on device-internal state',
+              'why':'Generic CRIU process checkpointing cannot be assumed to preserve arbitrary device state. The current metadata sweep does not establish that no task uses such state.',
+              'evidence':{'empirically_tested':False},
+              'mitigation':'Declare device requirements per task and route exceptional targets to a device-aware or VM-level backend.'
+          })
+          results.append({
+              'id':'cross_host_portability','category':'artifact_portability','status':'RELEVANT',
+              'matters':'yes for GitHub Release replay artifacts',
+              'why':'The current sweep restores the same container on the same runner. A portable release must preserve the image digest plus writable filesystem/volume state in addition to CRIU process state.',
+              'evidence':{'same_runner_restore_tested':True,'fresh_runner_reconstruction_tested':False},
+              'mitigation':'Add an explicit destroy/recreate-from-digest + rootfs-delta + CRIU restore test before claiming cross-runner replayability.'
+          })
+
+          counts={}
+          for r in results: counts[r['status']]=counts.get(r['status'],0)+1
+          report={
+              'schema':'exploitgym-criu-stage1/limitations-v1',
+              'generated_utc':datetime.datetime.now(datetime.timezone.utc).isoformat(),
+              'workflow_revision':os.environ.get('SWEEP_REVISION'),
+              'runtime':{'docker':run(['docker','version','--format','{{.Server.Version}}'],30).get('stdout','').strip(),'criu':run(['sudo','/usr/sbin/criu','--version'],30).get('stdout','').strip()},
+              'exploitgym_sha':manifest.get('exploitgym_sha'),
+              'family_task_counts':fam,
+              'status_counts':counts,
+              'tests':results,
+              'overall_conclusion':'CRIU is validated as the default process-state checkpoint backend when the replay invariant is contained within process/container resources. Portable artifact replay additionally requires filesystem/volume capture. Kernel-resident exploit state requires a VM-level snapshot boundary rather than stronger userspace memory hashing.'
+          }
+          pathlib.Path(root/'limitations-report.json').write_text(json.dumps(report,indent=2)+'\n')
+
+          lines=['# ExploitGym CRIU Stage 1 — limitation relevance report','',
+                 f"ExploitGym commit: `{manifest.get('exploitgym_sha')}`",'',
+                 'This report separates empirically tested resource fidelity from architectural state that is outside a process-level CRIU checkpoint.','',
+                 '| Limitation / resource | Result | Does it matter? | Why |','|---|---|---|---|']
+          for r in results:
+              why=str(r.get('why','')).replace('|','\\|').replace('\n',' ')
+              matters=str(r.get('matters','')).replace('|','\\|')
+              lines.append(f"| `{r['id']}` | **{r['status']}** | {matters} | {why} |")
+          lines += ['', '## Overall conclusion','', report['overall_conclusion'],'',
+                    '## Interpretation','',
+                    '- **PASS**: exercised under this pinned runtime and restored with the tested semantic invariant intact.',
+                    '- **CONFIRMED_LIMITATION / RELEVANT_LIMITATION / RELEVANT**: the limitation is observable or directly affects portable replay design; use the stated mitigation.',
+                    '- **REQUIRES_VM**: the relevant state is outside the process/container checkpoint boundary.',
+                    '- **UNASSESSED_CONDITIONAL**: not proven relevant to the current corpus; declare and test per-task when needed.','']
+          pathlib.Path(root/'limitations-report.md').write_text('\n'.join(lines))
+          print('\n'.join(lines))
+          PYLIMIT
+
+      - name: Upload limitation evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stage1-limitations
+          path: |
+            limitations-result/
+            limitations-evidence/
+          if-no-files-found: warn
+          retention-days: 30
+
+
+  aggregate:
+    name: Aggregate Stage 1 compatibility map
+    needs: [prepare, sweep, limitations]
+    if: always() && needs.prepare.result == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    outputs:
+      failed: ${{ steps.aggregate.outputs.failed }}
+      passed: ${{ steps.aggregate.outputs.passed }}
+    steps:
+      - name: Download manifest
+        uses: actions/download-artifact@v4
+        with:
+          name: stage1-manifest
+          path: downloaded/manifest
+
+      - name: Download all shard artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: stage1-shard-*
+          path: downloaded/shards
+          merge-multiple: false
+
+      - name: Download limitation assessment
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: stage1-limitations
+          path: downloaded/limitations
+
+      - name: Build JSON, CSV, Markdown and ZIP summary
+        id: aggregate
+        shell: bash
+        env:
+          EXPECTED_IMAGES: ${{ needs.prepare.outputs.image_count }}
+          EXPLOITGYM_SHA: ${{ needs.prepare.outputs.exploitgym_sha }}
+        run: |
+          set -Eeuo pipefail
+          mkdir -p stage1-final
+          python3 - <<'PY'
+          import csv, json, math, os, pathlib, statistics, zipfile
+
+          root = pathlib.Path('downloaded/shards')
+          rows = []
+          shard_summaries = []
+          limitations_path = pathlib.Path('downloaded/limitations/limitations-result/limitations-report.json')
+          if not limitations_path.exists():
+              limitations_path = pathlib.Path('downloaded/limitations/limitations-report.json')
+          limitations = None
+          if limitations_path.exists():
+              try:
+                  limitations = json.loads(limitations_path.read_text())
+              except Exception as exc:
+                  limitations = {'status':'report_parse_failed','error':repr(exc)}
+          for p in root.rglob('*.json'):
+              try:
+                  obj = json.loads(p.read_text())
+              except Exception:
+                  continue
+              if obj.get('schema') == 'exploitgym-criu-stage1/result-v4-memory-aggregate':
+                  rows.append(obj)
+              elif obj.get('schema') == 'exploitgym-criu-stage1/shard-v4-memory-aggregate':
+                  shard_summaries.append(obj)
+          rows.sort(key=lambda x: x['image'])
+          shard_summaries.sort(key=lambda x: x.get('shard',999))
+          expected = int(os.environ['EXPECTED_IMAGES'])
+          if len(rows) != expected:
+              print(f'::warning::Expected {expected} image results, found {len(rows)}')
+
+          def nums(key, source=None):
+              source = rows if source is None else source
+              return [x.get(key) for x in source if isinstance(x.get(key),(int,float))]
+
+          def pct(values, p):
+              values=sorted(values)
+              if not values: return None
+              return values[max(0,min(len(values)-1,int(math.ceil(p*len(values)))-1))]
+
+          def stats(values):
+              values=sorted(values)
+              if not values:
+                  return {'count':0,'sum':0,'min':None,'mean':None,'median':None,'p95':None,'max':None}
+              return {
+                  'count':len(values), 'sum':sum(values), 'min':values[0],
+                  'mean':sum(values)/len(values), 'median':statistics.median(values),
+                  'p95':pct(values,0.95), 'max':values[-1],
+              }
+
+          def mib(v):
+              return 'n/a' if not isinstance(v,(int,float)) else f'{v/(1024*1024):.2f} MiB'
+
+          def gib(v):
+              return 'n/a' if not isinstance(v,(int,float)) else f'{v/(1024**3):.2f} GiB'
+
+          def secs(v):
+              return 'n/a' if not isinstance(v,(int,float)) else f'{v:.3f}s'
+
+          passed = [r for r in rows if r.get('status') == 'passed']
+          failed = [r for r in rows if r.get('status') != 'passed']
+          verified = [r for r in rows if r.get('memory_continuity_verified') is True]
+          by_class = {}
+          by_family = {}
+          by_shard = {}
+          for r in rows:
+              by_class[r.get('classification','unknown')] = by_class.get(r.get('classification','unknown'),0)+1
+              sh = str(r.get('shard','unknown'))
+              sx = by_shard.setdefault(sh, {'total':0,'passed':0,'failed':0,'task_references':0,'rows':[]})
+              sx['total'] += 1
+              sx['passed' if r.get('status') == 'passed' else 'failed'] += 1
+              sx['task_references'] += int(r.get('task_count') or 0)
+              sx['rows'].append(r)
+              for fam in r.get('families') or ['unknown']:
+                  x = by_family.setdefault(fam, {'total':0,'passed':0,'failed':0,'task_references':0})
+                  x['total'] += 1
+                  x['passed' if r.get('status') == 'passed' else 'failed'] += 1
+                  x['task_references'] += int(r.get('task_count') or 0)
+
+          memory_metrics = [
+              'rss_before_bytes','rss_after_bytes','pss_before_bytes','pss_after_bytes',
+              'vmhwm_before_bytes','vmhwm_after_bytes','vmsize_before_bytes','vmsize_after_bytes',
+              'cgroup_memory_before_bytes','cgroup_memory_after_bytes',
+              'cgroup_memory_peak_before_bytes','cgroup_memory_peak_after_bytes',
+              'cgroup_anon_before_bytes','cgroup_anon_after_bytes',
+              'cgroup_file_before_bytes','cgroup_file_after_bytes',
+              'cgroup_kernel_before_bytes','cgroup_kernel_after_bytes',
+              'docker_memory_before_bytes','docker_memory_after_bytes',
+              'host_mem_available_before_bytes','host_mem_available_after_bytes',
+          ]
+          memory_statistics = {k:stats(nums(k)) for k in memory_metrics}
+          timing_statistics = {
+              'checkpoint_s':stats(nums('checkpoint_s')),
+              'restore_s':stats(nums('restore_s')),
+              'restore_attempt_count':stats(nums('restore_attempt_count')),
+          }
+          storage_statistics = {
+              'image_size_bytes':stats(nums('image_size_bytes')),
+              'checkpoint_bytes_visible':stats(nums('checkpoint_bytes_visible')),
+          }
+
+          shard_rows = []
+          for sh, x in sorted(by_shard.items(), key=lambda kv: int(kv[0]) if str(kv[0]).isdigit() else 999):
+              sr = x['rows']
+              shard_rows.append({
+                  'shard':sh, 'images':x['total'], 'passed':x['passed'], 'failed':x['failed'],
+                  'task_references':x['task_references'],
+                  'rss_before_max_bytes':stats(nums('rss_before_bytes',sr))['max'],
+                  'pss_before_max_bytes':stats(nums('pss_before_bytes',sr))['max'],
+                  'cgroup_memory_before_max_bytes':stats(nums('cgroup_memory_before_bytes',sr))['max'],
+                  'cgroup_memory_peak_after_max_bytes':stats(nums('cgroup_memory_peak_after_bytes',sr))['max'],
+                  'image_size_observation_sum_bytes':sum(nums('image_size_bytes',sr)),
+                  'checkpoint_visible_sum_bytes':sum(nums('checkpoint_bytes_visible',sr)),
+                  'checkpoint_seconds_sum':sum(nums('checkpoint_s',sr)),
+                  'restore_seconds_sum':sum(nums('restore_s',sr)),
+              })
+
+          # Since each shard tests images sequentially but shards run on separate VMs,
+          # sums over all image observations are cumulative workload statistics, not
+          # simultaneous RAM. Sum-of-shard-maxima is a conservative capacity-planning
+          # envelope, not a directly observed synchronized peak.
+          shard_peak_envelope = {
+              'rss_before_sum_of_shard_max_bytes': sum(x['rss_before_max_bytes'] or 0 for x in shard_rows),
+              'pss_before_sum_of_shard_max_bytes': sum(x['pss_before_max_bytes'] or 0 for x in shard_rows),
+              'cgroup_current_sum_of_shard_max_bytes': sum(x['cgroup_memory_before_max_bytes'] or 0 for x in shard_rows),
+              'cgroup_peak_sum_of_shard_max_bytes': sum(x['cgroup_memory_peak_after_max_bytes'] or 0 for x in shard_rows),
+              'interpretation': 'Capacity-planning envelope: sum of each shard runner\'s maximum observed image RAM. Maxima were not necessarily simultaneous.',
+          }
+
+          aggregate = {
+              'schema':'exploitgym-criu-stage1/aggregate-v3-memory-aggregate',
+              'workflow_revision': os.environ.get('SWEEP_REVISION'),
+              'exploitgym_sha': os.environ.get('EXPLOITGYM_SHA'),
+              'expected_unique_images': expected,
+              'observed_results': len(rows),
+              'task_references_represented': sum(int(r.get('task_count') or 0) for r in rows),
+              'passed': len(passed), 'failed': len(failed),
+              'memory_continuity_verified': len(verified),
+              'pass_rate': (len(passed)/len(rows) if rows else 0),
+              'continuity_verification_rate': (len(verified)/len(rows) if rows else 0),
+              'by_classification': dict(sorted(by_class.items())),
+              'by_family': by_family,
+              'memory_statistics': memory_statistics,
+              'timing_statistics': timing_statistics,
+              'storage_statistics': storage_statistics,
+              'shard_capacity_envelope': shard_peak_envelope,
+              'total_restore_transport_retries': sum(int(r.get('restore_transport_retries') or 0) for r in rows),
+              'total_checkpoint_bytes_visible': sum(nums('checkpoint_bytes_visible')),
+              'total_image_bytes_observation_sum': sum(nums('image_size_bytes')),
+              'ram_sum_caveat': 'RAM sums across all image rows are sums of sequential observations and MUST NOT be interpreted as simultaneous memory consumption.',
+              'scope': 'Image-level CRIU smoke compatibility using a minimal in-image long-lived process. Docker 27.5.1/containerd 1.7.25. A separate limitation-relevance suite tests semantic resource classes and records state outside the CRIU process boundary.',
+              'limitations_assessment': limitations,
+              'shards': shard_rows,
+              'results': rows,
+          }
+          pathlib.Path('stage1-final/summary.json').write_text(json.dumps(aggregate, indent=2)+'\n')
+
+          fields = [
+              'shard','image','families','task_count','status','classification','phase','checkpoint_s','restore_s',
+              'image_size_bytes','checkpoint_file_count','checkpoint_bytes_visible',
+              'rss_before_bytes','rss_after_bytes','pss_before_bytes','pss_after_bytes',
+              'vmrss_before_bytes','vmrss_after_bytes','vmhwm_before_bytes','vmhwm_after_bytes','vmsize_before_bytes','vmsize_after_bytes',
+              'rss_anon_before_bytes','rss_anon_after_bytes','rss_file_before_bytes','rss_file_after_bytes',
+              'private_dirty_before_bytes','private_dirty_after_bytes','anonymous_before_bytes','anonymous_after_bytes',
+              'cgroup_memory_before_bytes','cgroup_memory_after_bytes','cgroup_memory_peak_before_bytes','cgroup_memory_peak_after_bytes',
+              'cgroup_anon_before_bytes','cgroup_anon_after_bytes','cgroup_file_before_bytes','cgroup_file_after_bytes',
+              'cgroup_kernel_before_bytes','cgroup_kernel_after_bytes','cgroup_shmem_before_bytes','cgroup_shmem_after_bytes',
+              'cgroup_swap_before_bytes','cgroup_swap_after_bytes','docker_memory_before_bytes','docker_memory_after_bytes',
+              'docker_memory_percent_before','docker_memory_percent_after','host_mem_total_before_bytes','host_mem_total_after_bytes',
+              'host_mem_available_before_bytes','host_mem_available_after_bytes',
+              'host_pid_before','host_pid_after','proc_starttime_before_ticks','proc_starttime_after_ticks',
+              'probe_nonce_before','probe_nonce_after','probe_counter_before','probe_counter_after','probe_counter_delta','memory_continuity_verified',
+              'restore_attempt_count','restore_transport_retries','architecture','os','image_id','docker_server_version','network_strategy','network_namespace_restore_tested','exception'
+          ]
+          with open('stage1-final/results.csv','w',newline='') as f:
+              w=csv.DictWriter(f,fieldnames=fields);w.writeheader()
+              for r in rows:
+                  q={k:r.get(k) for k in fields};q['families']=','.join(r.get('families') or [])
+                  w.writerow(q)
+
+          shard_fields = ['shard','images','passed','failed','task_references','rss_before_max_bytes','pss_before_max_bytes','cgroup_memory_before_max_bytes','cgroup_memory_peak_after_max_bytes','image_size_observation_sum_bytes','checkpoint_visible_sum_bytes','checkpoint_seconds_sum','restore_seconds_sum']
+          with open('stage1-final/shards.csv','w',newline='') as f:
+              w=csv.DictWriter(f,fieldnames=shard_fields);w.writeheader();w.writerows(shard_rows)
+
+          memory_rows=[]
+          for metric, st in memory_statistics.items():
+              memory_rows.append({'metric':metric, **st})
+          with open('stage1-final/memory-summary.csv','w',newline='') as f:
+              mf=['metric','count','sum','min','mean','median','p95','max']
+              w=csv.DictWriter(f,fieldnames=mf);w.writeheader();w.writerows(memory_rows)
+
+          lines = [
+              '# ExploitGym CRIU Stage 1 — aggregate', '',
+              f"**{len(passed)} / {len(rows)} unique target images passed checkpoint + restore ({(100*len(passed)/len(rows)) if rows else 0:.1f}%).**", '',
+              f"Memory continuity independently verified for **{len(verified)} / {len(rows)}** images.", '',
+              f"Task references represented by the deduplicated image set: **{sum(int(r.get('task_count') or 0) for r in rows)}**.", '',
+              f"ExploitGym commit: `{os.environ.get('EXPLOITGYM_SHA')}`", '',
+              'A pass requires the original checkpointed probe to retain the same random in-memory nonce and a nondecreasing counter after restore.', '',
+              '## RAM across all tested processes', '',
+              '> **Important:** each shard tests images sequentially. Sums across all image rows are cumulative observations, not simultaneous RAM. The shard-max envelope below is for capacity planning, not a synchronized measured peak.', '',
+              '| Metric | Count | Mean | Median | P95 | Max | Sum of observations |',
+              '|---|---:|---:|---:|---:|---:|---:|',
+          ]
+          for key,label in [
+              ('rss_before_bytes','Process RSS before checkpoint'),
+              ('pss_before_bytes','Process PSS before checkpoint'),
+              ('cgroup_memory_before_bytes','Container cgroup RAM before checkpoint'),
+              ('cgroup_memory_peak_after_bytes','Container cgroup peak RAM'),
+              ('vmhwm_after_bytes','Process VmHWM'),
+              ('docker_memory_before_bytes','Docker-reported memory'),
+          ]:
+              st=memory_statistics[key]
+              lines.append(f"| {label} | {st['count']} | {mib(st['mean'])} | {mib(st['median'])} | {mib(st['p95'])} | {mib(st['max'])} | {gib(st['sum'])} |")
+
+          lines += [
+              '', '### 20-shard capacity envelope', '',
+              f"- Sum of per-shard max process RSS: **{mib(shard_peak_envelope['rss_before_sum_of_shard_max_bytes'])}**",
+              f"- Sum of per-shard max process PSS: **{mib(shard_peak_envelope['pss_before_sum_of_shard_max_bytes'])}**",
+              f"- Sum of per-shard max cgroup current RAM: **{mib(shard_peak_envelope['cgroup_current_sum_of_shard_max_bytes'])}**",
+              f"- Sum of per-shard max cgroup peak RAM: **{mib(shard_peak_envelope['cgroup_peak_sum_of_shard_max_bytes'])}**",
+              '', '## Timing and checkpoint storage', '',
+              '| Metric | Mean | Median | P95 | Max | Total |', '|---|---:|---:|---:|---:|---:|',
+              f"| Checkpoint time | {secs(timing_statistics['checkpoint_s']['mean'])} | {secs(timing_statistics['checkpoint_s']['median'])} | {secs(timing_statistics['checkpoint_s']['p95'])} | {secs(timing_statistics['checkpoint_s']['max'])} | {secs(timing_statistics['checkpoint_s']['sum'])} |",
+              f"| Restore time | {secs(timing_statistics['restore_s']['mean'])} | {secs(timing_statistics['restore_s']['median'])} | {secs(timing_statistics['restore_s']['p95'])} | {secs(timing_statistics['restore_s']['max'])} | {secs(timing_statistics['restore_s']['sum'])} |",
+              f"| Visible checkpoint bytes | {mib(storage_statistics['checkpoint_bytes_visible']['mean'])} | {mib(storage_statistics['checkpoint_bytes_visible']['median'])} | {mib(storage_statistics['checkpoint_bytes_visible']['p95'])} | {mib(storage_statistics['checkpoint_bytes_visible']['max'])} | {gib(storage_statistics['checkpoint_bytes_visible']['sum'])} |",
+              f"| Docker image disk size | {mib(storage_statistics['image_size_bytes']['mean'])} | {mib(storage_statistics['image_size_bytes']['median'])} | {mib(storage_statistics['image_size_bytes']['p95'])} | {mib(storage_statistics['image_size_bytes']['max'])} | {gib(storage_statistics['image_size_bytes']['sum'])} |",
+              '', f"Restore transport retries across all images: **{aggregate['total_restore_transport_retries']}**.",
+              '', '## By shard', '',
+              '| Shard | Images | Pass | Fail | Task refs | Max RSS | Max cgroup RAM | Max cgroup peak |',
+              '|---:|---:|---:|---:|---:|---:|---:|---:|'
+          ]
+          for x in shard_rows:
+              lines.append(f"| {x['shard']} | {x['images']} | {x['passed']} | {x['failed']} | {x['task_references']} | {mib(x['rss_before_max_bytes'])} | {mib(x['cgroup_memory_before_max_bytes'])} | {mib(x['cgroup_memory_peak_after_max_bytes'])} |")
+
+          lines += ['', '## By family', '', '| Family | Images | Pass | Fail | Task refs |', '|---|---:|---:|---:|---:|']
+          for fam,x in sorted(by_family.items()):
+              lines.append(f"| {fam} | {x['total']} | {x['passed']} | {x['failed']} | {x['task_references']} |")
+          lines += ['', '## Result classification', '', '| Classification | Count |', '|---|---:|']
+          for k,v in sorted(by_class.items(), key=lambda kv:(-kv[1],kv[0])):
+              lines.append(f'| {k} | {v} |')
+
+          if limitations and isinstance(limitations, dict) and isinstance(limitations.get('tests'), list):
+              lines += ['', '## CRIU limitation relevance', '',
+                        'The dedicated limitation suite tests semantic resource classes separately from the 862-image compatibility sweep.', '',
+                        '| Resource / limitation | Result | Matters? |', '|---|---|---|']
+              for t in limitations['tests']:
+                  matters=str(t.get('matters','')).replace('|','\\|')
+                  lines.append(f"| `{t.get('id')}` | **{t.get('status')}** | {matters} |")
+              lines += ['', limitations.get('overall_conclusion','')]
+          else:
+              lines += ['', '## CRIU limitation relevance', '', '> Limitation report was unavailable for this run.']
+
+          if failed:
+              lines += ['', '## Failed images', '']
+              for r in failed:
+                  lines.append(f"- `{r['image']}` — **{r.get('classification')}** ({r.get('exception','')[:220]})")
+          pathlib.Path('stage1-final/summary.md').write_text('\n'.join(lines)+'\n')
+          if limitations_path.exists():
+              pathlib.Path('stage1-final/limitations-report.json').write_text(limitations_path.read_text())
+              md_candidates=[
+                  pathlib.Path('downloaded/limitations/limitations-result/limitations-report.md'),
+                  pathlib.Path('downloaded/limitations/limitations-report.md'),
+              ]
+              for mdp in md_candidates:
+                  if mdp.exists():
+                      pathlib.Path('stage1-final/limitations-report.md').write_text(mdp.read_text())
+                      break
+
+          # Small machine-readable headline printed directly in the aggregate job log.
+          print('GLOBAL_AGGREGATE')
+          print(f"  images={len(rows)} passed={len(passed)} failed={len(failed)} continuity_verified={len(verified)} task_refs={aggregate['task_references_represented']}")
+          print(f"  process_rss mean={mib(memory_statistics['rss_before_bytes']['mean'])} median={mib(memory_statistics['rss_before_bytes']['median'])} p95={mib(memory_statistics['rss_before_bytes']['p95'])} max={mib(memory_statistics['rss_before_bytes']['max'])}")
+          print(f"  process_pss mean={mib(memory_statistics['pss_before_bytes']['mean'])} median={mib(memory_statistics['pss_before_bytes']['median'])} p95={mib(memory_statistics['pss_before_bytes']['p95'])} max={mib(memory_statistics['pss_before_bytes']['max'])}")
+          print(f"  cgroup_ram mean={mib(memory_statistics['cgroup_memory_before_bytes']['mean'])} median={mib(memory_statistics['cgroup_memory_before_bytes']['median'])} p95={mib(memory_statistics['cgroup_memory_before_bytes']['p95'])} max={mib(memory_statistics['cgroup_memory_before_bytes']['max'])}")
+          print(f"  cgroup_peak max={mib(memory_statistics['cgroup_memory_peak_after_bytes']['max'])} sum_shard_max_envelope={mib(shard_peak_envelope['cgroup_peak_sum_of_shard_max_bytes'])}")
+          print(f"  checkpoint_bytes total={gib(storage_statistics['checkpoint_bytes_visible']['sum'])} median={mib(storage_statistics['checkpoint_bytes_visible']['median'])} max={mib(storage_statistics['checkpoint_bytes_visible']['max'])}")
+          print(f"  image_disk observation_sum={gib(storage_statistics['image_size_bytes']['sum'])} median={mib(storage_statistics['image_size_bytes']['median'])} max={mib(storage_statistics['image_size_bytes']['max'])}")
+          print(f"  timing checkpoint_median={secs(timing_statistics['checkpoint_s']['median'])} restore_median={secs(timing_statistics['restore_s']['median'])} retries={aggregate['total_restore_transport_retries']}")
+          if limitations and isinstance(limitations,dict):
+              print('  limitations=' + json.dumps(limitations.get('status_counts') or {}, sort_keys=True))
+
+          with zipfile.ZipFile('stage1-final/stage1-complete-evidence.zip','w',zipfile.ZIP_DEFLATED) as z:
+              for base in (pathlib.Path('downloaded/manifest'), pathlib.Path('downloaded/shards'), pathlib.Path('downloaded/limitations')):
+                  if base.exists():
+                      for p in base.rglob('*'):
+                          if p.is_file(): z.write(p, p.as_posix())
+              for p in pathlib.Path('stage1-final').glob('*'):
+                  if p.is_file() and p.name != 'stage1-complete-evidence.zip': z.write(p,p.as_posix())
+
+          with open(os.environ['GITHUB_OUTPUT'],'a') as f:
+              f.write(f'passed={len(passed)}\nfailed={len(failed)}\n')
+          if os.environ.get('GITHUB_STEP_SUMMARY'):
+              with open(os.environ['GITHUB_STEP_SUMMARY'],'a') as f:
+                  f.write(pathlib.Path('stage1-final/summary.md').read_text())
+          PY
+
+      - name: Upload aggregate result
+        uses: actions/upload-artifact@v4
+        with:
+          name: exploitgym-criu-stage1-${{ github.run_id }}-${{ github.run_attempt }}
+          path: stage1-final/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish immutable GitHub Release
+        if: ${{ inputs.publish_release }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: criu-stage1-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          set -Eeuo pipefail
+          python3 - <<'PYRELEASE'
+          import json, mimetypes, os, pathlib, urllib.parse, urllib.request
+
+          token=os.environ['GH_TOKEN']
+          repo=os.environ['GITHUB_REPOSITORY']
+          tag=os.environ['TAG']
+          target=os.environ['GITHUB_SHA']
+          summary=pathlib.Path('stage1-final/summary.md').read_text()
+          api='https://api.github.com/repos/'+repo
+          headers={
+              'Authorization':'Bearer '+token,
+              'Accept':'application/vnd.github+json',
+              'X-GitHub-Api-Version':'2022-11-28',
+              'User-Agent':'exploitgym-criu-stage1',
+          }
+
+          def call(url, *, data=None, method=None, content_type='application/json'):
+              h=dict(headers)
+              if data is not None: h['Content-Type']=content_type
+              req=urllib.request.Request(url, data=data, headers=h, method=method)
+              with urllib.request.urlopen(req, timeout=120) as r:
+                  return r.read(), r.status
+
+          payload=json.dumps({
+              'tag_name':tag, 'target_commitish':target,
+              'name':f'ExploitGym CRIU Stage 1 — {tag}',
+              'body':summary, 'draft':False, 'prerelease':False,
+          }).encode()
+          raw,status=call(api+'/releases',data=payload,method='POST')
+          release=json.loads(raw)
+          upload_url=release['upload_url'].split('{',1)[0]
+          assets=[
+              pathlib.Path('stage1-final/summary.json'),
+              pathlib.Path('stage1-final/results.csv'),
+              pathlib.Path('stage1-final/summary.md'),
+              pathlib.Path('stage1-final/limitations-report.json'),
+              pathlib.Path('stage1-final/limitations-report.md'),
+              pathlib.Path('stage1-final/stage1-complete-evidence.zip'),
+          ]
+          assets=[p for p in assets if p.exists()]
+          uploaded=[]
+          for path in assets:
+              data=path.read_bytes()
+              url=upload_url+'?'+urllib.parse.urlencode({'name':path.name})
+              typ=mimetypes.guess_type(path.name)[0] or 'application/octet-stream'
+              body,st=call(url,data=data,method='POST',content_type=typ)
+              obj=json.loads(body)
+              uploaded.append({'name':path.name,'bytes':len(data),'id':obj.get('id')})
+              print('RELEASE ASSET',path.name,len(data),'bytes',flush=True)
+          pathlib.Path('stage1-final/release.json').write_text(json.dumps({
+              'tag':tag,'release_id':release.get('id'),'html_url':release.get('html_url'),
+              'assets':uploaded,
+          },indent=2)+'\n')
+          print('RELEASE',release.get('html_url'),flush=True)
+          PYRELEASE
+
+      - name: Optional strict compatibility gate
+        if: ${{ inputs.fail_on_incompatibility && steps.aggregate.outputs.failed != '0' }}
+        shell: bash
+        run: |
+          echo "${{ steps.aggregate.outputs.failed }} image(s) failed Stage 1 compatibility." >&2
+          exit 1
