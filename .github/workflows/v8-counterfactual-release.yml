@@ -181,7 +181,7 @@ jobs:
                 with (root/'events.log').open('a') as f:f.write(json.dumps(entry,sort_keys=True)+'\n')
 
         def register_target(name, executable):
-            if not re.fullmatch(r'v8-(criu|extended)-[0-9a-f]{12}',name): return
+            if not re.fullmatch(r'v8-(criu|extended|counterfactual)-[0-9a-f]{12}',name): return
             with locked():atomic(private_root()/'target.json',{'target':name,'executable_name':Path(executable).name,'registered_utc':now()})
 
         def on_audit_event(audit, kind, fields):
@@ -2984,6 +2984,13 @@ jobs:
                     'max_changed_words':max(per) if per else 0}
         
         
+        def same_scientific_ticks(a_events,b_events):
+            aa=[e for e in a_events if e.get('event')=='tick']; bb=[e for e in b_events if e.get('event')=='tick']
+            return len(aa)==len(bb) and all(
+                x.get('step')==y.get('step') and exact_state(x,y) and x.get('graph_values')==y.get('graph_values')
+                for x,y in zip(aa,bb))
+        
+        
         MEMORY9_COUNTERFACTUAL_SUITE_PY_1
     - name: Embed counterfactual_suite.py [2/2]
       shell: bash
@@ -3128,7 +3135,7 @@ jobs:
                             'trajectory_sha256':thash,'final':done}
                         if arm in arm_reference:
                             ref=arm_reference[arm]
-                            checks['same_arm_all_ticks_exact']=ticks==[e for e in ref if e.get('event')=='tick']
+                            checks['same_arm_all_ticks_exact']=same_scientific_ticks(new,ref)
                             ref_done=next(e for e in ref if e.get('event')=='done')
                             checks['same_arm_final_exact']=done.get('heap_words')==ref_done.get('heap_words') and done.get('random_draws')==ref_done.get('random_draws')
                             checks['same_arm_trajectory_hash_exact']=thash==trajectory_hash(ref)
@@ -3945,7 +3952,7 @@ jobs:
             if result['suite_status']!='passed' or not result['every_step_oracle_checks']:result['errors'].append('Exact per-step fidelity checks missing or failed')
             result['status']='passed' if not result['errors'] else 'failed'
             result['limitations']=['16 KiB of instrumented memory, not all V8 memory.', 'Native mapping/resource reads are non-atomic observations.',
-                'Observer and per-step delay affect timing; no uninstrumented-overhead claim.', 'All continuations use identical inputs, not alternative actions.']
+                'Observer and per-step delay affect timing; no uninstrumented-overhead claim.', 'All continuations share one checkpoint; CONTROL/A/B interventions are applied only after exact pre-branch identity.']
             update_manifest(mode='archived',status=result['status'],stage='complete' if result['status']=='passed' else 'failed_or_incomplete',
                 requested_trials=requested,horizon=horizon,coverage=result,ended_utc=now(),live_poll_seconds=None)
             atomic(evidence/'memory-fidelity.json',result)
@@ -3977,6 +3984,7 @@ jobs:
         import memory_bridge as b
         import proc_metrics as proc
         import intervention_suite as suite
+        import counterfactual_suite as counterfactual
         import memory_service as service
         import build_viewer as viewer
         from repair_tests import fixture
@@ -4094,6 +4102,18 @@ jobs:
                 f=next(x for x in payload['files'] if x['name']=='extended-replay/report.json');self.assertEqual(len(json.loads(f['text'])['trials']),12)
             def test_compact_trial_retains_boundaries(self):
                 c=viewer.compact_trial({'trial':{'trial':1,'resume':self.es[0]},'events':self.es});self.assertIn('heap_words',c['events'][0]);self.assertNotIn('heap_words',c['events'][1])
+            def test_counterfactual_same_arm_ignores_trial_metadata(self):
+                a=copy.deepcopy(self.es);b2=copy.deepcopy(self.es)
+                for e in a:
+                    if e.get('event')=='tick':e['trial']=1;e['arm']='A'
+                for e in b2:
+                    if e.get('event')=='tick':e['trial']=7;e['arm']='A'
+                self.assertTrue(counterfactual.same_scientific_ticks(a,b2))
+            def test_counterfactual_same_arm_rejects_state_change(self):
+                a=copy.deepcopy(self.es);b2=copy.deepcopy(self.es);b2[1]['heap_words'][9]^=1;b2[1]['digest']=suite.digest_words(b2[1]['heap_words'])
+                self.assertFalse(counterfactual.same_scientific_ticks(a,b2))
+            def test_counterfactual_target_is_monitorable(self):
+                name='v8-counterfactual-'+'b'*12;b.register_target(name,'/challenge/d8');self.assertEqual(b.load(b.private_root()/'target.json')['target'],name)
             def test_server_read_only(self):
                 (b.public_root()/'index.html').write_text('<!doctype html><title>test</title>')
                 server=service.Server(('127.0.0.1',0),service.Handler);t=threading.Thread(target=server.serve_forever,daemon=True);t.start();url=f'http://127.0.0.1:{server.server_port}'
@@ -4147,14 +4167,19 @@ jobs:
         python3 - <<'CHECK_SOURCES'
         import hashlib,json,os,pathlib,py_compile
         root=pathlib.Path(os.environ['BUNDLE_DIR']);evidence=pathlib.Path(os.environ['EVIDENCE_DIR']);checks=[]
-        expected={'memory_bridge.py': 'e967c67b165667d359308322035230394893a6007b99eba1fade2bae0eb1900b', 'proc_metrics.py': '8b8cb6a7e382325046db485b74826f912326f133581414909d0dd7922f36092a', 'memory_service.py': '330904555c088c64cf619e9e5ef676731677c550c56390acf203734e0dd68f68', 'memory-dashboard.html': 'c2158eec44edc0c7882403f7ceaffc6d16c04d08f6ff8f8254b8a6de9d3610d1', 'netns_guard.py': '0a7f6b8ef04a667e52999bc77f109294219fb3d2fdbe5a18a2b42c2676acc96c', 'checkpoint_probe.py': '03f9151b8e6f441ba01d674edca0f62287bd12f78d614e0cca7bf39580f02b97', 'build_viewer.py': '69fb73ecee767b615b9e0dbf1087256ded9a374f26a6192241868cbe95b08018', 'viewer-template.html': 'e93c62f7880024f1d94dfaf015cfc7312770c07d903d187db5c7fff687f7465f', 'install_criu.sh': '9f7b64296c1f1ffdc30f055f1f926d4b42a8c976291275978b6f803c27b43114', 'host_diagnostics.sh': '96cfdc39bcc6b5831c7784e140e1c62e45ba1b33ab698f53aaea7e68a0e647b2', 'report_tools.py': '74b716a254250c7bff6c6e49cab134f09d6eab8a4b7805e56121d86017ed4a45', 'self_tests.py': 'b6c327fd96f351d7fc102ea90dbaaa74e4e7486e448d4c941e430e296c90a545', 'network_tests.py': '05ddcf508cc1435e89d9d7302f20e9fb244d7409832c4a484994a2e7e46a8065', 'intervention_suite.py': '1b8607a109c8d719207e12210e9d1a696f829e5883999c13da02f66abf21edf4', 'fidelity_matrix.py': 'f91bd7a97511d7df4e981ace6f5383a151ee5da7e4d146dcf402417e503bbb53', 'build_pages.py': '70a144b21bee138c2eb56891cc2f126af5d28ff7b3871617344d573cd4a86090', 'repair_tests.py': '5b0b734402ecfe8733c1f40cbd95052faede8d39151ec58deb2148bbbfe3991a', 'documentation.json': 'd09b0e3eb695e042b107bd7cb14f10ef33b28f7d0c0059fc1877ed6f192f90fc', 'documentation.md': 'b2e427b77d8961ea7d6930395833c4e6fecce23a60d1eeafb963e7c9d8275cf2', 'finalize_memory.py': '89a054d3efff7fc2e3219a5d91072d235156541b768746ccc115adb02a691022', 'memory_tests.py': '3bbd3fe780488b579e16527b4046f4cbe0c0d62442b1f2b0a77eaf1290d14aed', 'memory-documentation.md': 'ccb7aaf088c267501df14601350bb1ea2e19edb476a2be46a3a83e0467912171'}
+        expected={'memory_bridge.py': 'bd3de8b2b0abcc479fb23e0c65601a55a71a69c28a53d87ffdff09ef647444ad', 'proc_metrics.py': '8b8cb6a7e382325046db485b74826f912326f133581414909d0dd7922f36092a', 'memory_service.py': '330904555c088c64cf619e9e5ef676731677c550c56390acf203734e0dd68f68', 'memory-dashboard.html': 'c2158eec44edc0c7882403f7ceaffc6d16c04d08f6ff8f8254b8a6de9d3610d1', 'netns_guard.py': '0a7f6b8ef04a667e52999bc77f109294219fb3d2fdbe5a18a2b42c2676acc96c', 'checkpoint_probe.py': '03f9151b8e6f441ba01d674edca0f62287bd12f78d614e0cca7bf39580f02b97', 'build_viewer.py': '69fb73ecee767b615b9e0dbf1087256ded9a374f26a6192241868cbe95b08018', 'viewer-template.html': '1f722f6e77fd26e6b8a4875320533d8b27d1a3f7b8d984bb297125a29b3d1c45', 'install_criu.sh': '9f7b64296c1f1ffdc30f055f1f926d4b42a8c976291275978b6f803c27b43114', 'host_diagnostics.sh': '96cfdc39bcc6b5831c7784e140e1c62e45ba1b33ab698f53aaea7e68a0e647b2', 'report_tools.py': 'cee3883ddf9bb9cd8452e29bac03dd86de40d50921d3b3ac4e498926f1399168', 'self_tests.py': 'b6c327fd96f351d7fc102ea90dbaaa74e4e7486e448d4c941e430e296c90a545', 'network_tests.py': '05ddcf508cc1435e89d9d7302f20e9fb244d7409832c4a484994a2e7e46a8065', 'intervention_suite.py': '1b8607a109c8d719207e12210e9d1a696f829e5883999c13da02f66abf21edf4', 'counterfactual_suite.py': '0bd0378164e83bb82233cdb2c4707cad8b1dfc1289f41bd07dd1c3a63120e9df', 'fidelity_matrix.py': '7adf1611bbcbd8186ad3d638b8dc955692a27489e0b4c1d753e75880e5d2633d', 'build_pages.py': '70a144b21bee138c2eb56891cc2f126af5d28ff7b3871617344d573cd4a86090', 'repair_tests.py': '5b0b734402ecfe8733c1f40cbd95052faede8d39151ec58deb2148bbbfe3991a', 'documentation.json': 'd09b0e3eb695e042b107bd7cb14f10ef33b28f7d0c0059fc1877ed6f192f90fc', 'documentation.md': 'd0606993942acfb48729a5d422d976dcfcb64465fcab1e337f80166da5014101', 'finalize_memory.py': '9407c5f75907553b3f9ae596ae075c23e85ee162a3c24ef07475409824519f3a', 'memory_tests.py': '59efe7727137a97634c12810c95dbe825240d97c1c4a57ba120033a18249a887', 'memory-documentation.md': 'de21730fc631a3443c3e18802df0744e62d3f39dd80ec6142829d10c6118afff'}
+        failed=False
         for name,wanted in expected.items():
-         path=root/name;actual=hashlib.sha256(path.read_bytes()).hexdigest();ok=actual==wanted
-         checks.append({'file':name,'passed':ok,'sha256':actual});print('SOURCE SHA256',name,actual,'PASS' if ok else 'FAIL',flush=True)
-         if not ok:raise SystemExit('Embedded source integrity failure: '+name)
-         if path.suffix=='.py':py_compile.compile(str(path),doraise=True)
+         path=root/name;actual=hashlib.sha256(path.read_bytes()).hexdigest();ok=actual==wanted;compile_error=None
+         if path.suffix=='.py':
+          try:py_compile.compile(str(path),doraise=True)
+          except Exception as exc:compile_error=repr(exc);ok=False
+         checks.append({'file':name,'passed':ok,'sha256':actual,'expected_sha256':wanted,'compile_error':compile_error})
+         print('SOURCE SHA256',name,actual,'PASS' if ok else 'FAIL',compile_error or '',flush=True)
+         failed=failed or not ok
          (evidence/'sources').mkdir(exist_ok=True);(evidence/'sources'/name).write_bytes(path.read_bytes())
-        (evidence/'asset-integrity.json').write_text(json.dumps({'status':'passed','revision':'memory-8','checks':checks},indent=2)+'\n')
+        (evidence/'asset-integrity.json').write_text(json.dumps({'status':'failed' if failed else 'passed','revision':'memory-9','checks':checks},indent=2)+'\n')
+        if failed:raise SystemExit('Embedded source integrity or compilation failure; inspect asset-integrity.json')
         CHECK_SOURCES
     - name: Regression checks of the original verifier
       id: self_tests
