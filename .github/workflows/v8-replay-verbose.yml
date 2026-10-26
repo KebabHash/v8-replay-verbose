@@ -8,7 +8,7 @@
 # Scope: disposable GitHub-hosted Linux runner; this restarts Docker.
 # Raw memory images are excluded from artifacts. Offline HTML controls inspect evidence.
 # Local tests are NOT evidence of successful real Docker/CRIU restoration.
-name: V8 Checkpoint Atlas - network-fix-3 - ultra verbose
+name: V8 Checkpoint Atlas - fidelity-4 - ultra verbose
 'on':
   workflow_dispatch:
     inputs:
@@ -714,6 +714,47 @@ jobs:
                             self.require(f"round {number}: {key}", value)
                         row['fidelity_status'] = 'passed'
                         self.resource_snapshot(container,'restored-'+str(number))
+                        # Independent repeated restores of the SAME checkpoint, not new dumps.
+                        # Run only after the last normal round; each trial must preserve
+                        # the checkpoint's original paused state and then advance.
+                        if number == rounds and not getattr(self, '_mock_disable_repeats', False):
+                            self.stage = 'repeat_restore_fidelity'
+                            row['repeat_restores'] = []
+                            for trial in range(1, 4):
+                                previous_logs = self.logs(container)
+                                self.run('stop-prior-branch', ['docker', 'kill', container], required=True)
+                                self.require('branch stopped before restore', self.state(container).get('Running') is False)
+                                guard.verify(f'branch-{trial}-stopped')
+                                start_trial = time.monotonic()
+                                self.run('repeat-restore-from-same-checkpoint',
+                                         ['docker', 'start', '--checkpoint', checkpoint, container], timeout=180, required=True)
+                                elapsed = time.monotonic() - start_trial
+                                guard.verify(f'branch-{trial}-restored', container)
+                                _, branch_logs = self.wait_event(container,
+                                    lambda e: e.get('event') == 'tick' and e.get('token') == paused['token']
+                                    and type(e.get('tick')) is int and e['tick'] > paused['tick'],
+                                    prefix=previous_logs, timeout=45)
+                                trial_checks = continuity_checks(paused, previous_logs, branch_logs,
+                                                                 ticket, self.state(container).get('Running') is True)
+                                for test_name, passed in trial_checks.items():
+                                    self.require(f'branch {trial}: {test_name}', passed)
+                                branch_delta = branch_logs[len(previous_logs):]
+                                branch_events = marker_events(branch_delta)
+                                branch_resume = next(e for e in branch_events
+                                    if e.get('event') == 'resumed' and e.get('ticket') == ticket)
+                                row['repeat_restores'].append({
+                                    'trial': trial, 'restore_s': elapsed, 'checks': trial_checks,
+                                    'resume': branch_resume, 'new_log_sha256': hashlib.sha256(branch_delta.encode()).hexdigest(),
+                                    'same_original_checkpoint': checkpoint,
+                                    'observation': 'Process state replay; post-resume wall clock and scheduling are not deterministic'})
+                                (self.root / f'branch-{trial}-events.json').write_text(
+                                    json.dumps(branch_events, indent=2) + '\n')
+                                self.say('REPEAT RESTORE RESULT | ' + json.dumps({
+                                    'trial':trial, 'checkpoint':checkpoint, 'restore_s':elapsed,
+                                    'exact_probe_words':trial_checks['all_4096_probe_words_exact'],
+                                    'execution_advances':trial_checks['execution_advances_after_resume']}))
+                            self.stage = 'fidelity'
+
                     self.report["status"] = "passed"
                     self.stage = "complete"
                 except Exception as exc:
@@ -1800,6 +1841,7 @@ jobs:
                 root=Path(td.name)
                 for f in ('self-tests.json','network-self-tests.json','setup.json','daemon-setup.json'):(root/f).write_text('{"status":"passed"}')
                 a=probe.Audit(root)
+                a._mock_disable_repeats=True  # Mock Docker has no multi-restore implementation.
                 fake=FakeAudit(root)
                 calls=[]
                 def run(label,args,timeout=90,required=False):
@@ -2238,6 +2280,71 @@ jobs:
 
         Local syntax, regression and mocked-Docker tests verify controller logic. They are not evidence that CRIU restored a real V8 process. Only the job can establish that by successfully restoring the live target and passing the subsequent continuity and namespace checks.
         EMBED_DOCUMENTATION_MD_1
+    - name: Embed fidelity_matrix.py [1/1]
+      shell: bash
+      run: |
+        set -Eeuo pipefail
+        cat > "$BUNDLE_DIR/fidelity_matrix.py" <<'EMBED_FIDELITY_MATRIX_PY_1'
+        import json, os, pathlib, statistics, sys
+        from checkpoint_probe import continuity_checks
+        root=pathlib.Path(os.environ['EVIDENCE_DIR'])
+        result={'status':'failed','version':'fidelity-matrix-1','tests':[],'limitations':[
+         'Probe-word equality is not a byte-for-byte comparison of all V8/JIT/kernel memory.',
+         'Network namespace is externally retained; it is not rewound.',
+         'Wall-clock time and thread scheduling are not deterministically replayed.',
+         'No LLM API/model state is captured; agent decision equivalence is not tested.',
+         'No mitigation variant is installed; causal mitigation effects are not tested.',
+         'No true intervention/alternative exploit action is performed; repeat restoration is not counterfactual branching.',
+         'No ASLR/CFI/MTE enable-after-checkpoint experiment is attempted; such interventions can invalidate comparisons.'
+         ]}
+        def check(name,passed,detail=None):
+         result['tests'].append({'name':name,'passed':bool(passed),'detail':detail})
+         print('FIDELITY MATRIX |',name,'PASS' if passed else 'FAIL',flush=True)
+        try:
+         report=json.loads((root/'report.json').read_text())
+         check('base_live_v8_restore_passed',report.get('status')=='passed')
+         rounds=report.get('rounds',[])
+         check('at_least_two_independent_checkpoints',len(rounds)>=2,len(rounds))
+         for row in rounds:
+          n=row['round']; paused=row['paused']; resumed=row.get('resumed',{})
+          checks=row.get('checks',{})
+          check(f'round_{n}_all_original_assertions',bool(checks) and all(checks.values()),checks)
+          check(f'round_{n}_4096_words_identical',paused.get('heap_words')==resumed.get('heap_words'))
+          check(f'round_{n}_token_tick_digest_hot_equal',all(paused.get(k)==resumed.get(k) for k in ('token','tick','digest','hot')))
+          check(f'round_{n}_checkpoint_and_restore_timing_measured',all(type(row.get(k)) in (int,float) and row[k]>0 for k in ('dump_s','restore_s')))
+          # Negative controls: a cold boot and changed state must be rejected.
+          original='V8_PROBE '+json.dumps(paused)+'\n'
+          forged=dict(resumed); forged['heap_words']=list(resumed['heap_words']); forged['heap_words'][0]^=1
+          forged_delta='V8_PROBE '+json.dumps(forged)+'\\nV8_PROBE '+json.dumps({'event':'tick','token':paused['token'],'tick':paused['tick']+1})+'\n'
+          rejected=continuity_checks(paused,original,original+forged_delta,paused['ticket'],True)
+          check(f'round_{n}_mutation_negative_control_rejected',rejected['all_4096_probe_words_exact'] is False)
+          cold_delta='V8_PROBE '+json.dumps({'event':'boot'})+'\n'+forged_delta
+          rejected_cold=continuity_checks(paused,original,original+cold_delta,paused['ticket'],True)
+          check(f'round_{n}_cold_boot_negative_control_rejected',rejected_cold['no_cold_boot_in_new_output'] is False)
+         if rounds:
+          branches=rounds[-1].get('repeat_restores',[])
+          check('three_real_restores_from_one_checkpoint',len(branches)==3,len(branches))
+          for b in branches:
+           check(f'branch_{b["trial"]}_all_runtime_assertions',bool(b.get('checks')) and all(b['checks'].values()))
+           check(f'branch_{b["trial"]}_identical_resume_state',all(b['resume'].get(k)==rounds[-1]['paused'].get(k) for k in ('token','tick','digest','hot','heap_words')))
+          if len(branches)==3:
+           result['repeat_restore_seconds']=[round(b['restore_s'],5) for b in branches]
+           result['repeat_restore_median_seconds']=statistics.median(b['restore_s'] for b in branches)
+          result['normal_dump_seconds']=[r.get('dump_s') for r in rounds]
+          result['normal_restore_seconds']=[r.get('restore_s') for r in rounds]
+         result['untested']=['agent_target_joint_state','model_sampling_variance','mitigation_on_off_causal_effect',
+          'ASLR_CFI_MTE_counterfactual_validity','full_heap_register_thread_equivalence','cross_host_portability',
+          'deterministic_clock_and_scheduler_replay','independent_action_branching']
+         result['status']='passed' if result['tests'] and all(t['passed'] for t in result['tests']) else 'failed'
+        except Exception as exc:
+         result['error']=repr(exc)
+        finally:
+         (root/'fidelity-matrix.json').write_text(json.dumps(result,indent=2)+'\n')
+         print('FIDELITY MATRIX FINAL',json.dumps({'status':result['status'],'passed':sum(t['passed'] for t in result['tests']),
+         'total':len(result['tests']),'untested':result.get('untested',[])}),flush=True)
+        sys.exit(0 if result['status']=='passed' else 1)
+        EMBED_FIDELITY_MATRIX_PY_1
+        test "$(sha256sum "$BUNDLE_DIR/fidelity_matrix.py" | cut -d ' ' -f1)" = "a301b9f00f997af00d763dd6e9b42059bc9440c30f00505d30c6239f18d2c332"
     - name: Verify every embedded byte and print the package manifest
       id: integrity
       shell: bash
@@ -2246,7 +2353,7 @@ jobs:
         python3 - <<'PYVERIFY'
         import hashlib,json,os,pathlib,sys
         root=pathlib.Path(os.environ['BUNDLE_DIR']); evidence=pathlib.Path(os.environ['EVIDENCE_DIR'])
-        expected={'netns_guard.py': 'f3e42c9f8b8a8c582eb8032d8ea622a4bc54bfd7200d774691ab219f07e4820f', 'checkpoint_probe.py': '3e646ce0d52c5faa3d43d8a4527be56285cce4b0bf077199937cc69fd9bb2771', 'build_viewer.py': '91a6ee15e3863deeea9307fa675c6ac69ffab17be6120d36741fc76295e81556', 'viewer-template.html': 'f0e324b18c0b1d206208fc3b1c0518006c4c8a3023294a5eab96b8ba8dc51b1e', 'install_criu.sh': '9f7b64296c1f1ffdc30f055f1f926d4b42a8c976291275978b6f803c27b43114', 'host_diagnostics.sh': '96cfdc39bcc6b5831c7784e140e1c62e45ba1b33ab698f53aaea7e68a0e647b2', 'report_tools.py': 'c2e4a257b22a6856f7049cb06e5bc09fe21e1050aab1c432aa676ced691e567b', 'self_tests.py': 'b6c327fd96f351d7fc102ea90dbaaa74e4e7486e448d4c941e430e296c90a545', 'network_tests.py': '39920a0f3fd84b6bb157cdc1d81767a30fcdf3e3b45f410a09c2db17c3c4b492', 'documentation.json': '6fddb1b2e975dab78dd340534adf364e75257bba77d27a5c6088afcfcba2db72', 'documentation.md': 'c54acc5bb2f0b6ffb14e3a191b4dd90d2ac497253b84b781212dd653f273f23c'}
+        expected={'netns_guard.py': 'f3e42c9f8b8a8c582eb8032d8ea622a4bc54bfd7200d774691ab219f07e4820f', 'checkpoint_probe.py': '063290b4f5086da6896ba1b8f244a4265ea84a9a338020aa5d1cf84daad7d635', 'build_viewer.py': '91a6ee15e3863deeea9307fa675c6ac69ffab17be6120d36741fc76295e81556', 'viewer-template.html': 'f0e324b18c0b1d206208fc3b1c0518006c4c8a3023294a5eab96b8ba8dc51b1e', 'install_criu.sh': '9f7b64296c1f1ffdc30f055f1f926d4b42a8c976291275978b6f803c27b43114', 'host_diagnostics.sh': '96cfdc39bcc6b5831c7784e140e1c62e45ba1b33ab698f53aaea7e68a0e647b2', 'report_tools.py': 'c2e4a257b22a6856f7049cb06e5bc09fe21e1050aab1c432aa676ced691e567b', 'self_tests.py': 'b6c327fd96f351d7fc102ea90dbaaa74e4e7486e448d4c941e430e296c90a545', 'network_tests.py': '05ddcf508cc1435e89d9d7302f20e9fb244d7409832c4a484994a2e7e46a8065', 'documentation.json': '6fddb1b2e975dab78dd340534adf364e75257bba77d27a5c6088afcfcba2db72', 'documentation.md': 'c54acc5bb2f0b6ffb14e3a191b4dd90d2ac497253b84b781212dd653f273f23c'}
         rows=[]
         for name,wanted in expected.items():
             actual=hashlib.sha256((root/name).read_bytes()).hexdigest()
@@ -2257,7 +2364,7 @@ jobs:
         (evidence/'asset-integrity.json').write_text(json.dumps(report,indent=2)+'\n')
         raise SystemExit(0 if report['status']=='passed' else 1)
         PYVERIFY
-        python3 -m py_compile "$BUNDLE_DIR/checkpoint_probe.py" "$BUNDLE_DIR/build_viewer.py" "$BUNDLE_DIR/report_tools.py" "$BUNDLE_DIR/self_tests.py" "$BUNDLE_DIR/netns_guard.py" "$BUNDLE_DIR/network_tests.py"
+        python3 -m py_compile "$BUNDLE_DIR/checkpoint_probe.py" "$BUNDLE_DIR/build_viewer.py" "$BUNDLE_DIR/report_tools.py" "$BUNDLE_DIR/self_tests.py" "$BUNDLE_DIR/netns_guard.py" "$BUNDLE_DIR/network_tests.py" "$BUNDLE_DIR/fidelity_matrix.py"
         cp "$BUNDLE_DIR"/*.py "$BUNDLE_DIR"/*.sh "$BUNDLE_DIR"/*.html "$EVIDENCE_DIR/sources/"
         cp "$BUNDLE_DIR/documentation.md" "$BUNDLE_DIR/documentation.json" "$EVIDENCE_DIR/"
         printf "=== DOCUMENTATION AND WORKAROUND RATIONALE ===\n"
@@ -2305,6 +2412,14 @@ jobs:
       run: |
         set -Eeuo pipefail
         python3 -u "$BUNDLE_DIR/checkpoint_probe.py" 2>&1 | tee "$EVIDENCE_DIR/experiment-console.log"
+    - name: Verify repeated replay, negative controls and fidelity matrix
+      id: fidelity_matrix
+      if: ${{ always() && steps.integrity.outcome == 'success' }}
+      continue-on-error: true
+      shell: bash
+      run: |
+        set -Eeuo pipefail
+        python3 -u "$BUNDLE_DIR/fidelity_matrix.py" 2>&1 | tee "$EVIDENCE_DIR/fidelity-matrix-console.log"
     - name: Summarize exact failures and collect host-side runtime evidence
       id: summary
       if: ${{ always() }}
@@ -2368,3 +2483,10 @@ jobs:
       run: |
         set -Eeuo pipefail
         python3 -u "$BUNDLE_DIR/report_tools.py" gate
+        python3 - <<'PY_FIDELITY_GATE'
+        import json, os, pathlib, sys
+        path=pathlib.Path(os.environ['EVIDENCE_DIR'])/'fidelity-matrix.json'
+        obj=json.loads(path.read_text()) if path.exists() else {'status':'missing'}
+        print('FINAL FIDELITY GATE |',obj['status'],flush=True)
+        sys.exit(0 if obj['status']=='passed' else 1)
+        PY_FIDELITY_GATE
