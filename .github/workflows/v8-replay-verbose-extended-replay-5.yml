@@ -2302,7 +2302,9 @@ jobs:
          result['tests'].append({'name':name,'passed':bool(condition),'detail':detail});print('INTERVENTION',name,'PASS' if condition else 'FAIL',flush=True)
          if not condition: raise AssertionError(name+': '+repr(detail))
         def cmd(args,timeout=120,ok=True):
+         print('FORK COMMAND',repr(args),flush=True)
          p=subprocess.run(args,text=True,capture_output=True,timeout=timeout)
+         if p.returncode: print('FORK COMMAND FAILED',p.returncode,p.stdout[-3000:],p.stderr[-3000:],flush=True)
          if ok and p.returncode: raise RuntimeError(f'{args!r} rc={p.returncode} stdout={p.stdout[-3000:]} stderr={p.stderr[-3000:]}')
          return p.stdout.strip()
         def inspect(name): return json.loads(cmd(['docker','inspect',name]))[0]
@@ -2348,7 +2350,7 @@ jobs:
         keeper='fork-keeper-'+uuid.uuid4().hex[:10]; target='fork-target-'+uuid.uuid4().hex[:10]
         workspace=root/'intervention-input';workspace.mkdir(exist_ok=True);action_file=workspace/'action.txt';action_file.write_text('control\n');(root/'fork-probe.js').write_text(js)
         try:
-         image=os.environ['IMAGE']; base=json.loads((root/'report.json').read_text()); d8=base['d8']; check('original_run_passed',base['status']=='passed')
+         image=os.environ['IMAGE']; base=json.loads((root/'report.json').read_text()); d8='/challenge/d8'; check('original_run_passed',base['status']=='passed')
          check('pinned_image',bool(re.search(r'@sha256:[a-f0-9]{64}$',image)))
          cap=base.get('d8_capabilities',{});check('d8_console_log_available',cap.get('console_log')=='function',cap)
          result['unsupported']=['external_action_intervention','joint_agent_target_state','real_exploit_trajectory','ASLR_CFI_MTE_treatment','cross_host_portability']
@@ -2394,6 +2396,11 @@ jobs:
          result['status']='passed'
         except Exception as exc:
          result['error']=repr(exc);result['traceback']=traceback.format_exc();print(result['traceback'],flush=True)
+         for name in (target,keeper):
+          p=subprocess.run(['docker','logs',name],capture_output=True,text=True)
+          (root/(name+'-failure.log')).write_text(p.stdout+'\nSTDERR\n'+p.stderr)
+          p=subprocess.run(['docker','inspect',name],capture_output=True,text=True)
+          (root/(name+'-inspect.json')).write_text(p.stdout or p.stderr)
         finally:
          for name in (target,keeper):
           subprocess.run(['docker','rm','-f',name],capture_output=True,text=True)
@@ -2485,7 +2492,7 @@ jobs:
         (evidence/'asset-integrity.json').write_text(json.dumps(report,indent=2)+'\n')
         raise SystemExit(0 if report['status']=='passed' else 1)
         PYVERIFY
-        python3 -m py_compile "$BUNDLE_DIR/intervention_suite.py" "$BUNDLE_DIR/checkpoint_probe.py" "$BUNDLE_DIR/build_viewer.py" "$BUNDLE_DIR/report_tools.py" "$BUNDLE_DIR/self_tests.py" "$BUNDLE_DIR/netns_guard.py" "$BUNDLE_DIR/network_tests.py" "$BUNDLE_DIR/fidelity_matrix.py"
+        python3 -m py_compile "$BUNDLE_DIR/checkpoint_probe.py" "$BUNDLE_DIR/build_viewer.py" "$BUNDLE_DIR/report_tools.py" "$BUNDLE_DIR/self_tests.py" "$BUNDLE_DIR/netns_guard.py" "$BUNDLE_DIR/network_tests.py" "$BUNDLE_DIR/fidelity_matrix.py"
         cp "$BUNDLE_DIR"/*.py "$BUNDLE_DIR"/*.sh "$BUNDLE_DIR"/*.html "$EVIDENCE_DIR/sources/"
         cp "$BUNDLE_DIR/documentation.md" "$BUNDLE_DIR/documentation.json" "$EVIDENCE_DIR/"
         printf "=== DOCUMENTATION AND WORKAROUND RATIONALE ===\n"
@@ -2541,7 +2548,7 @@ jobs:
       run: |
         set -Eeuo pipefail
         python3 -u "$BUNDLE_DIR/fidelity_matrix.py" 2>&1 | tee "$EVIDENCE_DIR/fidelity-matrix-console.log"
-    - name: Run 12 real same-checkpoint long-horizon V8 replay trials
+    - name: Run same-input checkpoint replay and long-horizon V8 fidelity
       id: intervention_suite
       if: ${{ always() && steps.integrity.outcome == 'success' && steps.fidelity_matrix.outcome == 'success' }}
       continue-on-error: true
@@ -2597,6 +2604,61 @@ jobs:
       run: |
         set -Eeuo pipefail
         python3 -u "$BUNDLE_DIR/report_tools.py" inventory
+    - name: Embed Pages site builder
+      if: ${{ always() }}
+      shell: bash
+      run: |
+        mkdir -p "$BUNDLE_DIR"
+        cat > "$BUNDLE_DIR/build_pages.py" <<'EMBED_PAGES_BUILDER'
+        import datetime, html, json, os, pathlib, zipfile
+        root=pathlib.Path(os.environ['EVIDENCE_DIR'])
+        site=pathlib.Path(os.environ['GITHUB_WORKSPACE'])/'pages-site'
+        site.mkdir(parents=True,exist_ok=True)
+        logfiles=sorted(p for p in root.rglob('*.log') if p.is_file() and not p.is_symlink())
+        with (site/'full-run.log').open('w',encoding='utf-8',errors='replace') as f:
+         f.write('GitHub Actions V8 checkpoint experiment\n')
+         f.write('Run: '+os.environ.get('GITHUB_RUN_ID','unknown')+'\n')
+         f.write('Generated: '+datetime.datetime.now(datetime.timezone.utc).isoformat()+'\n')
+         for p in logfiles:
+          f.write('\n'+'='*90+'\nFILE: '+str(p.relative_to(root))+'\n'+'='*90+'\n')
+          f.write(p.read_text(encoding='utf-8',errors='replace'))
+          f.write('\n')
+        with zipfile.ZipFile(site/'evidence-logs.zip','w',zipfile.ZIP_DEFLATED,compresslevel=6) as z:
+         for p in logfiles: z.write(p,'logs/'+str(p.relative_to(root)))
+         for name in ('report.json','fidelity-matrix.json','intervention-suite.json','viewer-build.json'):
+          if (root/name).exists(): z.write(root/name,name)
+        viewer=root/'trajectory-explorer.html'
+        if viewer.exists(): (site/'trajectory-explorer.html').write_bytes(viewer.read_bytes())
+        status={}
+        for name in ('report.json','fidelity-matrix.json','intervention-suite.json'):
+         try: status[name]=json.loads((root/name).read_text()).get('status','unknown')
+         except Exception: status[name]='missing'
+        (site/'status.json').write_text(json.dumps(status,indent=2)+'\n')
+        (site/'.nojekyll').touch()
+        links='<p><a href="trajectory-explorer.html">Interactive offline evidence explorer</a></p>' if viewer.exists() else ''
+        (site/'index.html').write_text('<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>V8 Checkpoint Atlas</title><style>body{font:17px system-ui;max-width:850px;margin:3rem auto;padding:0 1rem;line-height:1.6}a{color:#087e9e}code{background:#eee;padding:.15rem}</style><h1>V8 Checkpoint Atlas</h1><p>Static GitHub Pages evidence site for GitHub Actions run <code>'+html.escape(os.environ.get('GITHUB_RUN_ID','unknown'))+'</code>.</p><p><strong>Statuses:</strong> '+html.escape(json.dumps(status))+'</p>'+links+'<p><a href="full-run.log" download>Download full combined log (.log)</a></p><p><a href="evidence-logs.zip" download>Download all logs and JSON reports (.zip)</a></p><p><a href="status.json">Machine-readable status</a></p><p>GitHub Pages serves static files; it does not host a persistent CRIU process, Docker daemon, or executable backend. Evidence may contain environment details; publish only to an appropriate repository.</p></html>',encoding='utf-8')
+        print('PAGES SITE',site,'log count',len(logfiles),'size', (site/'full-run.log').stat().st_size)
+        EMBED_PAGES_BUILDER
+    - name: Build public GitHub Pages site and downloadable logs
+      if: ${{ always() }}
+      shell: bash
+      run: |
+        set -Eeuo pipefail
+        mkdir -p "$EVIDENCE_DIR"
+        python3 "$BUNDLE_DIR/build_pages.py"
+    - name: Upload downloadable full log as separate Actions artifact
+      if: ${{ always() }}
+      uses: actions/upload-artifact@v4
+      with:
+        name: v8-full-log-${{ github.run_id }}-${{ github.run_attempt }}
+        path: pages-site/full-run.log
+        retention-days: 30
+        if-no-files-found: error
+    - name: Upload GitHub Pages site artifact
+      if: ${{ always() }}
+      uses: actions/upload-pages-artifact@v3
+      with:
+        path: pages-site
     - name: Upload HTML, all logs, reports and generated sources even on failure
       if: ${{ always() }}
       uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
@@ -2622,3 +2684,20 @@ jobs:
         print('FINAL EXTENDED REPLAY GATE |',inter['status'],flush=True)
         sys.exit(0 if obj['status']=='passed' and inter['status']=='passed' else 1)
         PY_FIDELITY_GATE
+
+  deploy_pages:
+    name: Publish static evidence viewer to GitHub Pages
+    needs: feasibility
+    if: ${{ always() }}
+    runs-on: ubuntu-24.04
+    permissions:
+      pages: write
+      id-token: write
+      contents: read
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy static site
+        id: deployment
+        uses: actions/deploy-pages@v4
