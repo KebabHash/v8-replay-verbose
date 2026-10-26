@@ -1,19 +1,17 @@
-# SINGLE SELF-CONTAINED FILE. Replace .github/workflows/v8-replay-verbose.yml.
-# Revision network-fix-3: source-supported workaround for Moby #50750.
-# The dedicated namespace keeper uses --network none. The target shares ONLY
-# that keeper's namespace, not the host. Its external namespace is retained,
-# NOT checkpointed, rewound or portable. No normal-start fallback after failure.
-# All project source, tests, HTML and 19 annotated documentation references are
-# embedded here. APT, pinned CRIU source, image pull and artifact upload need Internet.
-# Scope: disposable GitHub-hosted Linux runner; this restarts Docker.
-# Raw memory images are excluded from artifacts. Offline HTML controls inspect evidence.
-# Local tests are NOT evidence of successful real Docker/CRIU restoration.
-name: V8 Checkpoint Atlas - extended-replay-5 - ultra verbose
+# Single self-contained workflow. Replace the old .github/workflows/v8-replay-verbose.yml.
+# Revision repair-6: privileged namespace checks, strict replay/oracles, genuine cold-start
+# control, valid mutation controls, complete downloadable logs, separate Pages deployment.
+# Hosted disposable x86-64 Ubuntu runner ONLY: this restarts Docker.
+# Pages is static public evidence, not a persistent execution server or live rewind API.
+# No model API secrets, raw memory images, Docker socket mount, or host-network fallback.
+# Build dependencies and pinned sources/images/actions require Internet access.
+# LOCAL TESTS ARE NOT LIVE GITHUB/DOCKER/CRIU VERIFICATION.
+name: V8 Checkpoint Atlas - repair-6 - logs and Pages
 'on':
   workflow_dispatch:
     inputs:
       restore_rounds:
-        description: Sequential real checkpoint/restore rounds (1-5)
+        description: Base checkpoint cycles (2-5; full fidelity suite requires at least 2)
         type: string
         default: '2'
       warmup_seconds:
@@ -24,12 +22,29 @@ name: V8 Checkpoint Atlas - extended-replay-5 - ultra verbose
         description: Pause window for capture (15-180 seconds). Host waits out the gate while target is stopped.
         type: string
         default: '45'
+      replay_trials:
+        description: Same-input restores of one saved checkpoint (3-100)
+        type: string
+        default: '12'
+      replay_steps:
+        description: Measured post-restore steps per trial (1-1000)
+        type: string
+        default: '250'
+      publish_pages:
+        description: Publish evidence and logs to configured GitHub Pages (public information)
+        type: boolean
+        default: true
 permissions:
   contents: read
+concurrency:
+  group: v8-checkpoint-atlas
+  cancel-in-progress: false
 jobs:
   feasibility:
     runs-on: ubuntu-24.04
     timeout-minutes: 45
+    permissions:
+      contents: read
     env:
       BUNDLE_DIR: ${{ github.workspace }}/.v8-checkpoint-atlas
       EVIDENCE_DIR: ${{ github.workspace }}/evidence
@@ -39,32 +54,34 @@ jobs:
       RESTORE_ROUNDS: ${{ inputs.restore_rounds || '2' }}
       WARMUP: ${{ inputs.warmup_seconds || '3' }}
       TIMED_GATE_SECONDS: ${{ inputs.timed_gate_seconds || '45' }}
-      FORK_TRIALS: '12'
+      FORK_TRIALS: ${{ inputs.replay_trials || '12' }}
       HEARTBEAT_SECONDS: '5'
       PYTHONUNBUFFERED: '1'
       DOCKER_CLI_EXPERIMENTAL: enabled
+      WORKFLOW_REVISION: repair-6
+      REPLAY_STEPS: ${{ inputs.replay_steps || '250' }}
+    outputs:
+      pages_artifact: ${{ steps.pages_artifact.outcome }}
     steps:
-    - name: Initialize the single-file package and evidence directory
+    - name: Initialize repair-6 and evidence paths
       id: initialize
       shell: bash
       run: |
         set -Eeuo pipefail
-        printf 'Workflow revision: network-fix-3\n'
         mkdir -p "$BUNDLE_DIR" "$EVIDENCE_DIR" "$EVIDENCE_DIR/sources"
-        printf '
-        === V8 CHECKPOINT ATLAS: SINGLE YAML, FULL CONSOLE OUTPUT ===
+        printf 'Workflow revision: repair-6
         '
-        printf 'All project code and HTML are embedded in this workflow. No checkout, pip, npm, CDN or model key is required.
+        printf 'Single YAML: source-built CRIU, live checkpoint, strict repeated replay, offline HTML, downloadable logs.
         '
-        printf 'Network is still required for APT build dependencies, pinned CRIU source, the V8 image and artifact upload.
+        printf 'No checkout or API keys. Internet is needed for APT, CRIU source, image pull, and official Actions.
         '
-        printf 'Rewind in HTML inspects evidence; it does not control a live process.
+        printf 'Disposable hosted runner only. Docker will restart. Public Pages logs must contain no secrets.
         '
-        printf 'Run: %s  attempt: %s  revision: %s
+        printf 'Run=%s attempt=%s sha=%s
         ' "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$GITHUB_SHA"
-        printf 'Evidence: %s
-        Sources: %s
-        ' "$EVIDENCE_DIR" "$BUNDLE_DIR"
+        printf 'Bundle=%s
+        Evidence=%s
+        ' "$BUNDLE_DIR" "$EVIDENCE_DIR"
     - name: Embed netns_guard.py [1/1]
       shell: bash
       run: |
@@ -166,7 +183,7 @@ jobs:
                     external_state='Loopback-only namespace retained, not rewound', host_network=False,
                     target_image_modified=False, engine_downgraded=False)
                 command = ['docker', 'create', '--name', self.name, '--network', 'none',
-                    '--label', 'v8.atlas.role=netns-keeper', '--label', 'v8.atlas.revision=network-fix-3',
+                    '--label', 'v8.atlas.role=netns-keeper', '--label', 'v8.atlas.revision=repair-6',
                     '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges',
                     '--memory', '64m', '--memory-swap', '64m', '--cpus', '0.1', '--pids-limit', '16',
                     '--restart', 'no', '--entrypoint', '/bin/sh', self.image, '-c', 'exec sleep 2147483647']
@@ -559,159 +576,171 @@ jobs:
             def logs(self, container):
                 return self.run("target-logs", ["docker", "logs", container], required=True)[1]
 
-            def wait_event(self, container, predicate, prefix="", timeout=45):
-                end = time.monotonic() + timeout
-                poll = 0
-                while time.monotonic() < end:
-                    poll += 1
-                    logs = self.logs(container)
-                    state = self.state(container)
-                    self.say(f"WAIT poll={poll} | running={state.get('Running')} | pid={state.get('Pid')} "
-                             f"| exit={state.get('ExitCode')} | oom={state.get('OOMKilled')} "
-                             f"| remaining={max(0,end-time.monotonic()):.2f}s")
-                    if state.get('Running') is not True:
-                        _, out, err = self.run('early-exit-target-output', ['docker', 'logs', container])
-                        raise RuntimeError('Target exited before required event: ' + json.dumps(state) +
-                                           '\nSTDOUT:\n' + out[-8000:] + '\nSTDERR:\n' + err[-8000:])
-                    if prefix and not logs.startswith(prefix):
         EMBED_CHECKPOINT_PROBE_PY_1
     - name: Embed checkpoint_probe.py [2/3]
       shell: bash
-      run: "set -Eeuo pipefail\ncat >> \"$BUNDLE_DIR/checkpoint_probe.py\" <<'EMBED_CHECKPOINT_PROBE_PY_2'\n             \
-        \   raise RuntimeError('Target log prefix changed; old and new output cannot be distinguished safely')\n         \
-        \   delta = logs[len(prefix):] if prefix else logs\n            matches = [e for e in marker_events(delta) if predicate(e)]\n\
-        \            if matches:\n                self.event('marker_observed', snapshot=matches[-1], polling_attempt=poll)\n\
-        \                return matches[-1], logs\n            time.sleep(0.5)\n        raise TimeoutError('Expected V8 marker\
-        \ did not appear before deadline; inspect target output and container state')\n\n    def resource_snapshot(self, container,\
-        \ reason):\n        state = self.state(container)\n        pid = state.get('Pid', 0)\n        self.event('resource_boundary',\
-        \ reason=reason, container_state=state)\n        if not isinstance(pid, int) or pid <= 0 or not state.get('Running'):\n\
-        \            self.say('No live PID: RSS is unobserved, not zero.')\n            return\n        code = r'''import\
-        \ json, pathlib, sys\npid=int(sys.argv[1]); p=pathlib.Path('/proc')/str(pid)\nstatus=(p/'status').read_text()\nvalues={line.split(':',1)[0]:line.split(':',1)[1].strip()\
-        \ for line in status.splitlines() if ':' in line}\nmem={line.split(':',1)[0]:int(line.split()[1])*1024 for line in\
-        \ pathlib.Path('/proc/meminfo').read_text().splitlines() if ':' in line}\nresult={'pid':pid,'process_status':values,'host_available_bytes':mem.get('MemAvailable')}\n\
+      run: "set -Eeuo pipefail\ncat >> \"$BUNDLE_DIR/checkpoint_probe.py\" <<'EMBED_CHECKPOINT_PROBE_PY_2'\n   \
+        \ def wait_event(self, container, predicate, prefix=\"\", timeout=45):\n        end = time.monotonic() +\
+        \ timeout\n        poll = 0\n        while time.monotonic() < end:\n            poll += 1\n            logs\
+        \ = self.logs(container)\n            state = self.state(container)\n            self.say(f\"WAIT poll={poll}\
+        \ | running={state.get('Running')} | pid={state.get('Pid')} \"\n                     f\"| exit={state.get('ExitCode')}\
+        \ | oom={state.get('OOMKilled')} \"\n                     f\"| remaining={max(0,end-time.monotonic()):.2f}s\"\
+        )\n            if state.get('Running') is not True:\n                _, out, err = self.run('early-exit-target-output',\
+        \ ['docker', 'logs', container])\n                raise RuntimeError('Target exited before required event:\
+        \ ' + json.dumps(state) +\n                                   '\\nSTDOUT:\\n' + out[-8000:] + '\\nSTDERR:\\\
+        n' + err[-8000:])\n            if prefix and not logs.startswith(prefix):\n                raise RuntimeError('Target\
+        \ log prefix changed; old and new output cannot be distinguished safely')\n            delta = logs[len(prefix):]\
+        \ if prefix else logs\n            matches = [e for e in marker_events(delta) if predicate(e)]\n       \
+        \     if matches:\n                self.event('marker_observed', snapshot=matches[-1], polling_attempt=poll)\n\
+        \                return matches[-1], logs\n            time.sleep(0.5)\n        raise TimeoutError('Expected\
+        \ V8 marker did not appear before deadline; inspect target output and container state')\n\n    def resource_snapshot(self,\
+        \ container, reason):\n        state = self.state(container)\n        pid = state.get('Pid', 0)\n      \
+        \  self.event('resource_boundary', reason=reason, container_state=state)\n        if not isinstance(pid,\
+        \ int) or pid <= 0 or not state.get('Running'):\n            self.say('No live PID: RSS is unobserved, not\
+        \ zero.')\n            return\n        code = r'''import json, pathlib, sys\npid=int(sys.argv[1]); p=pathlib.Path('/proc')/str(pid)\n\
+        status=(p/'status').read_text()\nvalues={line.split(':',1)[0]:line.split(':',1)[1].strip() for line in status.splitlines()\
+        \ if ':' in line}\nmem={line.split(':',1)[0]:int(line.split()[1])*1024 for line in pathlib.Path('/proc/meminfo').read_text().splitlines()\
+        \ if ':' in line}\nresult={'pid':pid,'process_status':values,'host_available_bytes':mem.get('MemAvailable')}\n\
         for name,key in [('VmRSS','rss_bytes'),('VmSize','virtual_bytes'),('VmHWM','peak_rss_bytes')]:\n    value=values.get(name)\n\
-        \    if value: result[key]=int(value.split()[0])*1024\nresult['cgroup']=(p/'cgroup').read_text()\nfor line in result['cgroup'].splitlines():\n\
-        \    if line.startswith('0::'):\n        cg=pathlib.Path('/sys/fs/cgroup')/line.split('::',1)[1].lstrip('/')\n   \
-        \     for name in ['memory.current','memory.peak','memory.max','memory.events','memory.swap.max']:\n            try:\
-        \ result[name]=(cg/name).read_text().strip()\n            except OSError: pass\nprint(json.dumps(result,sort_keys=True))\n\
-        '''\n        rc, out, err = self.run('process-memory-' + reason, ['sudo','python3','-c',code,str(pid)])\n        if\
-        \ rc == 0:\n            try:\n                sample = json.loads(out)\n                self.event('resource_sample',\
-        \ relative_s=round(time.monotonic()-self.monotonic_start,4),\n                           reason=reason, **sample)\n\
-        \            except ValueError:\n                self.event('resource_unavailable', reason=reason, error='Could not\
-        \ parse process-memory data')\n        else:\n            self.event('resource_unavailable', reason=reason, error=err)\n\
-        \        self.run('process-list-' + reason, ['docker','top',container,'-eo','pid,ppid,stat,etime,rss,vsz,args'])\n\
+        \    if value: result[key]=int(value.split()[0])*1024\nresult['cgroup']=(p/'cgroup').read_text()\nfor line\
+        \ in result['cgroup'].splitlines():\n    if line.startswith('0::'):\n        cg=pathlib.Path('/sys/fs/cgroup')/line.split('::',1)[1].lstrip('/')\n\
+        \        for name in ['memory.current','memory.peak','memory.max','memory.events','memory.swap.max']:\n\
+        \            try: result[name]=(cg/name).read_text().strip()\n            except OSError: pass\nprint(json.dumps(result,sort_keys=True))\n\
+        '''\n        rc, out, err = self.run('process-memory-' + reason, ['sudo','python3','-c',code,str(pid)])\n\
+        \        if rc == 0:\n            try:\n                sample = json.loads(out)\n                self.event('resource_sample',\
+        \ relative_s=round(time.monotonic()-self.monotonic_start,4),\n                           reason=reason,\
+        \ **sample)\n            except ValueError:\n                self.event('resource_unavailable', reason=reason,\
+        \ error='Could not parse process-memory data')\n        else:\n            self.event('resource_unavailable',\
+        \ reason=reason, error=err)\n        self.run('process-list-' + reason, ['docker','top',container,'-eo','pid,ppid,stat,etime,rss,vsz,args'])\n\
         \n    def wait_stopped_until(self, deadline_ms):\n        wait = max(0.0, deadline_ms / 1000.0 + 0.2 - time.time())\n\
         \        limit = time.monotonic() + wait\n        self.event('timed_gate_wait', seconds=round(wait,3), deadline_ms=deadline_ms,\n\
-        \                   explanation='Target is checkpointed and stopped. Host clock continues; this is not clock replay.')\n\
-        \        while time.monotonic() < limit:\n            remaining = limit - time.monotonic()\n            self.say(f'STOPPED\
-        \ GATE HEARTBEAT | waiting={remaining:.2f}s | no target is executing')\n            time.sleep(min(self.heartbeat_s,\
-        \ remaining))\n\n    def evidence_for_container(self, container, docker_root):\n        self.run(\"inspect-complete\"\
-        , [\"docker\", \"inspect\", container])\n        self.run(\"stats\", [\"docker\", \"stats\", \"--no-stream\", container],\
-        \ timeout=30)\n        rc, out, _ = self.run(\"container-id\", [\"docker\", \"inspect\", \"--format\", \"{{.Id}}\"\
-        , container])\n        cid = out.strip()\n        if rc != 0 or not re.fullmatch(r\"[0-9a-f]{64}\", cid):\n      \
-        \      return\n        # Copy logs and inventory only. Do NOT upload raw process-memory images.\n        collect =\
-        \ r'''\nimport json, pathlib, shutil, sys\nbase, dst = map(pathlib.Path, sys.argv[1:])\ndst.mkdir(parents=True, exist_ok=True)\n\
-        rows = []\nif base.exists():\n    for path in sorted(base.rglob('*')):\n        if path.is_file() and not path.is_symlink():\n\
-        \            rows.append({'path': str(path.relative_to(base)), 'bytes': path.stat().st_size})\n            if path.suffix\
-        \ in ('.log', '.txt'):\n                target = dst / str(path.relative_to(base)).replace('/', '__')\n          \
-        \      shutil.copyfile(path, target)\n(dst / 'inventory.json').write_text(json.dumps(rows, indent=2))\nprint(json.dumps(rows,\
-        \ indent=2))\n'''\n        self.run(\"checkpoint-inventory\", [\"sudo\", \"python3\", \"-c\", collect,\n         \
-        \           str(Path(docker_root) / \"containers\" / cid / \"checkpoints\"),\n                    str(self.root /\
-        \ \"criu-checkpoint-logs\")])\n\n    def main(self):\n        suffix = uuid.uuid4().hex[:12]\n        container =\
-        \ \"v8-criu-\" + suffix\n        guard = None\n        row = None\n        created = False\n        docker_root =\
-        \ \"/var/lib/docker\"\n        try:\n            for filename in (\"self-tests.json\", \"network-self-tests.json\"\
-        , \"setup.json\", \"daemon-setup.json\"):\n                path = self.root / filename\n                status = json.loads(path.read_text())\
-        \ if path.exists() else {\"status\": \"missing\"}\n                self.require(filename + \" succeeded\", status.get(\"\
-        status\") == \"passed\", status)\n            rounds = int(os.environ.get(\"RESTORE_ROUNDS\", \"2\"))\n          \
-        \  warmup = int(os.environ.get(\"WARMUP\", \"3\"))\n            gate = int(os.environ.get(\"TIMED_GATE_SECONDS\",\
-        \ \"45\"))\n            self.require(\"round count within bounds\", 1 <= rounds <= 5, rounds)\n            self.require(\"\
-        warmup within bounds\", 1 <= warmup <= 30, warmup)\n            self.require(\"timed gate within bounds\", 15 <= gate\
-        \ <= 180, gate)\n            image = os.environ[\"IMAGE\"]\n            self.require(\"image pinned by SHA256 digest\"\
-        , bool(re.fullmatch(r\"[^\\s]+@sha256:[0-9a-f]{64}\", image)), image)\n            self.report.update(image=image,\
-        \ requested_rounds=rounds, gate_seconds=gate,\n                               run_id=os.environ.get('GITHUB_RUN_ID','local'))\n\
-        \            self.stage = \"image_setup\"\n            self.run(\"image-pull\", [\"docker\", \"pull\", image], timeout=600,\
-        \ required=True)\n            self.run(\"image-inspect\", [\"docker\", \"image\", \"inspect\", image], required=True)\n\
-        \            docker_root = self.run(\"docker-root\", [\"docker\", \"info\", \"--format\", \"{{.DockerRootDir}}\"],\
-        \ required=True)[1].strip()\n            find_script = 'command -v d8 || find / -xdev -type f -name d8 -executable\
-        \ 2>/dev/null; true'\n            _, found, _ = self.run(\"find-d8\", [\"docker\", \"run\", \"--rm\", \"--network\"\
-        , \"none\", \"--entrypoint\", \"/bin/sh\", image, \"-c\", find_script], timeout=120, required=True)\n            candidates\
-        \ = [s.strip() for s in found.splitlines() if s.strip().startswith(\"/\") and \" \" not in s.strip()]\n          \
-        \  self.require(\"real d8 binary found\", bool(candidates), found)\n            d8 = candidates[0]\n            self.report[\"\
-        d8\"] = d8\n            options = [\"--runtime\", \"runc\", \"--network\", \"none\", \"--memory\", \"4g\", \"--memory-swap\"\
-        , \"4g\",\n                       \"--cpus\", \"2\", \"--pids-limit\", \"256\", \"--security-opt\", \"seccomp=unconfined\"\
-        ,\n                       \"--security-opt\", \"apparmor=unconfined\", \"--workdir\", str(Path(d8).parent)]\n    \
-        \        self.report[\"container_options\"] = options\n            self.run(\"d8-version\", [\"docker\", \"run\",\
-        \ \"--rm\", *options, \"--entrypoint\", d8, image, \"--version\"], required=True)\n            self.run('d8-binary-hash',\
-        \ ['docker','run','--rm','--network','none','--entrypoint','/bin/sh',image,\n                                    \
-        \  '-c','sha256sum \"$1\"; uname -a; ls -l \"$1\"','sh',d8],required=True)\n            self.stage = \"api_capabilities\"\
-        \n            rc, out, err = self.run('d8-api-capabilities', ['docker','run','--rm',*options,'--entrypoint',d8,image,'-e',CAPABILITY_JS])\n\
-        \            caps = parse_capabilities(out + \"\\n\" + err)\n            self.report['d8_capabilities'] = caps\n \
-        \           (self.root/'d8-capabilities.json').write_text(json.dumps(caps,indent=2)+'\\n')\n            self.require('real\
-        \ d8 has a supported output API', rc == 0 and\n                         (caps.get('print') == 'function' or caps.get('console_log')\
-        \ == 'function'),\n                         {'exit_code':rc,'capabilities':caps,'stdout':out,'stderr':err})\n    \
-        \        self.require('real d8 has standard typed arrays and time',\n                         caps.get('uint32array')\
-        \ == 'function' and caps.get('date_now') == 'function',caps)\n            self.event('probe_protocol', protocol='timed-gate-v1',\n\
-        \                       read_api_required=False, target_binary_modified=False,\n                       note='No shell\
-        \ read()/readline() or file API is used. A timed boundary is not deterministic clock replay.')\n            self.stage\
-        \ = \"network_fixture_setup\"\n            guard = NetworkNamespaceGuard(self, image, suffix)\n            network_mode\
-        \ = guard.start()\n            options = list(options)\n            options[options.index('--network') + 1] = network_mode\n\
-        \            self.report['container_options'] = options\n            self.report['workflow_revision'] = 'network-fix-3'\n\
-        \            self.report['limitations'].append(\n                'Network namespace is an explicitly retained loopback-only\
-        \ fixture, not restored from the checkpoint.')\n            self.event('target_network_selection', mode=network_mode,\n\
-        \                       reason='Bypass Moby #50750 new-namespace restore path without host networking')\n        \
-        \    self.stage = \"v8_start\"\n            self.run(\"container-create\", [\"docker\", \"create\", \"--name\", container,\
-        \ *options,\n                      \"--log-driver\", \"json-file\", \"--entrypoint\", d8, image, \"/tmp/v8-checkpoint-probe.js\"\
-        ], required=True)\n            created = True\n            js = self.root / \"probe.js\"\n            js.write_text(probe_source(rounds,warmup,gate))\n\
+        \                   explanation='Target is checkpointed and stopped. Host clock continues; this is not clock\
+        \ replay.')\n        while time.monotonic() < limit:\n            remaining = limit - time.monotonic()\n\
+        \            self.say(f'STOPPED GATE HEARTBEAT | waiting={remaining:.2f}s | no target is executing')\n \
+        \           time.sleep(min(self.heartbeat_s, remaining))\n\n    def evidence_for_container(self, container,\
+        \ docker_root):\n        self.run(\"inspect-complete\", [\"docker\", \"inspect\", container])\n        self.run(\"\
+        stats\", [\"docker\", \"stats\", \"--no-stream\", container], timeout=30)\n        rc, out, _ = self.run(\"\
+        container-id\", [\"docker\", \"inspect\", \"--format\", \"{{.Id}}\", container])\n        cid = out.strip()\n\
+        \        if rc != 0 or not re.fullmatch(r\"[0-9a-f]{64}\", cid):\n            return\n        # Copy logs\
+        \ and inventory only. Do NOT upload raw process-memory images.\n        collect = r'''\nimport json, pathlib,\
+        \ shutil, sys\nbase, dst = map(pathlib.Path, sys.argv[1:])\ndst.mkdir(parents=True, exist_ok=True)\nrows\
+        \ = []\nif base.exists():\n    for path in sorted(base.rglob('*')):\n        if path.is_file() and not path.is_symlink():\n\
+        \            rows.append({'path': str(path.relative_to(base)), 'bytes': path.stat().st_size})\n        \
+        \    if path.suffix in ('.log', '.txt'):\n                target = dst / str(path.relative_to(base)).replace('/',\
+        \ '__')\n                shutil.copyfile(path, target)\n(dst / 'inventory.json').write_text(json.dumps(rows,\
+        \ indent=2))\nprint(json.dumps(rows, indent=2))\n'''\n        self.run(\"checkpoint-inventory\", [\"sudo\"\
+        , \"python3\", \"-c\", collect,\n                    str(Path(docker_root) / \"containers\" / cid / \"checkpoints\"\
+        ),\n                    str(self.root / \"criu-checkpoint-logs\")])\n\n    def main(self):\n        suffix\
+        \ = uuid.uuid4().hex[:12]\n        container = \"v8-criu-\" + suffix\n        guard = None\n        row\
+        \ = None\n        created = False\n        docker_root = \"/var/lib/docker\"\n        try:\n           \
+        \ for filename in (\"self-tests.json\", \"network-self-tests.json\", \"setup.json\", \"daemon-setup.json\"\
+        ):\n                path = self.root / filename\n                status = json.loads(path.read_text()) if\
+        \ path.exists() else {\"status\": \"missing\"}\n                self.require(filename + \" succeeded\",\
+        \ status.get(\"status\") == \"passed\", status)\n            rounds = int(os.environ.get(\"RESTORE_ROUNDS\"\
+        , \"2\"))\n            warmup = int(os.environ.get(\"WARMUP\", \"3\"))\n            gate = int(os.environ.get(\"\
+        TIMED_GATE_SECONDS\", \"45\"))\n            self.require(\"round count within bounds\", 1 <= rounds <= 5,\
+        \ rounds)\n            self.require(\"warmup within bounds\", 1 <= warmup <= 30, warmup)\n            self.require(\"\
+        timed gate within bounds\", 15 <= gate <= 180, gate)\n            image = os.environ[\"IMAGE\"]\n      \
+        \      self.require(\"image pinned by SHA256 digest\", bool(re.fullmatch(r\"[^\\s]+@sha256:[0-9a-f]{64}\"\
+        , image)), image)\n            self.report.update(image=image, requested_rounds=rounds, gate_seconds=gate,\n\
+        \                               run_id=os.environ.get('GITHUB_RUN_ID','local'))\n            self.stage\
+        \ = \"image_setup\"\n            self.run(\"image-pull\", [\"docker\", \"pull\", image], timeout=600, required=True)\n\
+        \            self.run(\"image-inspect\", [\"docker\", \"image\", \"inspect\", image], required=True)\n \
+        \           docker_root = self.run(\"docker-root\", [\"docker\", \"info\", \"--format\", \"{{.DockerRootDir}}\"\
+        ], required=True)[1].strip()\n            find_script = 'command -v d8 || find / -xdev -type f -name d8\
+        \ -executable 2>/dev/null; true'\n            _, found, _ = self.run(\"find-d8\", [\"docker\", \"run\",\
+        \ \"--rm\", \"--network\", \"none\", \"--entrypoint\", \"/bin/sh\", image, \"-c\", find_script], timeout=120,\
+        \ required=True)\n            candidates = [s.strip() for s in found.splitlines() if s.strip().startswith(\"\
+        /\") and \" \" not in s.strip()]\n            self.require(\"real d8 binary found\", bool(candidates), found)\n\
+        \            d8 = candidates[0]\n            self.report[\"d8\"] = d8\n            options = [\"--runtime\"\
+        , \"runc\", \"--network\", \"none\", \"--memory\", \"4g\", \"--memory-swap\", \"4g\",\n                \
+        \       \"--cpus\", \"2\", \"--pids-limit\", \"256\", \"--security-opt\", \"seccomp=unconfined\",\n    \
+        \                   \"--security-opt\", \"apparmor=unconfined\", \"--workdir\", str(Path(d8).parent)]\n\
+        \            self.report[\"container_options\"] = options\n            self.run(\"d8-version\", [\"docker\"\
+        , \"run\", \"--rm\", *options, \"--entrypoint\", d8, image, \"--version\"], required=True)\n           \
+        \ self.run('d8-binary-hash', ['docker','run','--rm','--network','none','--entrypoint','/bin/sh',image,\n\
+        \                                      '-c','sha256sum \"$1\"; uname -a; ls -l \"$1\"','sh',d8],required=True)\n\
+        \            self.stage = \"api_capabilities\"\n            rc, out, err = self.run('d8-api-capabilities',\
+        \ ['docker','run','--rm',*options,'--entrypoint',d8,image,'-e',CAPABILITY_JS])\n            caps = parse_capabilities(out\
+        \ + \"\\n\" + err)\n            self.report['d8_capabilities'] = caps\n            (self.root/'d8-capabilities.json').write_text(json.dumps(caps,indent=2)+'\\\
+        n')\n            self.require('real d8 has a supported output API', rc == 0 and\n                      \
+        \   (caps.get('print') == 'function' or caps.get('console_log') == 'function'),\n                      \
+        \   {'exit_code':rc,'capabilities':caps,'stdout':out,'stderr':err})\n            self.require('real d8 has\
+        \ standard typed arrays and time',\n                         caps.get('uint32array') == 'function' and caps.get('date_now')\
+        \ == 'function',caps)\n            self.event('probe_protocol', protocol='timed-gate-v1',\n            \
+        \           read_api_required=False, target_binary_modified=False,\n                       note='No shell\
+        \ read()/readline() or file API is used. A timed boundary is not deterministic clock replay.')\n       \
+        \     self.stage = \"network_fixture_setup\"\n            guard = NetworkNamespaceGuard(self, image, suffix)\n\
+        \            network_mode = guard.start()\n            options = list(options)\n            options[options.index('--network')\
+        \ + 1] = network_mode\n            self.report['container_options'] = options\n            self.report['workflow_revision']\
+        \ = 'repair-6'\n            self.report['limitations'].append(\n                'Network namespace is an\
+        \ explicitly retained loopback-only fixture, not restored from the checkpoint.')\n            self.event('target_network_selection',\
+        \ mode=network_mode,\n                       reason='Bypass Moby #50750 new-namespace restore path without\
+        \ host networking')\n            self.stage = \"v8_start\"\n            self.run(\"container-create\", [\"\
+        docker\", \"create\", \"--name\", container, *options,\n                      \"--log-driver\", \"json-file\"\
+        , \"--entrypoint\", d8, image, \"/tmp/v8-checkpoint-probe.js\"], required=True)\n            created = True\n\
+        \            js = self.root / \"probe.js\"\n            js.write_text(probe_source(rounds,warmup,gate))\n\
         \            self.report[\"probe_sha256\"] = hashlib.sha256(js.read_bytes()).hexdigest()\n            self.run(\"\
-        copy-probe\", [\"docker\", \"cp\", str(js), container + \":/tmp/v8-checkpoint-probe.js\"], required=True)\n      \
-        \      self.run(\"container-start\", [\"docker\", \"start\", container], required=True)\n            self.wait_event(container,\
-        \ lambda e: e.get(\"event\") == \"tick\")\n            guard.verify('target-started', container)\n            self.resource_snapshot(container,'startup')\n\
-        \            for number in range(1, rounds + 1):\n                checkpoint = f\"round-{number}\"\n             \
-        \   self.stage = \"pause\"\n                paused, _ = self.wait_event(container, lambda e: e.get('event') == 'paused'\
-        \ and e.get('round') == number,\n                                            timeout=warmup+45)\n                ticket\
-        \ = paused.get('ticket')\n                deadline = paused.get('deadline_ms')\n                self.require(f'round\
-        \ {number}: valid timed gate', isinstance(ticket,str) and\n                             type(deadline) is int and\
-        \ deadline/1000-time.time() > 2,\n                             {'ticket':ticket,'deadline_ms':deadline,'host_now_ms':int(time.time()*1000)})\n\
-        \                row = {'round':number,'checkpoint':checkpoint,'ticket':ticket,'paused':paused,'checks':{},\n    \
-        \                   'capture_status':'not_attempted','restore_status':'not_attempted','fidelity_status':'not_reached'}\n\
-        \                self.report['rounds'].append(row)\n                self.event(\"round_start\", number=number, ticket=ticket,\
-        \ checkpoint=checkpoint)\n                self.require(f\"round {number}: alive before dump\", self.state(container).get(\"\
-        Running\") is True)\n                self.stage = \"pre_capture_namespace\"\n                guard.verify(f'round-{number}-pre-capture',\
-        \ container)\n                self.stage = \"checkpoint\"\n                row['capture_status'] = 'attempting'\n\
-        \                start = time.monotonic()\n                self.run(\"checkpoint-create\", [\"docker\", \"checkpoint\"\
-        , \"create\", container, checkpoint], timeout=180, required=True)\n                row['dump_s'] = time.monotonic()\
-        \ - start\n                row['capture_status'] = 'command_succeeded'\n                self.require(f\"round {number}:\
-        \ stopped after dump\", self.state(container).get(\"Running\") is False)\n                baseline = self.logs(container)\n\
-        \                time.sleep(0.5)\n                self.require(f\"round {number}: logs stable while stopped\", self.logs(container)\
-        \ == baseline)\n                self.require(f\"round {number}: gate did not expire before capture\",\n          \
-        \                   not any(e.get('event') == 'resumed' and e.get('ticket') == ticket for e in marker_events(baseline)),\n\
-        \                             'If false, increase timed_gate_seconds; this is not a valid pause-state capture.')\n\
-        \                (self.root / f\"round-{number}-stopped-baseline.log\").write_text(baseline)\n                self.evidence_for_container(container,\
-        \ docker_root)\n                self.stage = 'stopped_namespace_verification'\n                guard.verify(f'round-{number}-stopped')\n\
-        \                row['capture_status'] = 'passed'\n                self.stage = 'stopped_gate_wait' \n           \
-        \     self.wait_stopped_until(deadline)\n                self.stage = \"pre_restore_namespace\"\n                guard.verify(f'round-{number}-pre-restore')\n\
-        \                self.stage = \"restore\"\n                row['restore_status'] = 'attempting'\n                start\
-        \ = time.monotonic()\n                self.run(\"checkpoint-restore\", [\"docker\", \"start\", \"--checkpoint\", checkpoint,\
-        \ container], timeout=180, required=True)\n                row['restore_s'] = time.monotonic() - start\n         \
-        \       row['restore_status'] = 'command_succeeded'\n                self.require(f\"round {number}: running after\
-        \ restore\", self.state(container).get(\"Running\") is True)\n                self.stage = 'restored_namespace_verification'\n\
-        \                guard.verify(f'round-{number}-restored', container)\n                row['restore_status'] = 'passed'\n\
-        \                self.stage = \"fidelity\"\n                row['fidelity_status'] = 'checking'\n                resumed,\
-        \ _ = self.wait_event(container, lambda e: e.get(\"event\") == \"resumed\" and e.get(\"ticket\") == ticket, prefix=baseline)\n\
-        \                _, after = self.wait_event(container, lambda e: e.get(\"event\") == \"tick\" and e.get(\"tick\",\
-        \ -1) > paused[\"tick\"], prefix=baseline)\n                running = self.state(container).get(\"Running\") is True\n\
-        \                checks = continuity_checks(paused, baseline, after, ticket, running)\n                row.update(checks=checks,resumed=resumed)\n\
-        \                (self.root / f\"round-{number}-resumed.log\").write_text(after)\n                # Emit explicit\
-        \ observed values, not a success label without evidence.\n                for key in ('token','tick','digest','hot','words'):\n\
-        \                    self.say(f\"FIDELITY {key} | before={paused.get(key)!r} | after={resumed.get(key)!r}\")\n   \
-        \             bad = [i for i,(a,b) in enumerate(zip(paused.get('heap_words',[]),resumed.get('heap_words',[]))) if\
-        \ a != b]\n                self.say(f\"FIDELITY probe words | compared={len(paused.get('heap_words',[]))} | mismatching_indices={bad}\"\
-        )\n                for key, value in checks.items():\nEMBED_CHECKPOINT_PROBE_PY_2\n"
+        copy-probe\", [\"docker\", \"cp\", str(js), container + \":/tmp/v8-checkpoint-probe.js\"], required=True)\n\
+        \            self.run(\"container-start\", [\"docker\", \"start\", container], required=True)\n        \
+        \    self.wait_event(container, lambda e: e.get(\"event\") == \"tick\")\n            guard.verify('target-started',\
+        \ container)\n            self.resource_snapshot(container,'startup')\n            for number in range(1,\
+        \ rounds + 1):\n                checkpoint = f\"round-{number}\"\n                self.stage = \"pause\"\
+        \n                paused, _ = self.wait_event(container, lambda e: e.get('event') == 'paused' and e.get('round')\
+        \ == number,\n                                            timeout=warmup+45)\n                ticket = paused.get('ticket')\n\
+        \                deadline = paused.get('deadline_ms')\n                self.require(f'round {number}: valid\
+        \ timed gate', isinstance(ticket,str) and\n                             type(deadline) is int and deadline/1000-time.time()\
+        \ > 2,\n                             {'ticket':ticket,'deadline_ms':deadline,'host_now_ms':int(time.time()*1000)})\n\
+        \                row = {'round':number,'checkpoint':checkpoint,'ticket':ticket,'paused':paused,'checks':{},\n\
+        \                       'capture_status':'not_attempted','restore_status':'not_attempted','fidelity_status':'not_reached'}\n\
+        \                self.report['rounds'].append(row)\n                self.event(\"round_start\", number=number,\
+        \ ticket=ticket, checkpoint=checkpoint)\n                self.require(f\"round {number}: alive before dump\"\
+        , self.state(container).get(\"Running\") is True)\n                self.stage = \"pre_capture_namespace\"\
+        \n                guard.verify(f'round-{number}-pre-capture', container)\n                self.stage = \"\
+        checkpoint\"\n                row['capture_status'] = 'attempting'\n                start = time.monotonic()\n\
+        \                self.run(\"checkpoint-create\", [\"docker\", \"checkpoint\", \"create\", container, checkpoint],\
+        \ timeout=180, required=True)\n                row['dump_s'] = time.monotonic() - start\n              \
+        \  row['capture_status'] = 'command_succeeded'\n                self.require(f\"round {number}: stopped\
+        \ after dump\", self.state(container).get(\"Running\") is False)\n                baseline = self.logs(container)\n\
+        \                time.sleep(0.5)\n                self.require(f\"round {number}: logs stable while stopped\"\
+        , self.logs(container) == baseline)\n                self.require(f\"round {number}: gate did not expire\
+        \ before capture\",\n                             not any(e.get('event') == 'resumed' and e.get('ticket')\
+        \ == ticket for e in marker_events(baseline)),\n                             'If false, increase timed_gate_seconds;\
+        \ this is not a valid pause-state capture.')\n                (self.root / f\"round-{number}-stopped-baseline.log\"\
+        ).write_text(baseline)\n                self.evidence_for_container(container, docker_root)\n          \
+        \      self.stage = 'stopped_namespace_verification'\n                guard.verify(f'round-{number}-stopped')\n\
+        \                row['capture_status'] = 'passed'\n                self.stage = 'stopped_gate_wait' \n \
+        \               self.wait_stopped_until(deadline)\n                self.stage = \"pre_restore_namespace\"\
+        \n                guard.verify(f'round-{number}-pre-restore')\nEMBED_CHECKPOINT_PROBE_PY_2\n"
     - name: Embed checkpoint_probe.py [3/3]
       shell: bash
       run: |
         set -Eeuo pipefail
         cat >> "$BUNDLE_DIR/checkpoint_probe.py" <<'EMBED_CHECKPOINT_PROBE_PY_3'
+                        self.stage = "restore"
+                        row['restore_status'] = 'attempting'
+                        start = time.monotonic()
+                        self.run("checkpoint-restore", ["docker", "start", "--checkpoint", checkpoint, container], timeout=180, required=True)
+                        row['restore_s'] = time.monotonic() - start
+                        row['restore_status'] = 'command_succeeded'
+                        self.require(f"round {number}: running after restore", self.state(container).get("Running") is True)
+                        self.stage = 'restored_namespace_verification'
+                        guard.verify(f'round-{number}-restored', container)
+                        row['restore_status'] = 'passed'
+                        self.stage = "fidelity"
+                        row['fidelity_status'] = 'checking'
+                        resumed, _ = self.wait_event(container, lambda e: e.get("event") == "resumed" and e.get("ticket") == ticket, prefix=baseline)
+                        _, after = self.wait_event(container, lambda e: e.get("event") == "tick" and e.get("tick", -1) > paused["tick"], prefix=baseline)
+                        running = self.state(container).get("Running") is True
+                        checks = continuity_checks(paused, baseline, after, ticket, running)
+                        row.update(checks=checks,resumed=resumed)
+                        (self.root / f"round-{number}-resumed.log").write_text(after)
+                        # Emit explicit observed values, not a success label without evidence.
+                        for key in ('token','tick','digest','hot','words'):
+                            self.say(f"FIDELITY {key} | before={paused.get(key)!r} | after={resumed.get(key)!r}")
+                        bad = [i for i,(a,b) in enumerate(zip(paused.get('heap_words',[]),resumed.get('heap_words',[]))) if a != b]
+                        self.say(f"FIDELITY probe words | compared={len(paused.get('heap_words',[]))} | mismatching_indices={bad}")
+                        for key, value in checks.items():
                             self.require(f"round {number}: {key}", value)
                         row['fidelity_status'] = 'passed'
                         self.resource_snapshot(container,'restored-'+str(number))
@@ -792,7 +821,7 @@ jobs:
                     (self.root / "report.json").write_text(json.dumps(self.report, indent=2) + "\n")
                     self.say("FINAL MACHINE-READABLE REPORT\n" + json.dumps(self.report, indent=2))
                     # Keep the actionable result visible AFTER the intentionally large array dump.
-                    self.say('FINAL RESULT | revision=network-fix-3 | status=' + self.report['status'] +
+                    self.say('FINAL RESULT | revision=repair-6 | status=' + self.report['status'] +
                              ' | stage=' + self.report.get('failed_stage', self.stage))
                     for item in self.report.get('rounds', []):
                         self.say('ROUND RESULT | ' + json.dumps({k:item.get(k, 'not_reached') for k in
@@ -883,8 +912,8 @@ jobs:
             root.mkdir(parents=True, exist_ok=True)
             files, omissions, total = [], [], 0
             priorities = {'report.json': 0, 'setup.json': 1, 'daemon-setup.json': 2,
-                          'events.jsonl': 3, 'events.json': 4, 'results.json': 5}
-            paths = sorted(root.rglob('*'), key=lambda p: (priorities.get(p.name, 10), str(p)))
+                          'events.jsonl': 3, 'events.json': 4, 'results.json': 5, 'intervention-suite.json': 6, 'fidelity-matrix.json': 7}
+            paths = sorted(root.rglob('*'), key=lambda p: (priorities.get(p.name, 8 if p.name.startswith('trial-') and p.suffix=='.json' else 10), str(p)))
             for p in paths:
                 if not p.is_file() or p.is_symlink() or p.resolve() == output:
                     continue
@@ -1070,11 +1099,30 @@ jobs:
             for(const e of pending.values())add({kind:"tool",label:e.label||"Unfinished command",status:"incomplete",stage:e.stage,time:e.utc||e.time,argv:e.argv,detail:e});
             if(!events.length && Array.isArray(report.assertions))for(const a of report.assertions){trace.checks.push(a);add({kind:a.passed===false?"failure":"assertion",label:a.name||"Assertion",status:a.passed===true?"passed":a.passed===false?"failed":"unknown",stage:a.stage,detail:a});}
             for(const r of report.rounds||[]){for(const [key,val] of Object.entries(r.checks||{})){const name=`round ${r.round}: ${key}`;if(!trace.checks.some(c=>c.name===name))trace.checks.push({name,passed:val===true?true:val===false?false:null,stage:"fidelity"});}}
+        EMBED_VIEWER_TEMPLATE_HTML_2
+    - name: Embed viewer-template.html [3/4]
+      shell: bash
+      run: |
+        set -Eeuo pipefail
+        cat >> "$BUNDLE_DIR/viewer-template.html" <<'EMBED_VIEWER_TEMPLATE_HTML_3'
             if(report.status==="failed"&&!trace.nodes.some(n=>n.kind==="failure"&&n.label.startsWith("Experiment failed")))add({kind:"failure",label:"Experiment failed: "+(report.failed_stage||"unknown"),status:"failed",stage:report.failed_stage,time:report.finished_utc,stderr:report.exception||"Exception not included in imported report",detail:report});
             if(!trace.nodes.length)add({kind:"event",label:"No execution events recorded",status:"unknown",detail:report});
             if(!report.status)trace.status=trace.nodes.some(n=>n.status==="failed")?"failed":"unknown";
             trace.provenance.complete_report=report;
             data.traces.push(trace);
+          }
+          // Same-input continuations are separate lanes, not alternative-agent interventions.
+          for(const parent of [...data.traces]){
+            const rep=parent.provenance?.complete_report,dir=parent.provenance?.source_directory||"";
+            if(rep?.version!=="replay-repair-6"||!Array.isArray(rep.trials))continue;
+            for(const trial of rep.trials){
+              const file=map.get(dir+"trial-"+String(trial.trial).padStart(3,"0")+".json"),bundle=parseJSON(file);
+              if(!bundle?.events){data.warnings.push("Missing per-trial events for replay "+trial.trial);continue;}
+              const id=parent.id+"/replay-"+trial.trial;
+              const cp=parent.nodes.find(n=>n.kind==="checkpoint"&&n.status==="passed"&&n.checkpoint===trial.checkpoint);
+              const nodes=bundle.events.map((e,i)=>({id:id+"/e"+i,trace_id:id,kind:e.event==="resumed"?"restore":"event",label:e.event==="tick"?"Step "+e.step:e.event,status:trial.status==="passed"?"passed":"recorded",checkpoint:e.event==="resumed"?trial.checkpoint:null,time:Number.isFinite(e.clock_ms)?new Date(e.clock_ms).toISOString():null,snapshot:e,snapshot_source:"Fresh recorded probe event; only reported fields were measured",detail:e}));
+              data.traces.push({id,label:"Replay "+trial.trial+" / same input",status:trial.status||"incomplete",nodes,checks:Object.entries(trial.checks||{}).map(([name,passed])=>({name,passed,stage:"extended_fidelity"})),samples:[],parent:cp?{trace_id:parent.id,event_id:cp.id}:null,restore_available:false,provenance:{checkpoint_sha256:trial.checkpoint_sha256,action:"same-input-control",note:"Restores share one checkpoint and one host. No alternative agent action."}});
+            }
           }
           if(!data.traces.length)data.warnings.push("No report.json, events.jsonl, events.json, results.json, or setup report found. Select the extracted evidence folder, or a trajectory-atlas/v1 JSON session.");
           data.warnings.push(...(metadata.omissions||[]));
@@ -1085,12 +1133,6 @@ jobs:
           const d=clone(input);d.warnings=Array.isArray(d.warnings)?d.warnings:[];d.provenance=d.provenance||{};
           const ids=new Set(), allNodeIDs=new Set();
           for(const [i,t] of d.traces.entries()){
-        EMBED_VIEWER_TEMPLATE_HTML_2
-    - name: Embed viewer-template.html [3/4]
-      shell: bash
-      run: |
-        set -Eeuo pipefail
-        cat >> "$BUNDLE_DIR/viewer-template.html" <<'EMBED_VIEWER_TEMPLATE_HTML_3'
             t.id=String(t.id||"trace-"+i);if(ids.has(t.id))throw Error("Duplicate trajectory ID: "+t.id);ids.add(t.id);
             t.label=String(t.label||t.id);t.nodes=Array.isArray(t.nodes)?t.nodes:[];t.checks=Array.isArray(t.checks)?t.checks:[];t.samples=Array.isArray(t.samples)?t.samples:[];
             const nodeIDs=new Set();for(const [j,n] of t.nodes.entries()){n.id=String(n.id||t.id+"/e"+j);if(nodeIDs.has(n.id)||allNodeIDs.has(n.id))throw Error("Duplicate event ID: "+n.id);nodeIDs.add(n.id);allNodeIDs.add(n.id);n.trace_id=t.id;n.label=String(n.label||n.kind||"Event");n.kind=String(n.kind||"event");n.status=String(n.status||"unknown");if(n.kind==="checkpoint"&&n.status!=="passed")n.checkpoint=n.checkpoint||null;}
@@ -1176,6 +1218,12 @@ jobs:
          body.append(el("div",{class:"eyebrow"},(node.stage||node.kind||"event").toUpperCase()),el("div",{class:"event-title"},node.label));
          const dl=el("dl",{class:"kv"});for(const [key,val] of [["Trajectory",t.label],["Event ID",node.id],["Recorded at",node.time],["Exit code",node.exit_code],["Checkpoint",node.checkpoint]]){dl.append(el("dt",{},key),el("dd",{class:key==="Trajectory"?"":"mono"},text(val)));}body.append(dl);
          const actions=el("div",{class:"inspector-actions"});const pin=el("button",{},"Use state as reference");pin.disabled=!node.snapshot;pin.onclick=()=>{app.compareA=node.id;$("compareA").value=node.id;renderDiff();toast("Reference observation selected.");};actions.append(pin);
+        EMBED_VIEWER_TEMPLATE_HTML_3
+    - name: Embed viewer-template.html [4/4]
+      shell: bash
+      run: |
+        set -Eeuo pipefail
+        cat >> "$BUNDLE_DIR/viewer-template.html" <<'EMBED_VIEWER_TEMPLATE_HTML_4'
          const inspect=el("button",{},"Compare this state");inspect.disabled=!node.snapshot;inspect.onclick=()=>{app.compareB=node.id;$("compareB").value=node.id;renderDiff();};actions.append(inspect);
          const branch=el("button",{},"Plan branch here");branch.id="planBranch";branch.disabled=!checkpointOK(node);branch.onclick=openBranch;actions.append(branch);body.append(actions);
          const live=el("button",{disabled:"",title:"No execution backend is connected. The CI container and its checkpoints are not retained."},"Live restore unavailable");body.append(live,el("div",{class:"scope-note"},"Inspection rewind changes only your viewing position. Runtime restoration needs a retained checkpoint and a live authenticated runner. No restore command is issued from this page."));
@@ -1200,12 +1248,6 @@ jobs:
          if(!Array.isArray(aa)||!Array.isArray(bb)){$("heapCount").textContent="Not recorded";$("heapDetail").textContent="Array words missing from one or both observations; digest equality alone is not byte-for-byte evidence.";return;}
          const size=Math.max(aa.length,bb.length),group=Math.max(1,Math.ceil(size/128));let changed=0,missing=0;for(let i=0;i<size;i++){if(i>=aa.length||i>=bb.length)missing++;else if(aa[i]!==bb[i])changed++;}
          $("heapCount").textContent=`${changed} different / ${missing} missing / ${size} words`;
-        EMBED_VIEWER_TEMPLATE_HTML_3
-    - name: Embed viewer-template.html [4/4]
-      shell: bash
-      run: |
-        set -Eeuo pipefail
-        cat >> "$BUNDLE_DIR/viewer-template.html" <<'EMBED_VIEWER_TEMPLATE_HTML_4'
          for(let start=0;start<size;start+=group){const end=Math.min(size,start+group);let diff=0,unknown=0;for(let i=start;i<end;i++){if(i>=aa.length||i>=bb.length)unknown++;else if(aa[i]!==bb[i])diff++;}const label=`Words ${start}-${end-1}: ${diff} different, ${unknown} missing`;const btn=el("button",{class:"heap-cell "+(unknown?"":diff?"changed":"same"),title:label,"aria-label":label});btn.onclick=()=>{$("heapDetail").textContent=label+". "+Array.from({length:Math.min(5,end-start)},(_,j)=>`${start+j}: ${text(aa[start+j])} -> ${text(bb[start+j])}`).join("; ");};$("heapGrid").append(btn);}
          $("heapDetail").textContent=`Each square covers up to ${group} probe words. Teal: equal. Pink: differs. Gray: missing. Click for indices. These are not all V8 heap pages.`;
         }
@@ -1384,97 +1426,82 @@ jobs:
       run: |
         set -Eeuo pipefail
         cat > "$BUNDLE_DIR/report_tools.py" <<'EMBED_REPORT_TOOLS_PY_1'
-        """Summary, inventory, integrity and final fail-closed gate. Standard library only."""
+        """One aggregate verdict; publishing evidence is never scientific success."""
         import datetime
         import hashlib
-        import html
         import json
         import os
         from pathlib import Path
         import sys
-
-        ROOT = Path(os.environ.get('EVIDENCE_DIR', 'evidence'))
-        ROOT.mkdir(parents=True, exist_ok=True)
+        ROOT=Path(os.environ.get('EVIDENCE_DIR','evidence'));ROOT.mkdir(parents=True,exist_ok=True)
+        REQUIRED=('asset-integrity.json','self-tests.json','network-self-tests.json','repair-self-tests.json',
+                  'setup.json','daemon-setup.json','report.json','fidelity-matrix.json','intervention-suite.json','viewer-build.json')
 
 
         def read(name):
             try:
-                result = json.loads((ROOT / name).read_text())
-                if not isinstance(result, dict): raise ValueError('Expected a JSON object')
-                return result
-            except (OSError, ValueError) as exc:
-                return {'status': 'not_run', 'exception': str(exc)}
+                obj=json.loads((ROOT/name).read_text())
+                if not isinstance(obj,dict):raise ValueError('Expected JSON object')
+                return obj
+            except (OSError,ValueError) as exc:return {'status':'not_run','exception':str(exc)}
+
+
+        def aggregate():
+            records={n:read(n) for n in REQUIRED}
+            return {'workflow_revision':'repair-6','run_id':os.environ.get('GITHUB_RUN_ID'),
+                'sha':os.environ.get('GITHUB_SHA'),'passed':all(x.get('status')=='passed' for x in records.values()),
+                'stages':records,'scope':'finite same-host V8 and same-input replay; not counterfactual agent or mitigation outcomes',
+                'public_logs_warning':'Logs expose environment and probe data. No secrets should be added to this workload.'}
 
 
         def summary():
-            records = {n: read(n) for n in ('self-tests.json', 'network-self-tests.json', 'setup.json', 'daemon-setup.json', 'report.json')}
-            success = all(r.get('status') == 'passed' for r in records.values())
-            lines = ['# V8 checkpoint + HTML5 trajectory audit', '',
-                     '**Execution result: ' + ('PASS for this finite probe only' if success else 'NOT DEMONSTRATED') + '**', '',
-                     '| Stage | Status | Phase / error |', '|---|---|---|']
-            for name, r in records.items():
-                detail = str(r.get('last_phase', r.get('failed_stage', r.get('stage', ''))))
-                if r.get('exception'): detail += ' / ' + str(r['exception'])
-                lines.append('| ' + name + ' | ' + str(r.get('status','unknown')) + ' | ' + detail.replace('|','/').replace('\n',' ') + ' |')
-            experiment = records['report.json']
-            lines += ['', '## Explicit limits',
-                      'This uses the actual pinned V8 image and attempts live CRIU checkpoint/restore.',
-                      'The probe uses verified output APIs and a timed pause window; it does not require the removed shell read() API.',
-                      'Host time continues while the process is stopped. This does NOT claim deterministic clock replay.',
-                      'An isolated loopback-only namespace keeper stays alive across checkpoints. That external namespace is retained, not rewound.',
-                      'See documentation.md and documentation.json in the artifact for the official docs, source paths and workaround boundaries.',
-                      'Exact equality is checked for 4,096 probe words, token, counter and hot-function result, not every byte of V8/JIT/OS state.',
-                      'The model/agent, sockets, cross-host migration and alternative-agent branches are not tested.',
-                      'HTML rewind navigates recorded observations only. No live execution service is embedded.',
-                      'Checkpoint memory images and the runtime container are not retained in the downloadable artifact.',
-                      '', '## Assertions', '| Check | Result |', '|---|---|']
-            for a in experiment.get('assertions', []):
-                lines.append('| ' + str(a['name']).replace('|','/') + ' | ' + ('PASS' if a.get('passed') is True else 'FAIL') + ' |')
-            lines += ['', '## Capture / restore / fidelity', '| Round | Capture | Restore | Fidelity | Dump seconds | Restore seconds |', '|---|---|---|---|---|---|']
-            for row in experiment.get('rounds',[]):
-                lines.append(f"| {row.get('round')} | {row.get('capture_status','unknown')} | {row.get('restore_status','unknown')} | {row.get('fidelity_status','unknown')} | {row.get('dump_s','not reached')} | {row.get('restore_s','not reached')} |")
-            text = '\n'.join(lines) + '\n'
-            (ROOT/'summary.md').write_text(text)
-            (ROOT/'overall.json').write_text(json.dumps({'passed': success, 'stages': records}, indent=2)+'\n')
-            print(text, flush=True)
-            dest = os.environ.get('GITHUB_STEP_SUMMARY')
-            if dest:
-                with open(dest,'a') as f: f.write(text)
+            obj=aggregate();lines=['# V8 Checkpoint Atlas / repair-6','',
+                '**Overall experiment: '+('PASS (finite probe scope only)' if obj['passed'] else 'NOT PASSED / incomplete or failed')+'**','',
+                '| Stage | Status | Error / phase |','|---|---|---|']
+            for name,r in obj['stages'].items():
+                info=' / '.join(str(r.get(k,'')) for k in ('failed_stage','last_phase','exception','error','cleanup_error') if r.get(k))
+                lines.append('| '+name+' | '+str(r.get('status','unknown'))+' | '+info.replace('|','/').replace('\n',' ')+' |')
+            x=obj['stages']['intervention-suite.json']
+            lines+=['','## Extended replay',
+                f"Completed {len(x.get('trials',[]))} / {x.get('requested_trials','unknown')} restorations; requested horizon {x.get('horizon','unknown')} steps.",
+                'Same-input controls, not alternative actions. Real cold-start control is separate from synthetic verifier tests.',
+                '', '## Limits',
+                'Probe words, object observations, RNG output and small Wasm calculations are not full V8/JIT equivalence.',
+                'The network namespace is externally retained, not restored. Wall clock continues.',
+                'HTML rewind navigates recorded evidence; GitHub Pages is not a live CRIU control service.',
+                'Publishing reports does not turn failed or missing experiments into a pass.']
+            text='\n'.join(lines)+'\n';(ROOT/'summary.md').write_text(text);(ROOT/'overall.json').write_text(json.dumps(obj,indent=2)+'\n')
+            print(text,flush=True)
+            if os.environ.get('GITHUB_STEP_SUMMARY'):
+                with open(os.environ['GITHUB_STEP_SUMMARY'],'a') as f:f.write(text)
             return 0
 
 
         def inventory():
             rows=[]
             for p in sorted(ROOT.rglob('*')):
-                if p.is_symlink() or not p.is_file() or p.name=='artifact-manifest.json': continue
-                # Hash by streaming: verbose logs need not fit in memory.
+                if p.is_symlink() or not p.is_file() or p.name=='artifact-manifest.json':continue
                 h=hashlib.sha256()
                 with p.open('rb') as f:
-                    while chunk:=f.read(1024*1024): h.update(chunk)
-                rows.append({'path':p.relative_to(ROOT).as_posix(),'bytes':p.stat().st_size,'sha256':h.hexdigest()})
-            report={'created_utc':datetime.datetime.now(datetime.timezone.utc).isoformat(),
-                    'files':rows,'file_count':len(rows),'bytes':sum(r['bytes'] for r in rows),
-                    'manifest_excludes_itself':True,'raw_memory_images_uploaded':False}
-            (ROOT/'artifact-manifest.json').write_text(json.dumps(report,indent=2)+'\n')
-            for r in rows: print(f"ARTIFACT | {r['bytes']:>10} bytes | SHA256 {r['sha256']} | {r['path']}",flush=True)
-            print(f"ARTIFACT TOTAL | files={len(rows)} | bytes={report['bytes']}",flush=True)
-            return 0
+                    while chunk:=f.read(1048576):h.update(chunk)
+                row={'path':p.relative_to(ROOT).as_posix(),'bytes':p.stat().st_size,'sha256':h.hexdigest()};rows.append(row)
+                print(f"ARTIFACT | {row['bytes']:>10} bytes | SHA256 {row['sha256']} | {row['path']}",flush=True)
+            obj={'files':rows,'file_count':len(rows),'bytes':sum(x['bytes'] for x in rows),'manifest_excludes_itself':True,'raw_memory_images_uploaded':False}
+            (ROOT/'artifact-manifest.json').write_text(json.dumps(obj,indent=2)+'\n');return 0
 
 
         def gate():
-            required=('asset-integrity.json','self-tests.json','network-self-tests.json','setup.json','daemon-setup.json','report.json','viewer-build.json')
-            states={n:read(n) for n in required}
-            for n,r in states.items():
-                print(f"FINAL GATE {n} | status={r.get('status')} | phase={r.get('failed_stage',r.get('last_phase',''))} | error={r.get('exception','')}",flush=True)
-            ok=all(r.get('status')=='passed' for r in states.values())
-            print('PASS: finite live-V8 continuity test and HTML generation passed.' if ok else
-                  'NOT DEMONSTRATED. HTML may still be usable; report generation is not checkpoint success.',flush=True)
-            return 0 if ok else 1
-
+            obj=aggregate()
+            for n,r in obj['stages'].items():
+                print(f"FINAL GATE {n} | status={r.get('status')} | phase={r.get('failed_stage',r.get('last_phase',''))} | error={r.get('exception',r.get('error',''))} | cleanup={r.get('cleanup_error','')}",flush=True)
+                for a in r.get('assertions',r.get('tests',[])):
+                    if a.get('passed') is False:print('FAILED ASSERTION: '+json.dumps(a),flush=True)
+            print('FINAL OVERALL: '+('PASS (finite probe and same-input replay only)' if obj['passed'] else 'FAIL / NOT DEMONSTRATED. Reports may still be published.'),flush=True)
+            return 0 if obj['passed'] else 1
 
         if __name__=='__main__':
             functions={'summary':summary,'inventory':inventory,'gate':gate}
-            if len(sys.argv)!=2 or sys.argv[1] not in functions: raise SystemExit('Use summary, inventory, or gate')
+            if len(sys.argv)!=2 or sys.argv[1] not in functions:raise SystemExit('Use summary, inventory, or gate')
             raise SystemExit(functions[sys.argv[1]]())
         EMBED_REPORT_TOOLS_PY_1
     - name: Embed self_tests.py [1/1]
@@ -1896,6 +1923,12 @@ jobs:
                 self.assertEqual(create[create.index('--network')+1],'container:'+CID)
                 self.assertEqual(len(report['namespace_boundaries']),6)
                 labels=[x[0] for x in calls]
+        EMBED_NETWORK_TESTS_PY_1
+    - name: Embed network_tests.py [2/2]
+      shell: bash
+      run: |
+        set -Eeuo pipefail
+        cat >> "$BUNDLE_DIR/network_tests.py" <<'EMBED_NETWORK_TESTS_PY_2'
                 self.assertLess(labels.index('netns-keeper-start'),labels.index('container-start'))
                 self.assertLess(labels.index('checkpoint-create'),labels.index('checkpoint-restore'))
 
@@ -1914,12 +1947,6 @@ jobs:
             suite=unittest.defaultTestLoader.loadTestsFromModule(__import__(__name__))
             result=unittest.TextTestRunner(verbosity=2).run(suite)
             report={'status':'passed' if result.wasSuccessful() else 'failed',
-        EMBED_NETWORK_TESTS_PY_1
-    - name: Embed network_tests.py [2/2]
-      shell: bash
-      run: |
-        set -Eeuo pipefail
-        cat >> "$BUNDLE_DIR/network_tests.py" <<'EMBED_NETWORK_TESTS_PY_2'
                     'scope':'Mocked Docker boundary plus real controller execution; NOT a Docker/CRIU integration run.',
                     'tests_run':result.testsRun,'failures':len(result.failures),'errors':len(result.errors),
                     'skipped':len(result.skipped),'failure_details':[{'test':str(t),'traceback':e} for t,e in result.failures+result.errors]}
@@ -1928,6 +1955,715 @@ jobs:
             print('NETWORK TEST REPORT '+json.dumps(report),flush=True)
             raise SystemExit(0 if result.wasSuccessful() else 1)
         EMBED_NETWORK_TESTS_PY_2
+    - name: Embed intervention_suite.py [1/2]
+      shell: bash
+      run: |
+        set -Eeuo pipefail
+        cat > "$BUNDLE_DIR/intervention_suite.py" <<'EMBED_INTERVENTION_SUITE_PY_1'
+        """Same-input, long-horizon replay. No pretend agent/action/mitigation intervention.
+
+        Uses the proven privileged network guard. Records a real cold-start negative
+        control, exact initial/final state, every transition, and checkpoint file hashes.
+        Only the target process is restored. External namespace and clocks are not.
+        """
+        from __future__ import annotations
+        import copy
+        import hashlib
+        import json
+        import math
+        import os
+        from pathlib import Path
+        import re
+        import statistics
+        import sys
+        import time
+        import traceback
+        import uuid
+        from checkpoint_probe import Audit, marker_events
+        from netns_guard import NetworkNamespaceGuard
+
+        VERSION = 'replay-repair-6'
+        WORDS = 4096
+        LIMITATIONS = [
+            'Same-input replay, not alternative agent actions or causal mitigation experiments.',
+            'No LLM, exploit, CFI, MTE, ASLR treatment, or cross-host migration is exercised.',
+            'Finite probe words and observable computation are verified, not all V8/JIT/register state.',
+            'A retained loopback-only namespace is externally shared; its state is not rolled back.',
+            'Wall clock, kernel scheduling, and Docker log storage remain external and advancing.',
+            'Repeated restores share one checkpoint and one host; these are not independent workload samples.',
+            'Native binary is unchanged. Optional GC/Wasm features are reported separately; absent features are not passes.',
+        ]
+        PROBE_TEMPLATE = r'''"use strict";
+        const output = typeof print === 'function' ? print : (typeof console === 'object' && typeof console.log === 'function' ? console.log.bind(console) : null);
+        if(!output) throw Error('No supported output API');
+        const horizon=__HORIZON__, gateMS=__GATE_MS__;
+        const token=Array.from({length:8},()=>Math.floor(Math.random()*4294967296).toString(16).padStart(8,'0')).join('');
+        const heap=new Uint32Array(4096);
+        let seed=2166136261>>>0;
+        for(const c of token) seed=Math.imul(seed^c.charCodeAt(0),16777619)>>>0;
+        for(let i=0;i<heap.length;i++){seed=(Math.imul(seed,1664525)+1013904223)>>>0;heap[i]=seed;}
+        let tick=0,hot=0;
+        function hotFunction(x){return (Math.imul(x^0x87654321,33)+7)>>>0;}
+        function digest(){let h=2166136261>>>0;for(const w of heap)h=Math.imul(h^w,16777619)>>>0;return h.toString(16).padStart(8,'0');}
+        const objects=Array.from({length:32},(_,i)=>({id:i,value:(i*37)>>>0,label:token.slice(0,8)+'-'+i}));
+        objects[0].self=objects[0];objects[1].peer=objects[0];
+        const byID=new Map(objects.map(x=>[x.id,x]));
+        let wasmAdd=null;
+        const caps={gc:typeof gc==='function',wasm:typeof WebAssembly==='object',print:typeof print,read:typeof read};
+        if(caps.wasm){
+         const bytes=new Uint8Array([0,97,115,109,1,0,0,0,1,7,1,96,2,127,127,1,127,3,2,1,0,7,7,1,3,97,100,100,0,0,10,9,1,7,0,32,0,32,1,106,11]);
+         wasmAdd=new WebAssembly.Instance(new WebAssembly.Module(bytes)).exports.add;
+         if(wasmAdd(17,25)!==42)throw Error('Wasm arithmetic oracle failed');
+        }
+        let gcCalls=0;
+        function graphState(){return {values:objects.map(x=>x.value),labels:objects.map(x=>x.label),self:objects[0].self===objects[0],alias:objects[1].peer===objects[0],map:byID.size===32&&byID.get(0)===objects[0]};}
+        function state(){return {token,tick,digest:digest(),hot,words:4096,heap_words:Array.from(heap),graph:graphState(),wasm:wasmAdd?wasmAdd(tick,17):null};}
+        function emit(event,extra={}){output('V8_PROBE '+JSON.stringify({event,...extra}));}
+        function advance(){
+         for(let j=0;j<20000;j++){const i=(j+tick)&4095;hot=hotFunction((heap[i]+j)|0);heap[i]=(hot+(j^tick))>>>0;}
+         objects[tick&31].value=(objects[tick&31].value+tick+1)>>>0;
+         // Real transient object allocation, not a claim that the collector ran.
+         const temporary=Array.from({length:256},(_,i)=>({n:i+tick,s:'allocation-'+i}));
+         if(temporary[255].n!==255+tick)throw Error('Allocation sentinel failed');
+         tick++;
+        }
+        function delay(ms){const until=Date.now()+ms;while(Date.now()<until){}}
+        emit('boot',{token,capabilities:caps});
+        for(let i=0;i<10;i++)advance();
+        if(caps.gc){gc();gcCalls++;}
+        const ticket=token+'-shared',deadline_ms=Date.now()+gateMS;
+        emit('paused',{...state(),ticket,deadline_ms,capabilities:caps,gc_calls:gcCalls});
+        while(Date.now()<deadline_ms)delay(10);
+        emit('resumed',{...state(),ticket,clock_ms:Date.now()});
+        const random_draws=Array.from({length:16},()=>Math.random());
+        for(let step=1;step<=horizon;step++){
+         advance();if(caps.gc&&step%50===0){gc();gcCalls++;}
+         emit('tick',{token,step,tick,digest:digest(),hot,graph_values:objects.map(x=>x.value),wasm:wasmAdd?wasmAdd(tick,17):null});
+        }
+        emit('done',{...state(),ticket,steps:horizon,random_draws,gc_calls:gcCalls,clock_ms:Date.now()});
+        while(true)delay(200);
+        '''
+
+
+        def make_probe(horizon: int, gate_seconds: int) -> str:
+            if type(horizon) is not int or not 1 <= horizon <= 1000:
+                raise ValueError('horizon must be an integer from 1 to 1000')
+            if type(gate_seconds) is not int or not 15 <= gate_seconds <= 180:
+                raise ValueError('gate must be an integer from 15 to 180 seconds')
+            return PROBE_TEMPLATE.replace('__HORIZON__', str(horizon)).replace('__GATE_MS__', str(gate_seconds*1000))
+
+
+        def valid_state(s):
+            return (isinstance(s,dict) and isinstance(s.get('token'),str) and
+                bool(re.fullmatch(r'[0-9a-f]{64}',s['token'])) and type(s.get('tick')) is int and s['tick']>=0 and
+                type(s.get('hot')) is int and 0<=s['hot']<=0xffffffff and s.get('words')==WORDS and
+                isinstance(s.get('digest'),str) and bool(re.fullmatch(r'[0-9a-f]{8}',s['digest'])) and
+                isinstance(s.get('heap_words'),list) and len(s['heap_words'])==WORDS and
+                all(type(x) is int and 0<=x<=0xffffffff for x in s['heap_words']) and
+                isinstance(s.get('graph'),dict) and all(s['graph'].get(k) is True for k in ('self','alias','map')) and
+                isinstance(s['graph'].get('values'),list) and len(s['graph']['values'])==32 and
+                all(type(x) is int and 0<=x<=0xffffffff for x in s['graph']['values']) and
+                isinstance(s['graph'].get('labels'),list) and len(s['graph']['labels'])==32 and
+                all(isinstance(x,str) for x in s['graph']['labels']) and
+                (s.get('wasm') is None or type(s['wasm']) is int))
+
+
+        def checked_events(baseline, after):
+            if not after.startswith(baseline):
+                raise ValueError('Docker log prefix changed; cannot attribute new observations')
+            events=[]
+            for line in after[len(baseline):].splitlines():
+                if line.startswith('V8_PROBE '):
+                    e=json.loads(line[9:])
+                    if not isinstance(e,dict):raise ValueError('Probe event must be an object')
+                    events.append(e)
+            return events
+
+
+        def verify_trial(gate, new, horizon, reference=None):
+            resumed=[e for e in new if e.get('event')=='resumed']
+            done=[e for e in new if e.get('event')=='done']
+            ticks=[e for e in new if e.get('event')=='tick']
+            r=resumed[0] if len(resumed)==1 else {}
+            d=done[0] if len(done)==1 else {}
+            good=valid_state(gate) and valid_state(r) and valid_state(d)
+            same=lambda k:bool(good and r.get(k)==gate.get(k))
+            expected_order=['resumed']+['tick']*horizon+['done']
+            draws=d.get('random_draws',[])
+            checks={
+                'valid_complete_boundary_states':good,
+                'new_event_order_exact':[e.get('event') for e in new]==expected_order,
+                'no_cold_boot':not any(e.get('event')=='boot' for e in new),
+                'single_resume_and_done':len(resumed)==len(done)==1,
+                'same_startup_token':same('token'),
+                'same_counter_and_hot':same('tick') and same('hot'),
+                'all_4096_initial_words_exact':same('heap_words'),
+                'same_initial_digest':same('digest'),
+                'same_initial_object_graph':same('graph'),
+                'same_initial_wasm_result':same('wasm'),
+                'ticket_preserved':bool(good and r.get('ticket')==d.get('ticket')==gate.get('ticket')),
+                'all_transition_indices':len(ticks)==horizon and all(type(e.get('step')) is int and e['step']==i+1 and e.get('tick')==gate.get('tick',-999)+i+1 and e.get('token')==gate.get('token') for i,e in enumerate(ticks)),
+                'horizon_completed':bool(good and d.get('steps')==horizon and d['tick']==gate['tick']+horizon),
+                'final_token_and_graph_aliases':bool(good and d['token']==gate['token'] and d['graph']['labels']==gate['graph']['labels']),
+                'random_draws_well_formed':isinstance(draws,list) and len(draws)==16 and all(type(x) in (int,float) and math.isfinite(x) and 0<=x<1 for x in draws),
+                'final_matches_last_observed_transition':bool(good and ticks and all(d.get(k)==ticks[-1].get(k) for k in ('token','tick','digest','hot','wasm')) and d['graph']['values']==ticks[-1].get('graph_values')),
+            }
+            if reference is not None:
+                ref_done=next(e for e in reference if e.get('event')=='done')
+                checks['all_transitions_equal_to_first_restore']=ticks==[e for e in reference if e.get('event')=='tick']
+                checks['all_4096_final_words_equal_to_first_restore']=d.get('heap_words')==ref_done.get('heap_words')
+                checks['final_graph_equal_to_first_restore']=d.get('graph')==ref_done.get('graph')
+                checks['rng_stream_equal_to_first_restore']=draws==ref_done.get('random_draws')
+            return checks
+
+
+        def digest_words(words):
+            h=2166136261
+            for x in words:h=((h^x)*16777619)&0xffffffff
+            return f'{h:08x}'
+
+
+        def reference_end(gate,horizon):
+            """Independent Python arithmetic oracle for the full final array and object values."""
+            w=list(gate['heap_words']); vals=list(gate['graph']['values']); tick=gate['tick']; hot=gate['hot']
+            for _ in range(horizon):
+                for j in range(20000):
+                    i=(j+tick)&4095
+                    hot=(((((w[i]+j)&0xffffffff)^0x87654321)*33)+7)&0xffffffff
+                    w[i]=(hot+(j^tick))&0xffffffff
+                vals[tick&31]=(vals[tick&31]+tick+1)&0xffffffff
+                tick+=1
+            return {'heap_words':w,'tick':tick,'hot':hot,'digest':digest_words(w),'graph_values':vals}
+
+
+        HASH_SCRIPT=r'''import hashlib,json,pathlib,sys
+        root=pathlib.Path(sys.argv[1]); rows=[]
+        if not root.is_dir(): raise SystemExit('Checkpoint directory is absent')
+        for p in sorted(root.glob('*.img')):
+         if p.is_symlink() or not p.is_file() or p.name.startswith('stats-'):continue
+         h=hashlib.sha256()
+         with p.open('rb') as f:
+          while b:=f.read(1048576):h.update(b)
+         rows.append({'name':p.name,'bytes':p.stat().st_size,'sha256':h.hexdigest()})
+        if not rows or not any(x['name'].startswith('pages-') for x in rows):raise SystemExit('No ordinary memory pages checkpoint found')
+        blob=json.dumps(rows,sort_keys=True,separators=(',',':')).encode()
+        print(json.dumps({'files':rows,'bytes':sum(x['bytes'] for x in rows),'sha256':hashlib.sha256(blob).hexdigest()},sort_keys=True))
+        '''
+
+
+        class ExtendedReplay(Audit):
+            def __init__(self, evidence):
+                self.evidence=Path(evidence).resolve()
+                super().__init__(self.evidence/'extended-replay')
+                self.report.update(status='failed',version=VERSION,scope='same-input, same-host finite probe replay',
+                    limitations=LIMITATIONS,protocol='extended-timed-gate-v2',trials=[],unsupported=[
+                    'alternative_action_intervention','joint_agent_target_state','mitigation_effects','full_machine_state','cross_host'])
+
+            def wait_for(self,target,event,baseline='',timeout=90):
+                end=time.monotonic()+timeout
+                while time.monotonic()<end:
+                    text=self.logs(target); state=self.state(target)
+                    if not state.get('Running'):
+                        _,out,err=self.run('early-target-exit',['docker','logs',target])
+                        raise RuntimeError('Target exited: '+json.dumps(state)+'\n'+out[-4000:]+'\n'+err[-4000:])
+                    es=checked_events(baseline,text)
+                    hits=[e for e in es if e.get('event')==event]
+                    if hits:return hits[-1],text
+                    self.say(f'WAIT {event}: {len(es)} new events; {end-time.monotonic():.1f}s remain')
+                    time.sleep(.25)
+                raise TimeoutError(f'Target never emitted {event}; see target logs')
+
+            def hash_checkpoint(self,docker_root,cid,checkpoint):
+                if not re.fullmatch(r'[0-9a-f]{64}',cid) or not re.fullmatch(r'[a-z0-9-]+',checkpoint):
+                    raise ValueError('Invalid checkpoint identity')
+                path=Path(docker_root)/'containers'/cid/'checkpoints'/checkpoint
+                _,out,_=self.run('checkpoint-content-hash',['sudo','-n','python3','-c',HASH_SCRIPT,str(path)],timeout=120,required=True)
+                return json.loads(out)
+
+            def create_target(self,name,image,d8,mode,script):
+                options=['--name',name,'--runtime','runc','--network',mode,'--memory','4g','--memory-swap','4g',
+                    '--cpus','2','--pids-limit','256','--security-opt','seccomp=unconfined','--security-opt','apparmor=unconfined',
+                    '--restart','no','--log-driver','json-file','--workdir',str(Path(d8).parent),'--entrypoint',d8]
+                self.run('target-create',['docker','create',*options,image,'/tmp/extended-probe.js'],required=True)
+                self.run('copy-probe',['docker','cp',str(script),name+':/tmp/extended-probe.js'],required=True)
+                copied=self.root/(name+'-copied.js')
+                self.run('verify-probe-copy',['docker','cp',name+':/tmp/extended-probe.js',str(copied)],required=True)
+                self.require('copied probe SHA256 matches',copied.read_bytes()==script.read_bytes())
+                self.run('target-start',['docker','start',name],required=True)
+
+            def main(self):
+                suffix=uuid.uuid4().hex[:12];target='v8-extended-'+suffix;cold='v8-cold-'+suffix
+                guard=None;created=False;cold_created=False;docker_root='/var/lib/docker';checkpoint='extended-base'
+                try:
+                    self.stage='extended_setup'
+                    base=json.loads((self.evidence/'report.json').read_text())
+                    self.require('base runtime experiment passed',base.get('status')=='passed')
+                    image=os.environ['IMAGE'];self.require('same pinned image as base',base.get('image')==image and bool(re.fullmatch(r'[^\s]+@sha256:[a-f0-9]{64}',image)))
+                    d8=base.get('d8')
+                    self.require('use discovered d8, never an unverified hardcoded fallback',isinstance(d8,str) and d8.startswith('/') and '\n' not in d8,d8)
+        EMBED_INTERVENTION_SUITE_PY_1
+    - name: Embed intervention_suite.py [2/2]
+      shell: bash
+      run: |
+        set -Eeuo pipefail
+        cat >> "$BUNDLE_DIR/intervention_suite.py" <<'EMBED_INTERVENTION_SUITE_PY_2'
+                    trials=int(os.environ.get('FORK_TRIALS','12'));horizon=int(os.environ.get('REPLAY_STEPS','250'));gate_seconds=int(os.environ.get('TIMED_GATE_SECONDS','45'))
+                    self.require('trial count within range',3<=trials<=100,trials)
+                    self.report.update(image=image,d8=d8,requested_trials=trials,horizon=horizon,run_id=os.environ.get('GITHUB_RUN_ID','local')+'-extended')
+                    script=self.root/'extended-probe.js';script.write_text(make_probe(horizon,gate_seconds));script.chmod(0o644)
+                    self.report['probe_sha256']=hashlib.sha256(script.read_bytes()).hexdigest()
+                    _,docker_root,_=self.run('docker-root',['docker','info','--format','{{.DockerRootDir}}'],required=True);docker_root=docker_root.strip()
+                    guard=NetworkNamespaceGuard(self,image,suffix);mode=guard.start()
+                    self.stage='extended_start';created=True
+                    self.create_target(target,image,d8,mode,script)
+                    gate,_=self.wait_for(target,'paused',timeout=60)
+                    self.require('valid captured probe state',valid_state(gate));self.require('initial digest independently verified',gate['digest']==digest_words(gate['heap_words']))
+                    self.require('sufficient capture window',type(gate.get('deadline_ms')) is int and gate['deadline_ms']/1000-time.time()>5)
+                    guard.verify('extended-before-capture',target)
+                    self.report['gate']=gate;self.event('marker_observed',snapshot=gate)
+                    self.stage='extended_capture';start=time.monotonic()
+                    self.run('checkpoint-create',['docker','checkpoint','create',target,checkpoint],timeout=180,required=True)
+                    self.report['capture_s']=time.monotonic()-start
+                    self.require('stopped after capture',self.state(target).get('Running') is False)
+                    baseline=self.logs(target);time.sleep(.2)
+                    self.require('logs stable while stopped',self.logs(target)==baseline)
+                    self.require('capture preceded timed resume',not any(e.get('event')=='resumed' for e in marker_events(baseline)))
+                    cid=json.loads(self.run('target-id',['docker','inspect','--format','{{json .Id}}',target],required=True)[1])
+                    original_hash=self.hash_checkpoint(docker_root,cid,checkpoint);self.report['checkpoint_manifest']=original_hash
+                    guard.verify('extended-captured')
+                    self.event('capture',checkpoint=checkpoint,checkpoint_sha256=original_hash['sha256'],exact_match=True)
+                    # Real fresh process, not forged log text: it MUST fail startup-state equivalence.
+                    self.stage='cold_start_negative_control';cold_created=True
+                    self.create_target(cold,image,d8,mode,script)
+                    cold_gate,_=self.wait_for(cold,'paused',timeout=60)
+                    self.require('real cold-start state is well formed',valid_state(cold_gate))
+                    self.require('real cold-start has different startup token',cold_gate['token']!=gate['token'])
+                    self.require('real cold-start reinitializes probe words',cold_gate['heap_words']!=gate['heap_words'])
+                    self.report['negative_control']={'type':'real separate d8 process','different_token':True,'different_words':True,'token':cold_gate['token'],'digest':cold_gate['digest']}
+                    self.run('remove-cold-control',['docker','rm','-f',cold],required=True);cold_created=False
+                    self.stage='stopped_gate_wait';self.wait_stopped_until(gate['deadline_ms'])
+                    self.require('target remained stopped through wait',self.state(target).get('Running') is False)
+                    reference=None;oracle=None
+                    for number in range(1,trials+1):
+                        self.stage=f'extended_restore_{number:03d}'
+                        guard.verify(f'extended-{number:03d}-before')
+                        self.require('stopped before checkpoint restore',self.state(target).get('Running') is False)
+                        before_hash=self.hash_checkpoint(docker_root,cid,checkpoint)
+                        self.require(f'trial {number}: identical saved checkpoint bytes',before_hash==original_hash)
+                        baseline=self.logs(target);start=time.monotonic()
+                        self.run('checkpoint-restore',['docker','start','--checkpoint',checkpoint,target],timeout=180,required=True)
+                        restore_s=time.monotonic()-start
+                        self.require('running after restore',self.state(target).get('Running') is True)
+                        guard.verify(f'extended-{number:03d}-restored',target)
+                        done,after=self.wait_for(target,'done',baseline=baseline,timeout=120)
+                        new=checked_events(baseline,after)
+                        checks=verify_trial(gate,new,horizon,reference)
+                        row={'status':'pending','trial':number,'action':'same-input-control','checkpoint':checkpoint,'checkpoint_sha256':before_hash['sha256'],
+                            'restore_s':restore_s,'checks':checks,'resume':next((e for e in new if e.get('event')=='resumed'),None),'final':done}
+                        self.report['trials'].append(row)
+                        (self.root/f'trial-{number:03d}.json').write_text(json.dumps({'trial':row,'events':new},indent=2)+'\n')
+                        for k,passed in checks.items():self.require(f'trial {number}: {k}',passed)
+                        if oracle is None:
+                            self.say('Computing independent Python final-state oracle (not included in restore latency)')
+                            oracle=reference_end(gate,horizon)
+                        for k in ('heap_words','tick','hot','digest'):
+                            self.require(f'trial {number}: Python oracle {k}',done[k]==oracle[k])
+                        self.require(f'trial {number}: Python oracle graph',done['graph']['values']==oracle['graph_values'])
+                        if reference is None:reference=copy.deepcopy(new)
+                        self.event('extended_trial',trial=number,checkpoint=checkpoint,action='same-input-control',restore_s=restore_s,checks=checks,snapshot=done)
+                        self.resource_snapshot(target,f'extended-{number:03d}')
+                        self.run('stop-before-next-restore',['docker','kill',target],required=True)
+                        self.require('stopped after trial',self.state(target).get('Running') is False)
+                        self.require('checkpoint immutable after trial',self.hash_checkpoint(docker_root,cid,checkpoint)==original_hash)
+                        row['status']='passed'
+                        (self.root/f'trial-{number:03d}.json').write_text(json.dumps({'trial':row,'events':new},indent=2)+'\n')
+                        self.say(f'TRIAL {number}/{trials}: PASS | {horizon} transitions | 4096 initial and final words | restore={restore_s:.6f}s')
+                    self.report['optional_features']={'wasm':{'status':'exercised' if gate['capabilities']['wasm'] else 'not_available','scope':'small arithmetic module, not arbitrary Wasm'},
+                        'explicit_gc':{'status':'exercised' if gate['capabilities']['gc'] else 'not_available','calls_last_trial':done['gc_calls']},
+                        'jit':{'status':'not_proven','reason':'Hot calls do not establish optimizer tier or machine-code identity'}}
+                    self.report['restore_seconds']=[r['restore_s'] for r in self.report['trials']]
+                    self.report['median_restore_s']=statistics.median(self.report['restore_seconds'])
+                    self.report['status']='passed';self.stage='complete'
+                except Exception as exc:
+                    self.report.update(status='failed',failed_stage=self.stage,exception=repr(exc),traceback=traceback.format_exc())
+                    self.say(self.report['traceback']);self.event('experiment_failed',error=repr(exc))
+                finally:
+                    try:
+                        if created:
+                            self.evidence_for_container(target,docker_root)
+                            self.run('final-target-logs',['docker','logs',target])
+                        if cold_created:self.run('cold-control-cleanup',['docker','rm','-f',cold],required=True)
+                        if guard:guard.close(target if created else None)
+                    except Exception as exc:
+                        self.report['cleanup_error']=repr(exc);self.report['status']='failed';self.say('CLEANUP FAILURE '+repr(exc))
+                    if guard:self.report['external_dependencies']=guard.description()
+                    self.report.update(finished_utc=self.now(),command_count=self.index)
+                    payload=json.dumps(self.report,indent=2)+'\n'
+                    (self.root/'report.json').write_text(payload)
+                    (self.evidence/'intervention-suite.json').write_text(payload)
+                    self.say('EXTENDED REPLAY FINAL '+json.dumps({'status':self.report['status'],'requested':self.report.get('requested_trials'),
+                        'completed':len(self.report['trials']),'failed_stage':self.report.get('failed_stage'),
+                        'error':self.report.get('exception'),'cleanup_error':self.report.get('cleanup_error')}))
+                return 0 if self.report['status']=='passed' else 1
+
+
+        if __name__=='__main__':
+            raise SystemExit(ExtendedReplay(os.environ['EVIDENCE_DIR']).main())
+        EMBED_INTERVENTION_SUITE_PY_2
+    - name: Embed fidelity_matrix.py [1/1]
+      shell: bash
+      run: |
+        set -Eeuo pipefail
+        cat > "$BUNDLE_DIR/fidelity_matrix.py" <<'EMBED_FIDELITY_MATRIX_PY_1'
+        import json, os, pathlib, statistics, sys
+        from checkpoint_probe import continuity_checks
+        root=pathlib.Path(os.environ['EVIDENCE_DIR'])
+        result={'status':'failed','version':'fidelity-matrix-2','tests':[],'limitations':[
+         'Probe-word equality is not a byte-for-byte comparison of all V8/JIT/kernel memory.',
+         'Network namespace is externally retained; it is not rewound.',
+         'Wall-clock time and thread scheduling are not deterministically replayed.',
+         'No LLM API/model state is captured; agent decision equivalence is not tested.',
+         'No mitigation variant is installed; causal mitigation effects are not tested.',
+         'No true intervention/alternative exploit action is performed; repeat restoration is not counterfactual branching.',
+         'No ASLR/CFI/MTE enable-after-checkpoint experiment is attempted; such interventions can invalidate comparisons.'
+         ]}
+        def check(name,passed,detail=None):
+         result['tests'].append({'name':name,'passed':bool(passed),'detail':detail})
+         print('FIDELITY MATRIX |',name,'PASS' if passed else 'FAIL',flush=True)
+        try:
+         report=json.loads((root/'report.json').read_text())
+         check('base_live_v8_restore_passed',report.get('status')=='passed')
+         rounds=report.get('rounds',[])
+         check('at_least_two_independent_checkpoints',len(rounds)>=2,len(rounds))
+         for row in rounds:
+          n=row['round']; paused=row['paused']; resumed=row.get('resumed',{})
+          checks=row.get('checks',{})
+          check(f'round_{n}_all_original_assertions',bool(checks) and all(checks.values()),checks)
+          check(f'round_{n}_4096_words_identical',paused.get('heap_words')==resumed.get('heap_words'))
+          check(f'round_{n}_token_tick_digest_hot_equal',all(paused.get(k)==resumed.get(k) for k in ('token','tick','digest','hot')))
+          check(f'round_{n}_checkpoint_and_restore_timing_measured',all(type(row.get(k)) in (int,float) and row[k]>0 for k in ('dump_s','restore_s')))
+          # Negative controls: a cold boot and changed state must be rejected.
+          original='V8_PROBE '+json.dumps(paused)+'\n'
+          tick_line='V8_PROBE '+json.dumps({'event':'tick','token':paused['token'],'tick':paused['tick']+1})+'\n'
+          positive_delta='V8_PROBE '+json.dumps(resumed)+'\n'+tick_line
+          positive=continuity_checks(paused,original,original+positive_delta,paused['ticket'],True)
+          check(f'round_{n}_positive_fixture_is_valid',bool(positive) and all(positive.values()),positive)
+          forged=dict(resumed); forged['heap_words']=list(resumed['heap_words']); forged['heap_words'][0]^=1
+          forged_delta='V8_PROBE '+json.dumps(forged)+'\n'+tick_line
+          rejected=continuity_checks(paused,original,original+forged_delta,paused['ticket'],True)
+          check(f'round_{n}_mutation_rejected_for_word_mismatch_only',
+                rejected['all_4096_probe_words_exact'] is False and
+                all(v for k,v in rejected.items() if k!='all_4096_probe_words_exact'),rejected)
+          cold_delta='V8_PROBE '+json.dumps({'event':'boot'})+'\n'+positive_delta
+          rejected_cold=continuity_checks(paused,original,original+cold_delta,paused['ticket'],True)
+          check(f'round_{n}_cold_boot_rejected_for_boot_marker_only',
+                rejected_cold['no_cold_boot_in_new_output'] is False and
+                all(v for k,v in rejected_cold.items() if k!='no_cold_boot_in_new_output'),rejected_cold)
+         if rounds:
+          branches=rounds[-1].get('repeat_restores',[])
+          check('three_real_restores_from_one_checkpoint',len(branches)==3,len(branches))
+          for b in branches:
+           check(f'branch_{b["trial"]}_all_runtime_assertions',bool(b.get('checks')) and all(b['checks'].values()))
+           check(f'branch_{b["trial"]}_identical_resume_state',all(b['resume'].get(k)==rounds[-1]['paused'].get(k) for k in ('token','tick','digest','hot','heap_words')))
+          if len(branches)==3:
+           result['repeat_restore_seconds']=[round(b['restore_s'],5) for b in branches]
+           result['repeat_restore_median_seconds']=statistics.median(b['restore_s'] for b in branches)
+          result['normal_dump_seconds']=[r.get('dump_s') for r in rounds]
+          result['normal_restore_seconds']=[r.get('restore_s') for r in rounds]
+         result['untested']=['agent_target_joint_state','model_sampling_variance','mitigation_on_off_causal_effect',
+          'ASLR_CFI_MTE_counterfactual_validity','full_heap_register_thread_equivalence','cross_host_portability',
+          'deterministic_clock_and_scheduler_replay','independent_action_branching']
+         result['status']='passed' if result['tests'] and all(t['passed'] for t in result['tests']) else 'failed'
+        except Exception as exc:
+         result['error']=repr(exc)
+        finally:
+         (root/'fidelity-matrix.json').write_text(json.dumps(result,indent=2)+'\n')
+         print('FIDELITY MATRIX FINAL',json.dumps({'status':result['status'],'passed':sum(t['passed'] for t in result['tests']),
+         'total':len(result['tests']),'untested':result.get('untested',[])}),flush=True)
+        sys.exit(0 if result['status']=='passed' else 1)
+        EMBED_FIDELITY_MATRIX_PY_1
+    - name: Embed build_pages.py [1/1]
+      shell: bash
+      run: |
+        set -Eeuo pipefail
+        cat > "$BUNDLE_DIR/build_pages.py" <<'EMBED_BUILD_PAGES_PY_1'
+        """Publish a static evidence site plus comprehensive downloadable log files.
+        No environment dump, token, raw checkpoint .img, symlink, or runnable backend.
+        """
+        from __future__ import annotations
+        import datetime
+        import gzip
+        import hashlib
+        import html
+        import json
+        import os
+        from pathlib import Path
+        import shutil
+        import sys
+        import zipfile
+        from report_tools import aggregate
+
+        GENERATED={'full-run.log','full-run.log.gz','evidence-logs.zip','downloads.json','pages-build.json','pages-builder.log','artifact-manifest.json'}
+        TEXT_SUFFIXES={'.log','.txt','.jsonl'}
+        REPORT_SUFFIXES=TEXT_SUFFIXES|{'.json','.md','.py','.sh','.js'}
+
+
+        def safe_file(root,p):
+            try:
+                rel=p.relative_to(root)
+                return p.is_file() and not p.is_symlink() and not any((root/Path(*rel.parts[:i])).is_symlink() for i in range(1,len(rel.parts)))
+            except (OSError,ValueError):return False
+
+
+        def selected(root,suffixes):
+            return [p for p in sorted(root.rglob('*')) if safe_file(root,p) and p.name not in GENERATED and p.suffix.lower() in suffixes and p.name!='trajectory-bundle.json']
+
+
+        def sha256(path):
+            h=hashlib.sha256()
+            with path.open('rb') as f:
+                while chunk:=f.read(1048576):h.update(chunk)
+            return h.hexdigest()
+
+
+        def build(root,site):
+            root,site=Path(root).resolve(),Path(site).resolve()
+            if root==site or root in site.parents:raise ValueError('Site must be outside evidence to prevent recursive packaging')
+            root.mkdir(parents=True,exist_ok=True);site.mkdir(parents=True,exist_ok=True)
+            status=aggregate()
+            # Prefer a compact status.json: no full state arrays needed on the landing page.
+            slim={k:v for k,v in status.items() if k!='stages'}
+            slim['stages']={name:{k:r[k] for k in ('status','failed_stage','exception','error','cleanup_error') if k in r} for name,r in status['stages'].items()}
+            (root/'status.json').write_text(json.dumps(slim,indent=2)+'\n')
+            log_paths=selected(root,TEXT_SUFFIXES)
+            with (root/'full-run.log').open('w',encoding='utf-8') as f:
+                f.write('V8 Checkpoint Atlas / repair-6\n')
+                f.write('Run: '+str(os.environ.get('GITHUB_RUN_ID','unknown'))+'\n')
+                f.write('Scope: captured workflow command logs, not GitHub service-side action internals or later deployment logs.\n')
+                f.write('Grouped by source file; timestamps within files establish event order. Duplicate console/command observations are retained.\n')
+                f.write(json.dumps(slim,indent=2)+'\n')
+                for p in log_paths:
+                    f.write('\n'+'='*100+'\nFILE: '+p.relative_to(root).as_posix()+'\n'+'='*100+'\n')
+                    with p.open('r',encoding='utf-8',errors='replace') as source:
+                        while chunk:=source.read(1048576):f.write(chunk)
+                    f.write('\n')
+            with (root/'full-run.log').open('rb') as src,gzip.open(root/'full-run.log.gz','wb',compresslevel=6) as dst:shutil.copyfileobj(src,dst,1048576)
+            files=selected(root,REPORT_SUFFIXES)
+            with zipfile.ZipFile(root/'evidence-logs.zip','w',zipfile.ZIP_DEFLATED,compresslevel=6) as z:
+                for p in files:z.write(p,p.relative_to(root).as_posix())
+            downloads=[]
+            for name in ('full-run.log','full-run.log.gz','evidence-logs.zip','status.json'):
+                p=root/name;shutil.copyfile(p,site/name)
+                downloads.append({'name':name,'bytes':p.stat().st_size,'sha256':sha256(p)})
+            viewer=root/'trajectory-explorer.html'
+            has_viewer=safe_file(root,viewer)
+            if has_viewer:shutil.copyfile(viewer,site/viewer.name)
+            missing_html='' if has_viewer else '<p><strong>Viewer unavailable; use downloadable logs for the exact failure.</strong></p>'
+            outcome='PASS for this finite probe' if status['passed'] else 'FAILED or incomplete experiment'
+            rows=''.join('<tr><td>'+html.escape(n)+'</td><td>'+html.escape(str(r.get('status','unknown')))+'</td><td>'+html.escape(str(r.get('exception',r.get('error',r.get('failed_stage','')))))+'</td></tr>' for n,r in slim['stages'].items())
+            run=html.escape(str(os.environ.get('GITHUB_RUN_ID','unknown')))
+            links=''.join('<li><a download href="'+x['name']+'">'+x['name']+'</a> ('+str(x['bytes'])+' bytes)<br><code>'+x['sha256']+'</code></li>' for x in downloads)
+            explorer='<p><a class="button" href="trajectory-explorer.html">Open interactive trajectory explorer</a></p>' if has_viewer else ''
+            text='''<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="referrer" content="no-referrer"><title>V8 Checkpoint Atlas</title><style>
+        body{font:16px system-ui;max-width:1050px;margin:3rem auto;padding:0 1rem;background:#111b2a;color:#e8eef7;line-height:1.55}a{color:#72e2cb}code{font-size:12px;overflow-wrap:anywhere}table{border-collapse:collapse;width:100%}td,th{padding:.65rem;text-align:left;border-bottom:1px solid #344056;overflow-wrap:anywhere}li{margin:1rem 0}.button{display:inline-block;border:1px solid #72e2cb;padding:.6rem 1rem;border-radius:.5rem}small{color:#a8b6cb}</style></head><body><h1>V8 Checkpoint Atlas</h1>'''
+            text+='<h2>'+outcome+'</h2><p>Run '+run+' / workflow repair-6</p>'+explorer+missing_html
+            text+='<h2>Download logs</h2><ul>'+links+'</ul><h2>Experiment stages</h2><table><tr><th>Stage</th><th>Status</th><th>Detail</th></tr>'+rows+'</table>'
+            text+='<p><strong>Static evidence only.</strong> Playback and rewind navigate saved observations; no live Docker or CRIU backend is exposed. Same-input replay is not an agent/mitigation counterfactual experiment.</p><small>Logs may disclose environment details. Pages deployment success and experiment success are separate results.</small></body></html>'
+            (site/'index.html').write_text(text,encoding='utf-8');(site/'.nojekyll').touch()
+            (root/'downloads.json').write_text(json.dumps(downloads,indent=2)+'\n');shutil.copyfile(root/'downloads.json',site/'downloads.json')
+            total=sum(p.stat().st_size for p in site.rglob('*') if p.is_file())
+            if total>900*1024*1024:raise RuntimeError('Static site exceeds configured 900 MiB limit; raw diagnostics remain in evidence')
+            result={'status':'passed','site':str(site),'experiment_passed':status['passed'],'viewer_present':has_viewer,
+                'included_log_files':len(log_paths),'archive_files':len(files),'site_bytes':total,'downloads':downloads,
+                'raw_criu_memory_included':False,'static_only':True}
+            (root/'pages-build.json').write_text(json.dumps(result,indent=2)+'\n');print(json.dumps(result,indent=2),flush=True)
+            return result
+
+        if __name__=='__main__':
+            root=Path(os.environ['EVIDENCE_DIR']);site=Path(os.environ['GITHUB_WORKSPACE'])/'pages-site'
+            try:build(root,site)
+            except Exception as exc:
+                root.mkdir(parents=True,exist_ok=True);(root/'pages-build.json').write_text(json.dumps({'status':'failed','exception':repr(exc)},indent=2)+'\n');raise
+        EMBED_BUILD_PAGES_PY_1
+    - name: Embed repair_tests.py [1/1]
+      shell: bash
+      run: |
+        set -Eeuo pipefail
+        cat > "$BUNDLE_DIR/repair_tests.py" <<'EMBED_REPAIR_TESTS_PY_1'
+        """Regression tests. Mocked Docker tests are explicitly not live CRIU tests."""
+        import contextlib
+        import copy
+        import importlib
+        import io
+        import json
+        import os
+        from pathlib import Path
+        import tempfile
+        import time
+        import unittest
+        from unittest.mock import patch
+        import zipfile
+        import intervention_suite as x
+        import build_pages as pages
+        import report_tools as reports
+
+
+        def fixture(horizon=2):
+            gate={'event':'paused','token':'a'*64,'ticket':'a'*64+'-shared','tick':10,'hot':12,'words':4096,
+                'heap_words':list(range(4096)), 'graph':{'values':[i*37 for i in range(32)],'labels':['test-'+str(i) for i in range(32)],'self':True,'alias':True,'map':True},
+                'wasm':27,'deadline_ms':int(time.time()*1000)+60000,'capabilities':{'wasm':True,'gc':False}}
+            gate['digest']=x.digest_words(gate['heap_words'])
+            resume={**copy.deepcopy(gate),'event':'resumed','clock_ms':12345}
+            ticks=[];cur=copy.deepcopy(gate)
+            for i in range(horizon):
+                o=x.reference_end(cur,1);cur.update({k:o[k] for k in ('heap_words','tick','hot','digest')});cur['graph']['values']=o['graph_values'];cur['wasm']=cur['tick']+17
+                ticks.append({'event':'tick','token':cur['token'],'step':i+1,'tick':cur['tick'],'digest':cur['digest'],'hot':cur['hot'],'graph_values':list(o['graph_values']),'wasm':cur['wasm']})
+            done={**copy.deepcopy(cur),'event':'done','steps':horizon,'random_draws':[i/20 for i in range(16)],'gc_calls':0,'clock_ms':12346}
+            return gate,[resume,*ticks,done]
+
+
+        def lines(es):return ''.join('V8_PROBE '+json.dumps(e)+'\n' for e in es)
+
+
+        class VerifyTests(unittest.TestCase):
+            @classmethod
+            def setUpClass(cls):cls.g,cls.es=fixture()
+            def setUp(self):self.g=copy.deepcopy(self.g);self.es=copy.deepcopy(self.es)
+            def checks(self,reference=None):return x.verify_trial(self.g,self.es,2,reference)
+            def test_valid_probe(self):self.assertTrue(x.valid_state(self.g));self.assertTrue(all(self.checks().values()))
+            def test_invalid_horizon(self):
+                for h in [0,-1,1001,True,'2']:
+                    with self.assertRaises(ValueError):x.make_probe(h,45)
+            def test_invalid_gate(self):
+                for g in [0,14,181,False,'45']:
+                    with self.assertRaises(ValueError):x.make_probe(2,g)
+            def test_no_removed_api_dependency(self):
+                s=x.make_probe(2,15);self.assertNotIn('read(',s);self.assertNotIn('__HORIZON__',s);self.assertIn('horizon=2',s)
+            def test_initial_word_mutation(self):self.es[0]['heap_words'][0]^=1;self.assertFalse(self.checks()['all_4096_initial_words_exact'])
+            def test_invalid_word_type(self):self.es[0]['heap_words'][0]=True;self.assertFalse(self.checks()['valid_complete_boundary_states'])
+            def test_short_array(self):self.es[0]['heap_words'].pop();self.assertFalse(self.checks()['valid_complete_boundary_states'])
+            def test_restart_token(self):self.es[0]['token']='b'*64;self.assertFalse(self.checks()['same_startup_token'])
+            def test_counter_reset(self):self.es[0]['tick']=0;self.assertFalse(self.checks()['same_counter_and_hot'])
+            def test_cold_boot_marker(self):self.es.insert(0,{'event':'boot'});self.assertFalse(self.checks()['no_cold_boot'])
+            def test_duplicate_resume(self):self.es.insert(0,copy.deepcopy(self.es[0]));self.assertFalse(self.checks()['single_resume_and_done'])
+            def test_missing_final(self):self.es.pop();self.assertFalse(self.checks()['single_resume_and_done'])
+            def test_missing_transition(self):del self.es[1];self.assertFalse(self.checks()['all_transition_indices'])
+            def test_reordered_transitions(self):self.es[1],self.es[2]=self.es[2],self.es[1];self.assertFalse(self.checks()['all_transition_indices'])
+            def test_final_counter(self):self.es[-1]['tick']+=1;self.assertFalse(self.checks()['horizon_completed'])
+            def test_graph_alias(self):self.es[0]['graph']['self']=False;self.assertFalse(self.checks()['valid_complete_boundary_states'])
+            def test_ticket(self):self.es[0]['ticket']='wrong';self.assertFalse(self.checks()['ticket_preserved'])
+            def test_rng_shape(self):self.es[-1]['random_draws']=[float('nan')]*16;self.assertFalse(self.checks()['random_draws_well_formed'])
+            def test_equal_repeat(self):self.assertTrue(all(self.checks(copy.deepcopy(self.es)).values()))
+            def test_final_array_vs_reference(self):ref=copy.deepcopy(self.es);self.es[-1]['heap_words'][7]^=1;self.assertFalse(self.checks(ref)['all_4096_final_words_equal_to_first_restore'])
+            def test_rng_vs_reference(self):ref=copy.deepcopy(self.es);self.es[-1]['random_draws'][0]=.77;self.assertFalse(self.checks(ref)['rng_stream_equal_to_first_restore'])
+            def test_step_vs_reference(self):ref=copy.deepcopy(self.es);self.es[1]['digest']='12345678';self.assertFalse(self.checks(ref)['all_transitions_equal_to_first_restore'])
+            def test_strict_delta(self):b=lines([self.g]);self.assertEqual(x.checked_events(b,b+lines(self.es)),self.es)
+            def test_prefix_replaced(self):
+                with self.assertRaises(ValueError):x.checked_events('old','different')
+            def test_invalid_json(self):
+                with self.assertRaises(ValueError):x.checked_events('','V8_PROBE {bad}\n')
+            def test_old_logs_are_not_new(self):b=lines(self.es);self.assertEqual(x.checked_events(b,b),[])
+            def test_oracle(self):o=x.reference_end(self.g,2);self.assertEqual(o['heap_words'],self.es[-1]['heap_words']);self.assertEqual(x.digest_words(o['heap_words']),o['digest'])
+            def test_distinct_state_survives_warmup(self):
+                other=copy.deepcopy(self.g);other['heap_words'][0]^=1
+                self.assertNotEqual(x.reference_end(self.g,10)['heap_words'],x.reference_end(other,10)['heap_words'])
+            def test_no_direct_unprivileged_namespace_stat(self):
+                source=Path(x.__file__).read_text();self.assertNotIn('os.stat(',source);self.assertIn('NetworkNamespaceGuard(',source)
+
+
+        class OrchestrationTests(unittest.TestCase):
+            def exercise(self, fault=None):
+                with tempfile.TemporaryDirectory() as t:
+                    root=Path(t);image='cybergym/v8@sha256:'+'d'*64
+                    (root/'report.json').write_text(json.dumps({'status':'passed','image':image,'d8':'/challenge/d8'}))
+                    a=x.ExtendedReplay(root);g,es=fixture();baseline=lines([{'event':'boot','token':g['token']},g]);log=[baseline];running=[False];calls=[]
+                    a.say=lambda msg:None;a.event=lambda *args,**kw:None
+                    def cmd(label,argv,timeout=90,required=False):
+                        calls.append((label,argv))
+                        if label=='docker-root':return 0,'/var/lib/docker\n',''
+                        if label=='checkpoint-create':running[0]=False
+                        if label=='target-id':return 0,json.dumps('c'*64),''
+                        if label=='checkpoint-restore':
+                            if fault=='restore':raise RuntimeError('restore failed diagnostic')
+                            running[0]=True
+                            new=copy.deepcopy(es)
+                            if fault=='mutated':new[0]['heap_words'][0]^=1
+                            log[0]+=lines(new)
+                        if label=='stop-before-next-restore':running[0]=False
+                        return 0,'',''
+                    a.run=cmd;a.logs=lambda _:log[0];a.state=lambda _: {'Running':running[0],'Pid':333,'OOMKilled':False}
+                    a.resource_snapshot=lambda *args:None;a.evidence_for_container=lambda *args:None;a.wait_stopped_until=lambda *args:None
+                    a.hash_checkpoint=lambda *args: {'sha256':'expected','bytes':100,'files':[]}
+                    def create(*args):running[0]=True
+                    a.create_target=create
+                    def wait(target,kind,baseline='',timeout=90):
+                        if kind=='paused':
+                            value=copy.deepcopy(g)
+                            if 'cold' in target and fault!='cold':value['token']='b'*64;value['heap_words'][0]^=2;value['digest']=x.digest_words(value['heap_words'])
+                            # Cold process creation must not change original target's stopped state.
+                            if 'cold' in target:running[0]=False
+                            return value,log[0]
+                        return es[-1],log[0]
+                    a.wait_for=wait
+                    class Guard:
+                        def __init__(self,*args):pass
+                        def start(self):return 'container:'+'e'*64
+                        def verify(self,*args):return {}
+                        def close(self,*args):
+                            if fault=='cleanup':raise RuntimeError('cleanup failed')
+                        def description(self):return {'mock':True}
+                    with patch.object(x,'NetworkNamespaceGuard',Guard),patch.dict(os.environ,{'IMAGE':image,'FORK_TRIALS':'3','REPLAY_STEPS':'2','TIMED_GATE_SECONDS':'45'}),patch.object(x.time,'sleep',lambda _:None):
+                        rc=a.main()
+                    return rc,json.loads((root/'intervention-suite.json').read_text()),calls
+            def test_full_mocked_replay(self):
+                rc,r,calls=self.exercise();self.assertEqual(rc,0,r.get('exception'));self.assertEqual(len(r['trials']),3);self.assertTrue(all(t['status']=='passed' for t in r['trials']))
+                restore=[a for label,a in calls if label=='checkpoint-restore'];self.assertEqual(len(restore),3);self.assertTrue(all('--checkpoint' in a for a in restore))
+            def test_restore_failure_not_masked(self):rc,r,_=self.exercise('restore');self.assertEqual(rc,1);self.assertIn('restore failed',r['exception'])
+            def test_corrupt_restore_not_masked(self):rc,r,_=self.exercise('mutated');self.assertEqual(rc,1);self.assertIn('all_4096_initial',r['exception'])
+            def test_cold_control_must_differ(self):rc,r,_=self.exercise('cold');self.assertEqual(rc,1);self.assertIn('different startup token',r['exception'])
+            def test_cleanup_failure_is_failure(self):rc,r,_=self.exercise('cleanup');self.assertEqual(rc,1);self.assertIn('cleanup_error',r)
+
+
+        class PublishingTests(unittest.TestCase):
+            def setUp(self):
+                self.tmp=tempfile.TemporaryDirectory();self.addCleanup(self.tmp.cleanup);self.root=Path(self.tmp.name)/'evidence';self.root.mkdir();self.site=Path(self.tmp.name)/'site'
+                self.patch=patch.object(reports,'ROOT',self.root);self.patch.start();self.addCleanup(self.patch.stop)
+            def seed(self):
+                for name in reports.REQUIRED:(self.root/name).write_text(json.dumps({'status':'passed'}))
+                (self.root/'cmd.stdout.txt').write_text('stdout sentinel\n')
+                (self.root/'cmd.stderr.txt').write_text('stderr sentinel\n')
+                (self.root/'trace.jsonl').write_text('{"kind":"example"}\n')
+                (self.root/'console.log').write_text('console sentinel\n')
+                (self.root/'pages-1.img').write_bytes(b'secret memory must not publish')
+                (self.root/'symlink.log').symlink_to('/etc/passwd')
+                (self.root/'trajectory-explorer.html').write_text('<!doctype html><title>viewer</title>')
+            def build(self):
+                with contextlib.redirect_stdout(io.StringIO()):return pages.build(self.root,self.site)
+            def test_text_stderr_downloadable(self):
+                self.seed();r=self.build();text=(self.site/'full-run.log').read_text();self.assertIn('stderr sentinel',text);self.assertIn('stdout sentinel',text);self.assertIn('console sentinel',text);self.assertTrue(r['experiment_passed'])
+            def test_no_memory_or_symlinks(self):
+                self.seed();self.build()
+                with zipfile.ZipFile(self.site/'evidence-logs.zip') as z:self.assertNotIn('pages-1.img',z.namelist());self.assertNotIn('symlink.log',z.namelist());self.assertIn('cmd.stderr.txt',z.namelist())
+            def test_failed_experiment_publishes_as_failed(self):
+                self.seed();(self.root/'intervention-suite.json').write_text(json.dumps({'status':'failed','error':'<script>alert(1)</script>'}));r=self.build();self.assertFalse(r['experiment_passed']);self.assertIn('&lt;script&gt;', (self.site/'index.html').read_text());self.assertNotIn('<script>alert', (self.site/'index.html').read_text())
+            def test_missing_report_never_passes(self):self.seed();(self.root/'intervention-suite.json').unlink();self.assertFalse(self.build()['experiment_passed'])
+            def test_missing_viewer_no_dead_link(self):self.seed();(self.root/'trajectory-explorer.html').unlink();self.build();self.assertNotIn('href="trajectory-explorer.html"',(self.site/'index.html').read_text())
+            def test_no_recursive_packaging(self):
+                self.seed()
+                with self.assertRaises(ValueError):pages.build(self.root,self.root/'site')
+            def test_repeat_build_excludes_generated_logs(self):
+                self.seed();self.build();a=(self.root/'full-run.log').read_bytes();self.build();self.assertEqual(a,(self.root/'full-run.log').read_bytes())
+            def test_gate_requires_every_report(self):
+                self.seed();self.assertTrue(reports.aggregate()['passed']);(self.root/'repair-self-tests.json').unlink();self.assertFalse(reports.aggregate()['passed'])
+
+        if __name__=='__main__':
+            result=unittest.TextTestRunner(verbosity=2).run(unittest.defaultTestLoader.loadTestsFromModule(__import__(__name__)))
+            obj={'status':'passed' if result.wasSuccessful() else 'failed','scope':'Python verifier, mocked Docker orchestration, and real local file/report generation. NOT live CRIU.',
+                'tests_run':result.testsRun,'failures':len(result.failures),'errors':len(result.errors),'skipped':len(result.skipped),
+                'details':[{'test':str(t),'traceback':e} for t,e in result.failures+result.errors]}
+            root=Path(os.environ.get('EVIDENCE_DIR','evidence'));root.mkdir(parents=True,exist_ok=True);(root/'repair-self-tests.json').write_text(json.dumps(obj,indent=2)+'\n')
+            print(json.dumps(obj,indent=2));raise SystemExit(0 if result.wasSuccessful() else 1)
+        EMBED_REPAIR_TESTS_PY_1
     - name: Embed documentation.json [1/1]
       shell: bash
       run: |
@@ -1935,7 +2671,7 @@ jobs:
         cat > "$BUNDLE_DIR/documentation.json" <<'EMBED_DOCUMENTATION_JSON_1'
         {
           "reviewed_on": "2026-10-26",
-          "workflow_revision": "network-fix-3",
+          "workflow_revision": "repair-6",
           "coverage": "Relevant official documentation, upstream issues and versioned implementation; not an exhaustive archive of all related literature.",
           "diagnosis": "The observed error matches Moby #50750. The patch selects a pre-existing network namespace instead of the failing new-namespace initialization path.",
           "evidence_status": "Source-supported workaround. Live Docker/CRIU integration must still be established by the job.",
@@ -2086,7 +2822,31 @@ jobs:
               "kind": "official_documentation",
               "source_support": "Artifacts retain generated reports and output files from workflow runs.",
               "workflow_application": "Upload the HTML and diagnostic evidence after both success and failure. Raw memory images remain excluded."
+            },
+            {
+              "title": "Linux namespace access permissions",
+              "url": "https://man7.org/linux/man-pages/man7/namespaces.7.html",
+              "kind": "official_documentation",
+              "source_support": "Namespace symlink reads are ptrace access checked; unprivileged host reads may fail.",
+              "workflow_application": "Reuse guarded sudo readlink/nsenter rather than os.stat from the unprivileged runner."
+            },
+            {
+              "title": "GitHub custom Pages workflows",
+              "url": "https://docs.github.com/en/pages/getting-started-with-github-pages/using-custom-workflows-with-github-pages",
+              "kind": "official_documentation",
+              "source_support": "Pages requires a Pages artifact, deployment job, pages/id-token permissions and environment.",
+              "workflow_application": "Separate deployment even after a failed experiment, contingent on successful artifact upload."
             }
+          ],
+          "repairs": [
+            "Extended suite uses the already-validated sudo namespace guard.",
+            "Copied scripts are mode 0644; bytes are read back and compared before startup.",
+            "Every trial uses the same checkpoint, whose image files are content-hashed before and after.",
+            "Independent Python oracle checks final tracked words and graph values.",
+            "A real cold-start negative control is distinct from synthetic verifier mutation controls.",
+            "Probe arithmetic update is bijective per word so it does not erase initial-array differences.",
+            "All command .stdout.txt/.stderr.txt, logs and JSONL streams are retained in downloadable packages.",
+            "Pages deployment is separately gated on artifact upload, not on scientific success."
           ]
         }
         EMBED_DOCUMENTATION_JSON_1
@@ -2095,431 +2855,229 @@ jobs:
       run: |
         set -Eeuo pipefail
         cat > "$BUNDLE_DIR/documentation.md" <<'EMBED_DOCUMENTATION_MD_1'
-        # V8 checkpoint network restore: documentation and rationale
+        # V8 Checkpoint Atlas / repair-6
 
-        Revision: **network-fix-3**. Reviewed: **2026-10-26**.
+        ## Repair scope
 
-        Relevant official documentation, upstream issues and versioned implementation; not an exhaustive archive of all related literature.
+        - Extended suite uses the already-validated sudo namespace guard.
+        - Copied scripts are mode 0644; bytes are read back and compared before startup.
+        - Every trial uses the same checkpoint, whose image files are content-hashed before and after.
+        - Independent Python oracle checks final tracked words and graph values.
+        - A real cold-start negative control is distinct from synthetic verifier mutation controls.
+        - Probe arithmetic update is bijective per word so it does not erase initial-array differences.
+        - All command .stdout.txt/.stderr.txt, logs and JSONL streams are retained in downloadable packages.
+        - Pages deployment is separately gated on artifact upload, not on scientific success.
 
-        ## What the previous run establishes
+        ## Boundaries
 
-        The supplied log records a successful live checkpoint followed by a failed Docker restore:
-        ```text
-        bind-mount /proc/0/ns/net -> /var/run/docker/netns/...: no such file or directory
-        ```
+        Same-input replay only. No agent action, mitigation effect, full VM equivalence or active web backend is claimed. Repeated restores are correlated samples from one checkpoint. Optional GC and Wasm capabilities are reported honestly.
 
-        ## Source-supported workflow correction
+        Pages is public static hosting. The repository owner must select Settings > Pages > Source > GitHub Actions. The dispatch input can disable publication; downloadable Actions artifacts remain. No secrets should be added.
 
-        Start an inert, dedicated container with `--network none`. Create the V8 target with `--network container:<keeper-full-ID>` from its first launch. Retain the keeper during capture, the stopped interval and restoration. Verify its PID, start time, namespace inode, loopback-only interfaces and IPv4/IPv6 routing. Verify the restored target joins exactly that namespace. Remove the target before removing the keeper.
+        ## Sources
 
-        Docker 28.0.4 only runs the failing SetKey branch for an empty OCI network namespace path. Container-sharing supplies a nonempty path. runc already has external namespace capture/restore handling. These sources support the workaround; they do not prove this workflow succeeds on an untested runner.
-
-        ## Explicit boundaries
-
-        - Single-host live d8 process, not a VM snapshot.
-        - Namespace keeper remains running and is not checkpointed or rewound.
-        - No socket traffic, agent provider state, cross-host migration or deterministic clock replay is tested.
-        - Post-restore checks compare finite observations, not every byte of V8/JIT/kernel state.
-        - Static HTML rewind is inspection, not an active restoration service.
-        - Ordinary startup after failed restore is forbidden; host networking and runtime downgrades are not automatic fallbacks.
-
-        ## Documentation map
-
-        ### 1. Moby restore regression #50750
+        ### Moby restore regression #50750
         https://github.com/moby/moby/issues/50750
 
-        Type: upstream_issue.
-        **Source supports:** Exact /proc/0/ns/net error reported with Docker 28+. The issue is not evidence that every runtime combination is fixed.
+        Exact /proc/0/ns/net error reported with Docker 28+. The issue is not evidence that every runtime combination is fixed.
 
-        **Application:** Motivates bypassing the new-namespace initialization path, rather than changing the working V8 probe or CRIU build.
+        Applied here: Motivates bypassing the new-namespace initialization path, rather than changing the working V8 probe or CRIU build.
 
-        ### 2. containerd issue #12141
+        ### containerd issue #12141
         https://github.com/containerd/containerd/issues/12141
 
-        Type: upstream_issue.
-        **Source supports:** Related checkpoint/restore failure discussed in containerd; points back to Docker/Moby namespace handling.
+        Related checkpoint/restore failure discussed in containerd; points back to Docker/Moby namespace handling.
 
-        **Application:** Cross-reference only. Closing an issue is not proof of a shipped fix.
+        Applied here: Cross-reference only. Closing an issue is not proof of a shipped fix.
 
-        ### 3. Moby v28.0.4 task initialization
+        ### Moby v28.0.4 task initialization
         https://raw.githubusercontent.com/moby/moby/v28.0.4/daemon/start_linux.go
 
-        Type: versioned_source.
-        **Source supports:** initializeCreatedTask uses /proc/<task PID>/ns/net when the OCI network namespace has an empty path.
+        initializeCreatedTask uses /proc/<task PID>/ns/net when the OCI network namespace has an empty path.
 
-        **Application:** An explicit pre-existing namespace path bypasses this particular SetKey branch. This is the central source-level rationale.
+        Applied here: An explicit pre-existing namespace path bypasses this particular SetKey branch. This is the central source-level rationale.
 
-        ### 4. Moby v28.0.4 OCI namespace construction
+        ### Moby v28.0.4 OCI namespace construction
         https://raw.githubusercontent.com/moby/moby/v28.0.4/daemon/oci_linux.go
 
-        Type: versioned_source.
-        **Source supports:** The container network mode populates the OCI namespace path from the referenced container PID.
+        The container network mode populates the OCI namespace path from the referenced container PID.
 
-        **Application:** Create the target with --network container:<keeper ID> BEFORE its first start and checkpoint, not only during restore.
+        Applied here: Create the target with --network container:<keeper ID> BEFORE its first start and checkpoint, not only during restore.
 
-        ### 5. Moby v28.0.4 network lifecycle
+        ### Moby v28.0.4 network lifecycle
         https://raw.githubusercontent.com/moby/moby/v28.0.4/daemon/container_operations.go
 
-        Type: versioned_source.
-        **Source supports:** Container-network mode shares an existing network stack instead of allocating an independent Docker network sandbox.
+        Container-network mode shares an existing network stack instead of allocating an independent Docker network sandbox.
 
-        **Application:** Keep the namespace owner running and remove it only after the target is removed.
+        Applied here: Keep the namespace owner running and remove it only after the target is removed.
 
-        ### 6. runc v1.5.2 CRIU external namespaces
+        ### runc v1.5.2 CRIU external namespaces
         https://raw.githubusercontent.com/opencontainers/runc/v1.5.2/libcontainer/criu_linux.go
 
-        Type: versioned_source.
-        **Source supports:** External network namespaces are marked on dump and supplied through an inherited descriptor on restore. Network namespace support requires CRIU 3.11 or newer.
+        External network namespaces are marked on dump and supplied through an inherited descriptor on restore. Network namespace support requires CRIU 3.11 or newer.
 
-        **Application:** The keeper is an external fixture. Its network state is NOT dumped, rewound, or portably migrated by this test.
+        Applied here: The keeper is an external fixture. Its network state is NOT dumped, rewound, or portably migrated by this test.
 
-        ### 7. Docker checkpoint reference
+        ### Docker checkpoint reference
         https://docs.docker.com/reference/cli/docker/checkpoint/
 
-        Type: official_documentation.
-        **Source supports:** Checkpoint/restore is experimental, uses CRIU, and is primarily focused on single-host use. No external TTY is used here.
+        Checkpoint/restore is experimental, uses CRIU, and is primarily focused on single-host use. No external TTY is used here.
 
-        **Application:** Retain actual checkpoint commands and strict continuity checks; never substitute a cold start for a failed restore.
+        Applied here: Retain actual checkpoint commands and strict continuity checks; never substitute a cold start for a failed restore.
 
-        ### 8. Docker checkpoint create
+        ### Docker checkpoint create
         https://docs.docker.com/reference/cli/docker/checkpoint/create/
 
-        Type: official_documentation.
-        **Source supports:** Creates a checkpoint from a running container. Leave-running is an optional behavior.
+        Creates a checkpoint from a running container. Leave-running is an optional behavior.
 
-        **Application:** This workflow uses the default stopped-target behavior and verifies Running=false plus stable logs.
+        Applied here: This workflow uses the default stopped-target behavior and verifies Running=false plus stable logs.
 
-        ### 9. Docker container start
+        ### Docker container start
         https://docs.docker.com/reference/cli/docker/container/start/
 
-        Type: official_documentation.
-        **Source supports:** The --checkpoint option starts a container from a checkpoint.
+        The --checkpoint option starts a container from a checkpoint.
 
-        **Application:** Only the first target launch is ordinary start. Every tested continuation uses --checkpoint.
+        Applied here: Only the first target launch is ordinary start. Every tested continuation uses --checkpoint.
 
-        ### 10. Docker network sharing
+        ### Docker network sharing
         https://docs.docker.com/engine/network/
 
-        Type: official_documentation.
-        **Source supports:** The supported container:<name|id> mode shares another container networking stack; certain DNS/hostname/port flags are incompatible.
+        The supported container:<name|id> mode shares another container networking stack; certain DNS/hostname/port flags are incompatible.
 
-        **Application:** The target shares only the dedicated keeper namespace. No host networking or port publishing is used.
+        Applied here: The target shares only the dedicated keeper namespace. No host networking or port publishing is used.
 
-        ### 11. Docker none driver
+        ### Docker none driver
         https://docs.docker.com/engine/network/drivers/none/
 
-        Type: official_documentation.
-        **Source supports:** The none driver leaves a private stack with only loopback, rather than eliminating network namespaces altogether.
+        The none driver leaves a private stack with only loopback, rather than eliminating network namespaces altogether.
 
-        **Application:** The keeper uses none. Namespace identity, loopback-only links and both route tables are checked at runtime.
+        Applied here: The keeper uses none. Namespace identity, loopback-only links and both route tables are checked at runtime.
 
-        ### 12. Docker host driver
+        ### Docker host driver
         https://docs.docker.com/engine/network/drivers/host/
 
-        Type: official_documentation.
-        **Source supports:** Host networking shares the host network stack rather than isolating the container network.
+        Host networking shares the host network stack rather than isolating the container network.
 
-        **Application:** Not used as a workaround: it would change the security boundary of this vulnerable target.
+        Applied here: Not used as a workaround: it would change the security boundary of this vulnerable target.
 
-        ### 13. CRIU external resources
+        ### CRIU external resources
         https://criu.org/External_resources
 
-        Type: official_documentation.
-        **Source supports:** Some resources cannot be checkpointed/restored without help from the caller, because some state lies outside the dumped container.
+        Some resources cannot be checkpointed/restored without help from the caller, because some state lies outside the dumped container.
 
-        **Application:** Declare the namespace keeper as a retained external dependency in report.json and the HTML evidence.
+        Applied here: Declare the namespace keeper as a retained external dependency in report.json and the HTML evidence.
 
-        ### 14. CRIU Docker integration
+        ### CRIU Docker integration
         https://criu.org/Docker
 
-        Type: official_documentation.
-        **Source supports:** Describes native Docker integration and recommends considering Podman as an alternative.
+        Describes native Docker integration and recommends considering Podman as an alternative.
 
-        **Application:** This patch retains Docker to isolate the observed change; a future Podman comparison is a separate experiment.
+        Applied here: This patch retains Docker to isolate the observed change; a future Podman comparison is a separate experiment.
 
-        ### 15. CRIU external Docker historical prototype
+        ### CRIU external Docker historical prototype
         https://criu.org/index.php?mobileaction=toggle_view_mobile&title=Docker_External
 
-        Type: historical_warning.
-        **Source supports:** The old external Docker C/R approach is marked as a proof of concept, not the recommended native integration.
+        The old external Docker C/R approach is marked as a proof of concept, not the recommended native integration.
 
-        **Application:** Do not run raw criu restore behind Docker and pretend Docker tracks the revived process correctly.
+        Applied here: Do not run raw criu restore behind Docker and pretend Docker tracks the revived process correctly.
 
-        ### 16. Docker daemon configuration
+        ### Docker daemon configuration
         https://docs.docker.com/reference/cli/dockerd/
 
-        Type: official_documentation.
-        **Source supports:** Documents daemon configuration, experimental mode and configuration validation.
+        Documents daemon configuration, experimental mode and configuration validation.
 
-        **Application:** Keep the existing merged/validated daemon config. Restarting Docker is restricted to the disposable hosted runner.
+        Applied here: Keep the existing merged/validated daemon config. Restarting Docker is restricted to the disposable hosted runner.
 
-        ### 17. GitHub expression contexts
+        ### GitHub expression contexts
         https://docs.github.com/en/actions/reference/workflows-and-actions/contexts
 
-        Type: official_documentation.
-        **Source supports:** Available expression contexts depend on the workflow key being evaluated.
+        Available expression contexts depend on the workflow key being evaluated.
 
-        **Application:** Keep github.workspace in job-level env; do not reintroduce runner.temp there.
+        Applied here: Keep github.workspace in job-level env; do not reintroduce runner.temp there.
 
-        ### 18. GitHub workflow syntax
+        ### GitHub workflow syntax
         https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax
 
-        Type: official_documentation.
-        **Source supports:** Workflow syntax specifies job/step behavior, conditions, shells, and a 21,000-character run-block maximum.
+        Workflow syntax specifies job/step behavior, conditions, shells, and a 21,000-character run-block maximum.
 
-        **Application:** Split embedded source into multiple small run blocks within the SAME YAML. Evidence and HTML steps use always().
+        Applied here: Split embedded source into multiple small run blocks within the SAME YAML. Evidence and HTML steps use always().
 
-        ### 19. GitHub artifacts
+        ### GitHub artifacts
         https://docs.github.com/en/actions/how-tos/writing-workflows/choosing-what-your-workflow-does/storing-and-sharing-data-from-a-workflow
 
-        Type: official_documentation.
-        **Source supports:** Artifacts retain generated reports and output files from workflow runs.
+        Artifacts retain generated reports and output files from workflow runs.
 
-        **Application:** Upload the HTML and diagnostic evidence after both success and failure. Raw memory images remain excluded.
+        Applied here: Upload the HTML and diagnostic evidence after both success and failure. Raw memory images remain excluded.
 
-        ## Validation interpretation
+        ### Linux namespace access permissions
+        https://man7.org/linux/man-pages/man7/namespaces.7.html
 
-        Local syntax, regression and mocked-Docker tests verify controller logic. They are not evidence that CRIU restored a real V8 process. Only the job can establish that by successfully restoring the live target and passing the subsequent continuity and namespace checks.
+        Namespace symlink reads are ptrace access checked; unprivileged host reads may fail.
+
+        Applied here: Reuse guarded sudo readlink/nsenter rather than os.stat from the unprivileged runner.
+
+        ### GitHub custom Pages workflows
+        https://docs.github.com/en/pages/getting-started-with-github-pages/using-custom-workflows-with-github-pages
+
+        Pages requires a Pages artifact, deployment job, pages/id-token permissions and environment.
+
+        Applied here: Separate deployment even after a failed experiment, contingent on successful artifact upload.
+
         EMBED_DOCUMENTATION_MD_1
-    - name: Embed intervention_suite.py
-      shell: bash
-      run: |
-        set -Eeuo pipefail
-        mkdir -p "$BUNDLE_DIR"
-        cat > "$BUNDLE_DIR/intervention_suite.py" <<'EMBED_INTERVENTION_SUITE'
-        import hashlib, json, os, pathlib, re, statistics, subprocess, time, uuid, sys, traceback
-        root=pathlib.Path(os.environ['EVIDENCE_DIR']); root.mkdir(exist_ok=True,parents=True)
-        result={'status':'failed','version':'extended-replay-suite-1','tests':[],'branches':[],'limitations':[
-         'Agent state and LLM sampling are not restored; these are controlled external actions, not autonomous agent choices.',
-         'No real exploit is attempted; this is a V8 execution-forking experiment.',
-         'Mitigation variants requiring compile/startup changes cannot be toggled after checkpoint.',
-         'No ASLR/CFI/MTE treatment is tested; do not interpret branch effects as mitigation effects.',
-         'Full V8 heap/JIT/register equivalence is not proven by probe observations.',
-         'External namespace, wall clock, kernel scheduling and host bind mount are not rewound.',
-         'Only one runner and one pinned V8 image are exercised; no cross-host portability result.'
-         ]}
-        def check(name,condition,detail=None):
-         result['tests'].append({'name':name,'passed':bool(condition),'detail':detail});print('INTERVENTION',name,'PASS' if condition else 'FAIL',flush=True)
-         if not condition: raise AssertionError(name+': '+repr(detail))
-        def cmd(args,timeout=120,ok=True):
-         print('FORK COMMAND',repr(args),flush=True)
-         p=subprocess.run(args,text=True,capture_output=True,timeout=timeout)
-         if p.returncode: print('FORK COMMAND FAILED',p.returncode,p.stdout[-3000:],p.stderr[-3000:],flush=True)
-         if ok and p.returncode: raise RuntimeError(f'{args!r} rc={p.returncode} stdout={p.stdout[-3000:]} stderr={p.stderr[-3000:]}')
-         return p.stdout.strip()
-        def inspect(name): return json.loads(cmd(['docker','inspect',name]))[0]
-        def logs(name): return cmd(['docker','logs',name],ok=True)
-        def events(text):
-         out=[]
-         for line in text.splitlines():
-          if line.startswith('FORK_EVENT '):
-           try: out.append(json.loads(line[11:]))
-           except Exception: pass
-         return out
-        def wait(name,kind,timeout=60,after=0):
-         deadline=time.monotonic()+timeout
-         while time.monotonic()<deadline:
-          es=events(logs(name))
-          found=[e for e in es[after:] if e.get('kind')==kind]
-          if found:return found[-1],es
-          time.sleep(.25)
-         raise TimeoutError('wait '+kind+' '+repr(events(logs(name))[-3:]))
-        js=r'''"use strict";
-        const say=x=>console.log('FORK_EVENT '+JSON.stringify(x));
-        const words=new Uint32Array(4096);let s=0x1a2b3c4d;
-        for(let i=0;i<words.length;i++){s=(Math.imul(s,1664525)+1013904223)>>>0;words[i]=s;}
-        let tick=0,hot=0;function f(x){return(Math.imul(x^0x87654321,33)+7)>>>0;}
-        function digest(){let h=2166136261>>>0;for(let i=0;i<words.length;i++)h=Math.imul(h^words[i],16777619)>>>0;return h.toString(16).padStart(8,'0');}
-        function advance(){for(let j=0;j<20000;j++){let i=(j+tick)&4095;hot=f(words[i]+j);words[i]=(words[i]^hot)>>>0;}tick++;}
-        let gcAvailable=typeof gc==='function', wasmAvailable=typeof WebAssembly==='object';
-        let obj=[];for(let i=0;i<10000;i++)obj.push({i,field:'v8-'+i});if(gcAvailable)gc();
-        for(let i=0;i<250;i++)f(i); // warm function; not proof of machine-code JIT compilation
-        let wasmValue=null; if(wasmAvailable){try{let m=new WebAssembly.Module(new Uint8Array([0,97,115,109,1,0,0,0]));wasmValue=(new WebAssembly.Instance(m)).exports?1:0;}catch(e){wasmValue='error:'+String(e);}}
-        const delay=ms=>{let until=Date.now()+ms;while(Date.now()<until){}};
-        for(let i=0;i<10;i++)advance();
-        const deadline=Date.now()+90000;
-        say({kind:'gate',tick,digest:digest(),words:Array.from(words),hot,deadline,readAvailable:typeof read==='function',gcAvailable,wasmAvailable,wasmValue});
-        while(Date.now()<deadline)delay(20);
-        say({kind:'resume',tick,digest:digest(),words:Array.from(words),hot,clock:Date.now()});
-        const action='control'; // The pinned d8 has no read() API: external action injection is unsupported.
-        say({kind:'action',action,tick,digest:digest(),word17:words[17],word18:words[18]});
-        for(let i=0;i<250;i++){advance();if(i===0||i===1||i===9||i===49||i===99||i===249)say({kind:'continuation',action,step:i+1,tick,digest:digest(),hot});}
-        say({kind:'done',action,tick,digest:digest(),hot});
-        while(true)delay(200);
-        '''
-        keeper='fork-keeper-'+uuid.uuid4().hex[:10]; target='fork-target-'+uuid.uuid4().hex[:10]
-        workspace=root/'intervention-input';workspace.mkdir(exist_ok=True);action_file=workspace/'action.txt';action_file.write_text('control\n');(root/'fork-probe.js').write_text(js)
-        try:
-         image=os.environ['IMAGE']; base=json.loads((root/'report.json').read_text()); d8='/challenge/d8'; check('original_run_passed',base['status']=='passed')
-         check('pinned_image',bool(re.search(r'@sha256:[a-f0-9]{64}$',image)))
-         cap=base.get('d8_capabilities',{});check('d8_console_log_available',cap.get('console_log')=='function',cap)
-         result['unsupported']=['external_action_intervention','joint_agent_target_state','real_exploit_trajectory','ASLR_CFI_MTE_treatment','cross_host_portability']
-         cmd(['docker','create','--name',keeper,'--network','none','--entrypoint','/bin/sh',image,'-c','while :; do sleep 60; done'])
-         cmd(['docker','start',keeper]);k=inspect(keeper);pid=k['State']['Pid'];check('keeper_running',pid>0)
-         keeper_ns=os.stat('/proc/'+str(pid)+'/ns/net').st_ino
-         check('keeper_not_host_namespace',keeper_ns!=os.stat('/proc/1/ns/net').st_ino)
-         opts=['--name',target,'--runtime','runc','--network','container:'+keeper,'--memory','4g','--memory-swap','4g','--cpus','2','--pids-limit','256','--security-opt','seccomp=unconfined','--security-opt','apparmor=unconfined','--mount','type=bind,src='+str(workspace)+',dst=/fork,readonly','--entrypoint',d8]
-         cmd(['docker','create',*opts,image,'/tmp/fork-probe.js'])
-         cmd(['docker','cp',str(root/'fork-probe.js'),target+':/tmp/fork-probe.js']);cmd(['docker','start',target]);gate,ev=wait(target,'gate',timeout=45)
-         check('checkpoint_before_gate_expiry',gate['deadline']-int(time.time()*1000)>5000)
-         start=time.monotonic();cmd(['docker','checkpoint','create',target,'fork-base'],timeout=180);dump_s=time.monotonic()-start
-         check('target_stopped_after_checkpoint',not inspect(target)['State']['Running'])
-         check('keeper_namespace_preserved',os.stat('/proc/'+str(pid)+'/ns/net').st_ino==keeper_ns)
-         # Wait until deadline so each restored branch proceeds immediately after restoration.
-         wait_s=max(0,(gate['deadline']-int(time.time()*1000))/1000+.25);time.sleep(wait_s)
-         trials=int(os.environ.get('FORK_TRIALS','12'));check('trial_count_valid',3<=trials<=100,trials)
-         sequence=['control']*trials
-         for idx,action in enumerate(sequence,1):
-          action_file.write_text(action+'\n');baseline=events(logs(target)); start=time.monotonic()
-          cmd(['docker','start','--checkpoint','fork-base',target],timeout=180);restore_s=time.monotonic()-start
-          _,all_events=wait(target,'done',timeout=90,after=len(baseline));new=all_events[len(baseline):]
-          resumes=[e for e in new if e.get('kind')=='resume']; acts=[e for e in new if e.get('kind')=='action']; cont=[e for e in new if e.get('kind')=='continuation']; dones=[e for e in new if e.get('kind')=='done']
-          check(f'trial_{idx}_single_resume_action_done',len(resumes)==len(acts)==len(dones)==1)
-          resume=resumes[0];check(f'trial_{idx}_4096_words',resume['words']==gate['words'])
-          check(f'trial_{idx}_tokenless_state_equivalence',all(resume[k]==gate[k] for k in ('tick','digest','hot')))
-          check(f'trial_{idx}_action_matches',acts[0]['action']==action)
-          check(f'trial_{idx}_long_horizon_250_steps',len(cont)==6 and cont[-1]['step']==250 and dones[0]['tick']==gate['tick']+250)
-          state=inspect(target);check(f'trial_{idx}_running',state['State']['Running'])
-          pid_now=state['State']['Pid'];check(f'trial_{idx}_namespace',os.stat('/proc/'+str(pid_now)+'/ns/net').st_ino==keeper_ns)
-          branch={'trial':idx,'action':action,'restore_s':restore_s,'pre_action_digest':resume['digest'],'post_action_digest':acts[0]['digest'],'continuation':cont,'final_digest':dones[0]['digest'],'observed_clock':resume['clock']}
-          result['branches'].append(branch);(root/f'intervention-branch-{idx:03}.json').write_text(json.dumps({'branch':branch,'events':new},indent=2)+'\n')
-          cmd(['docker','kill',target]);check(f'trial_{idx}_stopped_before_next',not inspect(target)['State']['Running'])
-         result['checkpoint_s']=dump_s;result['median_restore_s']=statistics.median(b['restore_s'] for b in result['branches'])
-         groups={a:[b for b in result['branches'] if b['action']==a] for a in ('control','flip','rotate')}
-         for action,branches in groups.items():
-          if not branches: continue
-          check(action+'_has_repeats',len(branches)>=1)
-          check(action+'_same_post_action_digest',len(set(b['post_action_digest'] for b in branches))==1)
-          check(action+'_same_250_step_digest',len(set(b['final_digest'] for b in branches))==1)
-         check('all_250_step_final_digests_equal',len(set(b['final_digest'] for b in result['branches']))==1)
-         check('all_branches_share_initial_digest',len(set(b['pre_action_digest'] for b in result['branches']))==1)
-         result['status']='passed'
-        except Exception as exc:
-         result['error']=repr(exc);result['traceback']=traceback.format_exc();print(result['traceback'],flush=True)
-         for name in (target,keeper):
-          p=subprocess.run(['docker','logs',name],capture_output=True,text=True)
-          (root/(name+'-failure.log')).write_text(p.stdout+'\nSTDERR\n'+p.stderr)
-          p=subprocess.run(['docker','inspect',name],capture_output=True,text=True)
-          (root/(name+'-inspect.json')).write_text(p.stdout or p.stderr)
-        finally:
-         for name in (target,keeper):
-          subprocess.run(['docker','rm','-f',name],capture_output=True,text=True)
-         (root/'intervention-suite.json').write_text(json.dumps(result,indent=2)+'\n')
-         print('INTERVENTION FINAL',json.dumps({'status':result['status'],'checks':len(result['tests']),'branches':len(result['branches']),'error':result.get('error')}),flush=True)
-        sys.exit(0 if result['status']=='passed' else 1)
-        EMBED_INTERVENTION_SUITE
-    - name: Embed fidelity_matrix.py [1/1]
-      shell: bash
-      run: |
-        set -Eeuo pipefail
-        cat > "$BUNDLE_DIR/fidelity_matrix.py" <<'EMBED_FIDELITY_MATRIX_PY_1'
-        import json, os, pathlib, statistics, sys
-        from checkpoint_probe import continuity_checks
-        root=pathlib.Path(os.environ['EVIDENCE_DIR'])
-        result={'status':'failed','version':'fidelity-matrix-1','tests':[],'limitations':[
-         'Probe-word equality is not a byte-for-byte comparison of all V8/JIT/kernel memory.',
-         'Network namespace is externally retained; it is not rewound.',
-         'Wall-clock time and thread scheduling are not deterministically replayed.',
-         'No LLM API/model state is captured; agent decision equivalence is not tested.',
-         'No mitigation variant is installed; causal mitigation effects are not tested.',
-         'No true intervention/alternative exploit action is performed; repeat restoration is not counterfactual branching.',
-         'No ASLR/CFI/MTE enable-after-checkpoint experiment is attempted; such interventions can invalidate comparisons.'
-         ]}
-        def check(name,passed,detail=None):
-         result['tests'].append({'name':name,'passed':bool(passed),'detail':detail})
-         print('FIDELITY MATRIX |',name,'PASS' if passed else 'FAIL',flush=True)
-        try:
-         report=json.loads((root/'report.json').read_text())
-         check('base_live_v8_restore_passed',report.get('status')=='passed')
-         rounds=report.get('rounds',[])
-         check('at_least_two_independent_checkpoints',len(rounds)>=2,len(rounds))
-         for row in rounds:
-          n=row['round']; paused=row['paused']; resumed=row.get('resumed',{})
-          checks=row.get('checks',{})
-          check(f'round_{n}_all_original_assertions',bool(checks) and all(checks.values()),checks)
-          check(f'round_{n}_4096_words_identical',paused.get('heap_words')==resumed.get('heap_words'))
-          check(f'round_{n}_token_tick_digest_hot_equal',all(paused.get(k)==resumed.get(k) for k in ('token','tick','digest','hot')))
-          check(f'round_{n}_checkpoint_and_restore_timing_measured',all(type(row.get(k)) in (int,float) and row[k]>0 for k in ('dump_s','restore_s')))
-          # Negative controls: a cold boot and changed state must be rejected.
-          original='V8_PROBE '+json.dumps(paused)+'\n'
-          forged=dict(resumed); forged['heap_words']=list(resumed['heap_words']); forged['heap_words'][0]^=1
-          forged_delta='V8_PROBE '+json.dumps(forged)+'\\nV8_PROBE '+json.dumps({'event':'tick','token':paused['token'],'tick':paused['tick']+1})+'\n'
-          rejected=continuity_checks(paused,original,original+forged_delta,paused['ticket'],True)
-          check(f'round_{n}_mutation_negative_control_rejected',rejected['all_4096_probe_words_exact'] is False)
-          cold_delta='V8_PROBE '+json.dumps({'event':'boot'})+'\n'+forged_delta
-          rejected_cold=continuity_checks(paused,original,original+cold_delta,paused['ticket'],True)
-          check(f'round_{n}_cold_boot_negative_control_rejected',rejected_cold['no_cold_boot_in_new_output'] is False)
-         if rounds:
-          branches=rounds[-1].get('repeat_restores',[])
-          check('three_real_restores_from_one_checkpoint',len(branches)==3,len(branches))
-          for b in branches:
-           check(f'branch_{b["trial"]}_all_runtime_assertions',bool(b.get('checks')) and all(b['checks'].values()))
-           check(f'branch_{b["trial"]}_identical_resume_state',all(b['resume'].get(k)==rounds[-1]['paused'].get(k) for k in ('token','tick','digest','hot','heap_words')))
-          if len(branches)==3:
-           result['repeat_restore_seconds']=[round(b['restore_s'],5) for b in branches]
-           result['repeat_restore_median_seconds']=statistics.median(b['restore_s'] for b in branches)
-          result['normal_dump_seconds']=[r.get('dump_s') for r in rounds]
-          result['normal_restore_seconds']=[r.get('restore_s') for r in rounds]
-         result['untested']=['agent_target_joint_state','model_sampling_variance','mitigation_on_off_causal_effect',
-          'ASLR_CFI_MTE_counterfactual_validity','full_heap_register_thread_equivalence','cross_host_portability',
-          'deterministic_clock_and_scheduler_replay','independent_action_branching']
-         result['status']='passed' if result['tests'] and all(t['passed'] for t in result['tests']) else 'failed'
-        except Exception as exc:
-         result['error']=repr(exc)
-        finally:
-         (root/'fidelity-matrix.json').write_text(json.dumps(result,indent=2)+'\n')
-         print('FIDELITY MATRIX FINAL',json.dumps({'status':result['status'],'passed':sum(t['passed'] for t in result['tests']),
-         'total':len(result['tests']),'untested':result.get('untested',[])}),flush=True)
-        sys.exit(0 if result['status']=='passed' else 1)
-        EMBED_FIDELITY_MATRIX_PY_1
-        test "$(sha256sum "$BUNDLE_DIR/fidelity_matrix.py" | cut -d ' ' -f1)" = "a301b9f00f997af00d763dd6e9b42059bc9440c30f00505d30c6239f18d2c332"
-    - name: Verify every embedded byte and print the package manifest
+    - name: Verify embedded hashes and compile all Python
       id: integrity
       shell: bash
       run: |
         set -Eeuo pipefail
         python3 - <<'PYVERIFY'
-        import hashlib,json,os,pathlib,sys
-        root=pathlib.Path(os.environ['BUNDLE_DIR']); evidence=pathlib.Path(os.environ['EVIDENCE_DIR'])
-        expected={'netns_guard.py': 'f3e42c9f8b8a8c582eb8032d8ea622a4bc54bfd7200d774691ab219f07e4820f', 'checkpoint_probe.py': '063290b4f5086da6896ba1b8f244a4265ea84a9a338020aa5d1cf84daad7d635', 'build_viewer.py': '91a6ee15e3863deeea9307fa675c6ac69ffab17be6120d36741fc76295e81556', 'viewer-template.html': 'f0e324b18c0b1d206208fc3b1c0518006c4c8a3023294a5eab96b8ba8dc51b1e', 'install_criu.sh': '9f7b64296c1f1ffdc30f055f1f926d4b42a8c976291275978b6f803c27b43114', 'host_diagnostics.sh': '96cfdc39bcc6b5831c7784e140e1c62e45ba1b33ab698f53aaea7e68a0e647b2', 'report_tools.py': 'c2e4a257b22a6856f7049cb06e5bc09fe21e1050aab1c432aa676ced691e567b', 'self_tests.py': 'b6c327fd96f351d7fc102ea90dbaaa74e4e7486e448d4c941e430e296c90a545', 'network_tests.py': '05ddcf508cc1435e89d9d7302f20e9fb244d7409832c4a484994a2e7e46a8065', 'documentation.json': '6fddb1b2e975dab78dd340534adf364e75257bba77d27a5c6088afcfcba2db72', 'documentation.md': 'c54acc5bb2f0b6ffb14e3a191b4dd90d2ac497253b84b781212dd653f273f23c'}
-        rows=[]
-        for name,wanted in expected.items():
-            actual=hashlib.sha256((root/name).read_bytes()).hexdigest()
-            good=actual==wanted
-            rows.append({'path':name,'bytes':(root/name).stat().st_size,'sha256':actual,'expected':wanted,'passed':good})
-            print(('PASS' if good else 'FAIL')+f' ASSET | {name} | bytes={rows[-1]["bytes"]} | SHA256={actual}',flush=True)
-        report={'status':'passed' if all(r['passed'] for r in rows) else 'failed','assets':rows}
-        (evidence/'asset-integrity.json').write_text(json.dumps(report,indent=2)+'\n')
-        raise SystemExit(0 if report['status']=='passed' else 1)
+        import hashlib,json,os,pathlib,shutil,py_compile
+        bundle=pathlib.Path(os.environ['BUNDLE_DIR']);root=pathlib.Path(os.environ['EVIDENCE_DIR'])
+        expected={'netns_guard.py': '0a7f6b8ef04a667e52999bc77f109294219fb3d2fdbe5a18a2b42c2676acc96c', 'checkpoint_probe.py': '0c4e4fe4074720ecbff8320c1ec2a8a1865057af688f9cf6bcf78e663a485c12', 'build_viewer.py': '7450d06045bf08c6363b1d67ea9214e819bf2b0e9e8f7fa6345071febf7e39f9', 'viewer-template.html': 'd041580f34270c5e4821ff1558a560c4a9f10182784e422d6642ea971d4c046e', 'install_criu.sh': '9f7b64296c1f1ffdc30f055f1f926d4b42a8c976291275978b6f803c27b43114', 'host_diagnostics.sh': '96cfdc39bcc6b5831c7784e140e1c62e45ba1b33ab698f53aaea7e68a0e647b2', 'report_tools.py': '7245ab5a51bc9c4a3a5f172e4805993b927c6815d3eb113dbc1705fc6cebd3d6', 'self_tests.py': 'b6c327fd96f351d7fc102ea90dbaaa74e4e7486e448d4c941e430e296c90a545', 'network_tests.py': '05ddcf508cc1435e89d9d7302f20e9fb244d7409832c4a484994a2e7e46a8065', 'intervention_suite.py': '6bd811c1d5d3b4fab6e9fe9ebe44cf24d7e8efb0004ae9d927fa248fc0bcee22', 'fidelity_matrix.py': 'f91bd7a97511d7df4e981ace6f5383a151ee5da7e4d146dcf402417e503bbb53', 'build_pages.py': 'd74301cf06c25e1252764906948c05c21a9d7af1099c8e0e2b95845ed2df3866', 'repair_tests.py': '5b0b734402ecfe8733c1f40cbd95052faede8d39151ec58deb2148bbbfe3991a', 'documentation.json': 'd09b0e3eb695e042b107bd7cb14f10ef33b28f7d0c0059fc1877ed6f192f90fc', 'documentation.md': 'b2e427b77d8961ea7d6930395833c4e6fecce23a60d1eeafb963e7c9d8275cf2'}
+        results=[]
+        for name,want in expected.items():
+         p=bundle/name; got=hashlib.sha256(p.read_bytes()).hexdigest()
+         row={'name':name,'sha256':got,'matches':got==want};results.append(row)
+         print('EMBEDDED SOURCE',json.dumps(row),flush=True)
+         if p.suffix=='.py':py_compile.compile(str(p),doraise=True)
+         shutil.copyfile(p,root/'sources'/name)
+        for name in ('documentation.json','documentation.md'):shutil.copyfile(bundle/name,root/name)
+        obj={'status':'passed' if all(x['matches'] for x in results) else 'failed','workflow_revision':'repair-6','files':results}
+        (root/'asset-integrity.json').write_text(json.dumps(obj,indent=2)+'\n')
+        if obj['status']!='passed':raise SystemExit('Embedded asset hash mismatch')
         PYVERIFY
-        python3 -m py_compile "$BUNDLE_DIR/checkpoint_probe.py" "$BUNDLE_DIR/build_viewer.py" "$BUNDLE_DIR/report_tools.py" "$BUNDLE_DIR/self_tests.py" "$BUNDLE_DIR/netns_guard.py" "$BUNDLE_DIR/network_tests.py" "$BUNDLE_DIR/fidelity_matrix.py"
-        cp "$BUNDLE_DIR"/*.py "$BUNDLE_DIR"/*.sh "$BUNDLE_DIR"/*.html "$EVIDENCE_DIR/sources/"
-        cp "$BUNDLE_DIR/documentation.md" "$BUNDLE_DIR/documentation.json" "$EVIDENCE_DIR/"
-        printf "=== DOCUMENTATION AND WORKAROUND RATIONALE ===\n"
-        cat "$EVIDENCE_DIR/documentation.md"
-    - name: Run embedded verifier tests (not a claim of CRIU success)
+    - name: Regression checks of the original verifier
       id: self_tests
-      continue-on-error: true
+      if: ${{ !cancelled() && steps.integrity.outcome == 'success' }}
       shell: bash
       run: |
         set -Eeuo pipefail
-        python3 -u "$BUNDLE_DIR/checkpoint_probe.py" stream local-self-tests   python3 -u "$BUNDLE_DIR/self_tests.py" 2>&1 | tee "$EVIDENCE_DIR/self-test-console.log"
-    - name: Test namespace safety and restore orchestration (mocked Docker; not runtime proof)
+        python3 -u "$BUNDLE_DIR/self_tests.py" 2>&1 | tee "$EVIDENCE_DIR/self-test-console.log"
+    - name: Namespace safety and mocked runtime tests
       id: network_tests
+      if: ${{ !cancelled() && steps.integrity.outcome == 'success' }}
       shell: bash
       run: |
         set -Eeuo pipefail
-        python3 -u "$BUNDLE_DIR/network_tests.py" 2>&1 | tee "$EVIDENCE_DIR/network-tests-console.log"
+        python3 -u "$BUNDLE_DIR/network_tests.py" 2>&1 | tee "$EVIDENCE_DIR/network-test-console.log"
+    - name: Extended replay, failure and publication regression tests
+      id: repair_tests
+      if: ${{ !cancelled() && steps.integrity.outcome == 'success' }}
+      shell: bash
+      run: |
+        set -Eeuo pipefail
+        python3 -u "$BUNDLE_DIR/repair_tests.py" 2>&1 | tee "$EVIDENCE_DIR/repair-test-console.log"
     - name: Stream complete host, resource and runtime diagnostics
       continue-on-error: true
       shell: bash
       run: |
         set -Eeuo pipefail
         python3 -u "$BUNDLE_DIR/checkpoint_probe.py" stream host-preflight   bash "$BUNDLE_DIR/host_diagnostics.sh" 2>&1 | tee "$EVIDENCE_DIR/host-console.log"
+      if: ${{ !cancelled() && steps.integrity.outcome == 'success' }}
     - name: Source-build the pinned CRIU release with live compiler logs
       id: criu_setup
       continue-on-error: true
-      if: ${{ steps.self_tests.outcome == 'success' && steps.network_tests.outcome == 'success' }}
+      if: ${{ !cancelled() && steps.self_tests.outcome == 'success' && steps.network_tests.outcome == 'success'
+        && steps.repair_tests.outcome == 'success' }}
       shell: bash
       run: |
         set -Eeuo pipefail
@@ -2527,7 +3085,7 @@ jobs:
     - name: Configure Docker checkpoint support and print feature diagnostics
       id: daemon
       continue-on-error: true
-      if: ${{ steps.criu_setup.outcome == 'success' }}
+      if: ${{ !cancelled() && steps.criu_setup.outcome == 'success' }}
       shell: bash
       run: |
         set -Eeuo pipefail
@@ -2535,131 +3093,64 @@ jobs:
     - name: Attempt real V8 checkpoints and exact probe-state restoration
       id: experiment
       continue-on-error: true
-      if: ${{ always() && steps.integrity.outcome == 'success' }}
+      if: ${{ !cancelled() && steps.daemon.outcome == 'success' && steps.repair_tests.outcome == 'success' }}
       shell: bash
       run: |
         set -Eeuo pipefail
         python3 -u "$BUNDLE_DIR/checkpoint_probe.py" 2>&1 | tee "$EVIDENCE_DIR/experiment-console.log"
-    - name: Verify repeated replay, negative controls and fidelity matrix
+    - name: Check fidelity matrix including valid negative controls
       id: fidelity_matrix
-      if: ${{ always() && steps.integrity.outcome == 'success' }}
-      continue-on-error: true
+      if: ${{ !cancelled() && steps.experiment.outcome == 'success' }}
       shell: bash
       run: |
         set -Eeuo pipefail
         python3 -u "$BUNDLE_DIR/fidelity_matrix.py" 2>&1 | tee "$EVIDENCE_DIR/fidelity-matrix-console.log"
-    - name: Run same-input checkpoint replay and long-horizon V8 fidelity
-      id: intervention_suite
-      if: ${{ always() && steps.integrity.outcome == 'success' && steps.fidelity_matrix.outcome == 'success' }}
-      continue-on-error: true
+    - name: Run 12 same-checkpoint replays and exact long-horizon verification
+      id: extended_replay
+      if: ${{ !cancelled() && steps.fidelity_matrix.outcome == 'success' && steps.repair_tests.outcome == 'success'
+        }}
       shell: bash
       run: |
         set -Eeuo pipefail
         python3 -u "$BUNDLE_DIR/intervention_suite.py" 2>&1 | tee "$EVIDENCE_DIR/intervention-console.log"
-    - name: Summarize exact failures and collect host-side runtime evidence
-      id: summary
+    - name: Collect runtime diagnostics after success or failure
       if: ${{ always() }}
-      continue-on-error: true
       shell: bash
       run: |
         set -Eeuo pipefail
         mkdir -p "$EVIDENCE_DIR"
-        python3 -u "$BUNDLE_DIR/report_tools.py" summary
-        # These are diagnostics; an unavailable journal must not prevent HTML generation.
-        sudo journalctl -u docker -u containerd --since '1 hour ago' --no-pager > "$EVIDENCE_DIR/runtime-journal.log" 2>&1 || true
-        sudo dmesg --ctime > "$EVIDENCE_DIR/dmesg.log" 2>&1 || true
-        sudo chown -R "$(id -u):$(id -g)" "$EVIDENCE_DIR"
-        # Logs can be lengthy. Full contents are uploaded; print the final 120 lines here as an extra pointer.
-        printf '
-        === RUNTIME JOURNAL TAIL (FULL JOURNAL IS IN ARTIFACT) ===
-        '
-        tail -n 120 "$EVIDENCE_DIR/runtime-journal.log" || true
-        printf '
-        === KERNEL LOG TAIL (FULL LOG IS IN ARTIFACT) ===
-        '
-        tail -n 120 "$EVIDENCE_DIR/dmesg.log" || true
-    - name: Generate the self-contained HTML5 trajectory explorer even on failure
+        sudo -n journalctl -u docker -u containerd --since '1 hour ago' --no-pager > "$EVIDENCE_DIR/runtime-journal.log" 2>&1 || true
+        sudo -n dmesg --ctime > "$EVIDENCE_DIR/dmesg.log" 2>&1 || true
+        sudo -n chown -R "$(id -u):$(id -g)" "$EVIDENCE_DIR" || true
+    - name: Generate HTML5 evidence viewer, including failed trials
       id: viewer
       if: ${{ always() }}
-      continue-on-error: true
       shell: bash
       run: |
         set -Eeuo pipefail
-        mkdir -p "$EVIDENCE_DIR"
-        python3 -u "$BUNDLE_DIR/build_viewer.py" "$EVIDENCE_DIR" "$EVIDENCE_DIR/trajectory-explorer.html"
-        printf '
-        === HTML OUTPUT ===
-        '
-        ls -lh "$EVIDENCE_DIR/trajectory-explorer.html"
-        sha256sum "$EVIDENCE_DIR/trajectory-explorer.html"
-        printf '
-        Open trajectory-explorer.html from the extracted artifact. No web server or network access is needed.
-        '
-        printf 'Display rewind and branch plans are not a live runtime-control service.
-        '
-    - name: Print an SHA-256 inventory of every evidence file
+        python3 -u "$BUNDLE_DIR/build_viewer.py" "$EVIDENCE_DIR" "$EVIDENCE_DIR/trajectory-explorer.html" 2>&1 | tee "$EVIDENCE_DIR/viewer-console.log"
+    - name: Report one aggregate experiment verdict
+      id: summary
       if: ${{ always() }}
-      continue-on-error: true
+      shell: bash
+      run: |
+        set -Eeuo pipefail
+        python3 -u "$BUNDLE_DIR/report_tools.py" summary
+    - name: Build static Pages site and complete downloadable log bundles
+      id: pages_build
+      if: ${{ always() }}
+      shell: bash
+      run: |
+        set -Eeuo pipefail
+        python3 -u "$BUNDLE_DIR/build_pages.py"
+    - name: Hash and list all preserved evidence
+      if: ${{ always() }}
       shell: bash
       run: |
         set -Eeuo pipefail
         python3 -u "$BUNDLE_DIR/report_tools.py" inventory
-    - name: Embed Pages site builder
-      if: ${{ always() }}
-      shell: bash
-      run: |
-        mkdir -p "$BUNDLE_DIR"
-        cat > "$BUNDLE_DIR/build_pages.py" <<'EMBED_PAGES_BUILDER'
-        import datetime, html, json, os, pathlib, zipfile
-        root=pathlib.Path(os.environ['EVIDENCE_DIR'])
-        site=pathlib.Path(os.environ['GITHUB_WORKSPACE'])/'pages-site'
-        site.mkdir(parents=True,exist_ok=True)
-        logfiles=sorted(p for p in root.rglob('*.log') if p.is_file() and not p.is_symlink())
-        with (site/'full-run.log').open('w',encoding='utf-8',errors='replace') as f:
-         f.write('GitHub Actions V8 checkpoint experiment\n')
-         f.write('Run: '+os.environ.get('GITHUB_RUN_ID','unknown')+'\n')
-         f.write('Generated: '+datetime.datetime.now(datetime.timezone.utc).isoformat()+'\n')
-         for p in logfiles:
-          f.write('\n'+'='*90+'\nFILE: '+str(p.relative_to(root))+'\n'+'='*90+'\n')
-          f.write(p.read_text(encoding='utf-8',errors='replace'))
-          f.write('\n')
-        with zipfile.ZipFile(site/'evidence-logs.zip','w',zipfile.ZIP_DEFLATED,compresslevel=6) as z:
-         for p in logfiles: z.write(p,'logs/'+str(p.relative_to(root)))
-         for name in ('report.json','fidelity-matrix.json','intervention-suite.json','viewer-build.json'):
-          if (root/name).exists(): z.write(root/name,name)
-        viewer=root/'trajectory-explorer.html'
-        if viewer.exists(): (site/'trajectory-explorer.html').write_bytes(viewer.read_bytes())
-        status={}
-        for name in ('report.json','fidelity-matrix.json','intervention-suite.json'):
-         try: status[name]=json.loads((root/name).read_text()).get('status','unknown')
-         except Exception: status[name]='missing'
-        (site/'status.json').write_text(json.dumps(status,indent=2)+'\n')
-        (site/'.nojekyll').touch()
-        links='<p><a href="trajectory-explorer.html">Interactive offline evidence explorer</a></p>' if viewer.exists() else ''
-        (site/'index.html').write_text('<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>V8 Checkpoint Atlas</title><style>body{font:17px system-ui;max-width:850px;margin:3rem auto;padding:0 1rem;line-height:1.6}a{color:#087e9e}code{background:#eee;padding:.15rem}</style><h1>V8 Checkpoint Atlas</h1><p>Static GitHub Pages evidence site for GitHub Actions run <code>'+html.escape(os.environ.get('GITHUB_RUN_ID','unknown'))+'</code>.</p><p><strong>Statuses:</strong> '+html.escape(json.dumps(status))+'</p>'+links+'<p><a href="full-run.log" download>Download full combined log (.log)</a></p><p><a href="evidence-logs.zip" download>Download all logs and JSON reports (.zip)</a></p><p><a href="status.json">Machine-readable status</a></p><p>GitHub Pages serves static files; it does not host a persistent CRIU process, Docker daemon, or executable backend. Evidence may contain environment details; publish only to an appropriate repository.</p></html>',encoding='utf-8')
-        print('PAGES SITE',site,'log count',len(logfiles),'size', (site/'full-run.log').stat().st_size)
-        EMBED_PAGES_BUILDER
-    - name: Build public GitHub Pages site and downloadable logs
-      if: ${{ always() }}
-      shell: bash
-      run: |
-        set -Eeuo pipefail
-        mkdir -p "$EVIDENCE_DIR"
-        python3 "$BUNDLE_DIR/build_pages.py"
-    - name: Upload downloadable full log as separate Actions artifact
-      if: ${{ always() }}
-      uses: actions/upload-artifact@v4
-      with:
-        name: v8-full-log-${{ github.run_id }}-${{ github.run_attempt }}
-        path: pages-site/full-run.log
-        retention-days: 30
-        if-no-files-found: error
-    - name: Upload GitHub Pages site artifact
-      if: ${{ always() }}
-      uses: actions/upload-pages-artifact@v3
-      with:
-        path: pages-site
-    - name: Upload HTML, all logs, reports and generated sources even on failure
+    - name: Upload evidence even when experiments fail
+      id: evidence_upload
       if: ${{ always() }}
       uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
       with:
@@ -2667,37 +3158,65 @@ jobs:
         path: ${{ env.EVIDENCE_DIR }}/
         if-no-files-found: error
         retention-days: 14
-        compression-level: 6
-    - name: Fail closed unless real continuity and report generation both passed
+    - name: Upload separately downloadable logs
+      if: ${{ always() && steps.pages_build.outcome == 'success' }}
+      uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+      with:
+        name: v8-downloadable-logs-${{ github.run_id }}-${{ github.run_attempt }}
+        path: |
+          ${{ env.EVIDENCE_DIR }}/full-run.log
+          ${{ env.EVIDENCE_DIR }}/full-run.log.gz
+          ${{ env.EVIDENCE_DIR }}/evidence-logs.zip
+          ${{ env.EVIDENCE_DIR }}/status.json
+        if-no-files-found: error
+        retention-days: 14
+    - name: Upload Pages artifact independently of experiment success
+      id: pages_artifact
+      if: ${{ !cancelled() && inputs.publish_pages && steps.pages_build.outcome == 'success' }}
+      uses: actions/upload-pages-artifact@7b1f4a764d45c48632c6b24a0339c27f5614fb0b
+      with:
+        path: pages-site
+    - name: Fail unless every required experiment and log package passed
+      id: final_gate
       if: ${{ always() }}
       shell: bash
       run: |
-        set -Eeuo pipefail
+        set +e
+        set -uo pipefail
         python3 -u "$BUNDLE_DIR/report_tools.py" gate
-        python3 - <<'PY_FIDELITY_GATE'
-        import json, os, pathlib, sys
-        path=pathlib.Path(os.environ['EVIDENCE_DIR'])/'fidelity-matrix.json'
-        obj=json.loads(path.read_text()) if path.exists() else {'status':'missing'}
-        print('FINAL FIDELITY GATE |',obj['status'],flush=True)
-        other=pathlib.Path(os.environ['EVIDENCE_DIR'])/'intervention-suite.json'
-        inter=json.loads(other.read_text()) if other.exists() else {'status':'missing'}
-        print('FINAL EXTENDED REPLAY GATE |',inter['status'],flush=True)
-        sys.exit(0 if obj['status']=='passed' and inter['status']=='passed' else 1)
-        PY_FIDELITY_GATE
-
+        experiment_rc=$?
+        python3 - <<'PYPACKAGE'
+        import json,os,pathlib
+        p=pathlib.Path(os.environ['EVIDENCE_DIR'])/'pages-build.json'
+        r=json.loads(p.read_text()) if p.exists() else {'status':'missing'}
+        print('FINAL LOG PACKAGE |',r.get('status'),'|',r.get('exception',''),flush=True)
+        raise SystemExit(0 if r.get('status')=='passed' else 1)
+        PYPACKAGE
+        package_rc=$?
+        if [ "$experiment_rc" -ne 0 ] || [ "$package_rc" -ne 0 ]; then exit 1; fi
   deploy_pages:
-    name: Publish static evidence viewer to GitHub Pages
+    name: Publish static evidence, including failed experiment reports
     needs: feasibility
-    if: ${{ always() }}
+    if: ${{ !cancelled() && needs.feasibility.outputs.pages_artifact == 'success' }}
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
     permissions:
+      contents: read
       pages: write
       id-token: write
-      contents: read
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
-      - name: Deploy static site
-        id: deployment
-        uses: actions/deploy-pages@v4
+    - name: Check configured Pages site
+      uses: actions/configure-pages@983d7736d9b0ae728b81ab479565c72886d7745b
+    - name: Deploy static site
+      id: deployment
+      uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e
+    - name: Record website URL
+      env:
+        PAGE_URL: ${{ steps.deployment.outputs.page_url }}
+      shell: bash
+      run: |
+        printf "GitHub Pages: %s\n" "$PAGE_URL"
+        printf "## Published evidence\n%s\n" "$PAGE_URL" >> "$GITHUB_STEP_SUMMARY"
