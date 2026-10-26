@@ -1,25 +1,14 @@
-# Revision: context-fix-2. Replace .github/workflows/v8-replay-verbose.yml in full.
-# Single file: put ONLY this YAML in .github/workflows/v8-checkpoint-atlas.yml.
-# All project Python, Bash, JavaScript, HTML and CSS are embedded below.
-# No checkout, companion files, Python packages, npm packages or API keys.
-# Internet is required for APT dependencies, pinned CRIU source, the pinned V8 image,
-# and the pinned upload-artifact action. This is NOT an air-gapped distribution.
-#
-# SECURITY/SCOPE: disposable GitHub-hosted Ubuntu runner only. Restarts Docker.
-# No network inside the target container, no Docker socket mount, no terminal/TTY.
-# seccomp and AppArmor are relaxed only for the test container to support CRIU.
-# Raw checkpoint images are not uploaded. Do not add secrets to the workload.
-# HTML rewind is evidence navigation; real restoration happens during this job.
-#
-# DEPENDENCY PROVENANCE:
-# https://github.com/checkpoint-restore/criu/commit/2b7ac603cda31d015d91c856c34c557cb2300e7d
-# https://docs.docker.com/reference/cli/docker/checkpoint/
-# https://raw.githubusercontent.com/sunblaze-ucb/exploitgym/main/data/tasks/v8/human/446124892/challenge/patch
-# https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax
-# Every run block is kept below GitHub's documented 21,000-character limit.
-#
-# LOCAL VALIDATION IS NOT A LIVE GITHUB/DOCKER/CRIU RESULT.
-name: V8 Checkpoint Atlas - context-fix-2 - ultra verbose
+# SINGLE SELF-CONTAINED FILE. Replace .github/workflows/v8-replay-verbose.yml.
+# Revision network-fix-3: source-supported workaround for Moby #50750.
+# The dedicated namespace keeper uses --network none. The target shares ONLY
+# that keeper's namespace, not the host. Its external namespace is retained,
+# NOT checkpointed, rewound or portable. No normal-start fallback after failure.
+# All project source, tests, HTML and 19 annotated documentation references are
+# embedded here. APT, pinned CRIU source, image pull and artifact upload need Internet.
+# Scope: disposable GitHub-hosted Linux runner; this restarts Docker.
+# Raw memory images are excluded from artifacts. Offline HTML controls inspect evidence.
+# Local tests are NOT evidence of successful real Docker/CRIU restoration.
+name: V8 Checkpoint Atlas - network-fix-3 - ultra verbose
 'on':
   workflow_dispatch:
     inputs:
@@ -59,7 +48,7 @@ jobs:
       shell: bash
       run: |
         set -Eeuo pipefail
-        printf 'Workflow revision: context-fix-2\n'
+        printf 'Workflow revision: network-fix-3\n'
         mkdir -p "$BUNDLE_DIR" "$EVIDENCE_DIR" "$EVIDENCE_DIR/sources"
         printf '
         === V8 CHECKPOINT ATLAS: SINGLE YAML, FULL CONSOLE OUTPUT ===
@@ -75,6 +64,198 @@ jobs:
         printf 'Evidence: %s
         Sources: %s
         ' "$EVIDENCE_DIR" "$BUNDLE_DIR"
+    - name: Embed netns_guard.py [1/1]
+      shell: bash
+      run: |
+        set -Eeuo pipefail
+        cat > "$BUNDLE_DIR/netns_guard.py" <<'EMBED_NETNS_GUARD_PY_1'
+        """Same-host external network-namespace fixture for Moby #50750.
+
+        The keeper is NOT checkpointed. The target joins its pre-existing, loopback-only
+        network namespace. Nothing here restores external namespace state. No host
+        networking, synthetic PID, blind retry, or ordinary-start fallback is allowed.
+        """
+        import json
+        import re
+
+        ISSUE = 'https://github.com/moby/moby/issues/50750'
+
+
+        def positive_pid(value):
+            if type(value) is not int or value <= 1:
+                raise ValueError('A live container PID greater than 1 is required; refusing /proc/0 or host init')
+            return value
+
+
+        def namespace_inode(text):
+            match = re.fullmatch(r'net:\[([1-9][0-9]*)\]', text.strip())
+            if not match:
+                raise ValueError('Invalid network namespace identity: ' + repr(text))
+            return int(match.group(1))
+
+
+        def isolation_checks(links, routes4, routes6, keeper_ns, host_ns, target_ns=None):
+            def valid_routes(rows):
+                return isinstance(rows, list) and all(isinstance(r, dict) and
+                    r.get('dev') == 'lo' and r.get('dst') != 'default' and not r.get('gateway') and
+                    not r.get('multipath') and not r.get('nexthops') for r in rows)
+            names = [x.get('ifname') for x in links if isinstance(x, dict)] if isinstance(links, list) else []
+            return {
+                'keeper_namespace_valid': type(keeper_ns) is int and keeper_ns > 0,
+                'host_namespace_valid': type(host_ns) is int and host_ns > 0,
+                'not_host_network_namespace': keeper_ns != host_ns,
+                'only_loopback_interface': names == ['lo'] and len(links) == 1,
+                'ipv4_routes_loopback_only': valid_routes(routes4),
+                'ipv6_routes_loopback_only': valid_routes(routes6),
+                **({'target_joins_keeper_namespace': target_ns == keeper_ns} if target_ns is not None else {}),
+            }
+
+
+        def classify_restore_error(text):
+            if 'bind-mount /proc/0/ns/net' in text:
+                return {'code': 'docker_network_namespace_pid_zero', 'reference': ISSUE,
+                        'explanation': 'Known Docker restore namespace lifecycle signature; not a heap-fidelity result.',
+                        'action': 'Inspect network-*.json, namespace keeper liveness, daemon journal and CRIU restore logs. No host-network fallback.'}
+            return {'code': 'runtime_restore_failed',
+                    'explanation': 'Restore did not complete. The exact command error remains authoritative.',
+                    'action': 'Inspect checkpoint-restore stderr, runtime journal, and CRIU dump/restore logs.'}
+
+
+        class NetworkNamespaceGuard:
+            """Keep a distinct namespace alive and validate its identity at every boundary."""
+            def __init__(self, audit, image, suffix):
+                if not re.fullmatch(r'[a-f0-9]{12}', suffix):
+                    raise ValueError('Keeper suffix must be twelve hexadecimal characters')
+                self.audit = audit
+                self.image = image
+                self.name = 'v8-netns-' + suffix
+                self.cid = None
+                self.pid = None
+                self.inode = None
+                self.started_at = None
+                self.cleanup_needed = False
+                self.history = []
+
+            def _inspect(self, container):
+                _, out, _ = self.audit.run('netns-inspect',
+                    ['docker', 'inspect', '--format', '{{json .}}', container], required=True)
+                obj = json.loads(out)
+                if not isinstance(obj, dict):
+                    raise ValueError('Expected Docker inspect object')
+                return obj
+
+            def _inode(self, pid, label):
+                # Host identity has a separate explicit read below; never pass PID 1 here.
+                positive_pid(pid)
+                _, out, _ = self.audit.run(label, ['sudo', '-n', 'readlink', f'/proc/{pid}/ns/net'], required=True)
+                return namespace_inode(out)
+
+            def _network_json(self, pid, arguments, label):
+                positive_pid(pid)
+                _, out, _ = self.audit.run(label,
+                    ['sudo', '-n', 'nsenter', '--target', str(pid), '--net', '--', 'ip', '-j', *arguments], required=True)
+                data = json.loads(out)
+                if not isinstance(data, list):
+                    raise ValueError('Expected iproute2 JSON array')
+                return data
+
+            def start(self):
+                a = self.audit
+                a.event('network_strategy', strategy='persistent-isolated-keeper', reference=ISSUE,
+                    external_state='Loopback-only namespace retained, not rewound', host_network=False,
+                    target_image_modified=False, engine_downgraded=False)
+                command = ['docker', 'create', '--name', self.name, '--network', 'none',
+                    '--label', 'v8.atlas.role=netns-keeper', '--label', 'v8.atlas.revision=network-fix-3',
+                    '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges',
+                    '--memory', '64m', '--memory-swap', '64m', '--cpus', '0.1', '--pids-limit', '16',
+                    '--restart', 'no', '--entrypoint', '/bin/sh', self.image, '-c', 'exec sleep 2147483647']
+                # Mark for cleanup before create, so partial runtime failures are not ignored.
+                self.cleanup_needed = True
+                _, out, _ = a.run('netns-keeper-create', command, required=True)
+                self.cid = out.strip()
+                a.require('namespace keeper has a full Docker ID', bool(re.fullmatch(r'[a-f0-9]{64}', self.cid)), self.cid)
+                a.run('netns-keeper-start', ['docker', 'start', self.cid], required=True)
+                initial = self.verify('keeper-created')
+                self.pid = initial['keeper_pid']
+                self.inode = initial['keeper_inode']
+                self.started_at = initial['keeper_started_at']
+                a.report['external_dependencies'] = self.description()
+                return 'container:' + self.cid
+
+            def description(self):
+                return {'strategy': 'persistent-isolated-keeper', 'keeper_name': self.name,
+                        'keeper_id': self.cid, 'keeper_pid': self.pid, 'keeper_network_inode': self.inode,
+                        'checkpointed': False, 'restoration_scope': 'Same-host target process; retained loopback namespace fixture',
+                        'host_network': False, 'namespace_state_rewound': False,
+                        'checks_recorded': len(self.history), 'reference': ISSUE}
+
+            def verify(self, boundary, target=None):
+                if not re.fullmatch(r'[a-zA-Z0-9_-]+', boundary):
+                    raise ValueError('Unsafe diagnostic filename')
+                a = self.audit
+                keeper = self._inspect(self.cid or self.name)
+                state = keeper.get('State', {})
+                a.require(boundary + ': keeper still running', state.get('Running') is True, state)
+                pid = positive_pid(state.get('Pid'))
+                a.require(boundary + ': keeper remains isolated',
+                          keeper.get('HostConfig', {}).get('NetworkMode') == 'none')
+                a.require(boundary + ': keeper identity unchanged', keeper.get('Id') == self.cid)
+                a.require(boundary + ': keeper never restarted', keeper.get('RestartCount') == 0)
+                if self.pid is not None:
+                    a.require(boundary + ': keeper PID and start time unchanged',
+                        pid == self.pid and state.get('StartedAt') == self.started_at,
+                        {'old_pid': self.pid, 'pid': pid, 'started_at': state.get('StartedAt')})
+                inode = self._inode(pid, 'netns-keeper-inode')
+                if self.inode is not None:
+                    a.require(boundary + ': keeper namespace retained', inode == self.inode,
+                        {'captured_inode': self.inode, 'current_inode': inode})
+                _, out, _ = a.run('netns-host-inode', ['sudo', '-n', 'readlink', '/proc/1/ns/net'], required=True)
+                host_inode = namespace_inode(out)
+                links = self._network_json(pid, ['link', 'show'], 'netns-links')
+                routes4 = self._network_json(pid, ['-4', 'route', 'show', 'table', 'all'], 'netns-ipv4-routes')
+                routes6 = self._network_json(pid, ['-6', 'route', 'show', 'table', 'all'], 'netns-ipv6-routes')
+                target_pid, target_inode = None, None
+                if target is not None:
+                    inspected = self._inspect(target)
+                    a.require(boundary + ': target running for namespace verification',
+                        inspected.get('State', {}).get('Running') is True, inspected.get('State'))
+                    a.require(boundary + ': target uses explicit keeper namespace',
+                        inspected.get('HostConfig', {}).get('NetworkMode') == 'container:' + self.cid,
+                        inspected.get('HostConfig', {}).get('NetworkMode'))
+                    target_pid = positive_pid(inspected['State'].get('Pid'))
+                    target_inode = self._inode(target_pid, 'netns-target-inode')
+                checks = isolation_checks(links, routes4, routes6, inode, host_inode, target_inode)
+                item = {'boundary': boundary, 'keeper_pid': pid, 'keeper_inode': inode,
+                    'keeper_started_at': state.get('StartedAt'), 'host_inode': host_inode,
+                    'target_pid': target_pid, 'target_inode': target_inode, 'links': links,
+                    'ipv4_routes': routes4, 'ipv6_routes': routes6, 'checks': checks,
+                    'external_namespace_retained_not_rewound': True}
+                self.history.append(item)
+                (a.root / ('network-' + boundary + '.json')).write_text(json.dumps(item, indent=2) + '\n')
+                a.event('network_namespace_evidence', **item)
+                for key, passed in checks.items():
+                    a.require(boundary + ': ' + key, passed)
+                return item
+
+            def close(self, target=None):
+                if not self.cleanup_needed:
+                    return
+                a = self.audit
+                if target:
+                    rc, out, err = a.run('netns-cleanup-target-check',
+                        ['docker', 'inspect', '--format', '{{json .State}}', target])
+                    if rc == 0:
+                        # Remove the target BEFORE releasing its external namespace.
+                        rc, _, _ = a.run('netns-cleanup-target', ['docker', 'rm', '-f', target])
+                        if rc != 0:
+                            raise RuntimeError('Target cleanup failed; retaining its namespace keeper until disposable runner teardown')
+                    elif 'no such object' not in err.lower() and 'no such container' not in err.lower():
+                        raise RuntimeError('Cannot establish target absence; retaining namespace keeper until runner teardown')
+                rc, _, err = a.run('netns-keeper-cleanup', ['docker', 'rm', '-f', self.cid or self.name])
+                if rc != 0 and 'no such container' not in err.lower():
+                    raise RuntimeError('Namespace keeper cleanup failed; see command logs')
+                self.cleanup_needed = False
+        EMBED_NETNS_GUARD_PY_1
     - name: Embed checkpoint_probe.py [1/3]
       shell: bash
       run: |
@@ -94,6 +275,7 @@ jobs:
         import time
         import traceback
         import uuid
+        from netns_guard import NetworkNamespaceGuard, classify_restore_error
 
         # No removed shell file APIs are required. The native binary is not patched.
         # Timed rendezvous: the tracked probe words stay unchanged during a wall-clock gate.
@@ -391,212 +573,159 @@ jobs:
                         raise RuntimeError('Target exited before required event: ' + json.dumps(state) +
                                            '\nSTDOUT:\n' + out[-8000:] + '\nSTDERR:\n' + err[-8000:])
                     if prefix and not logs.startswith(prefix):
-                        raise RuntimeError('Target log prefix changed; old and new output cannot be distinguished safely')
-                    delta = logs[len(prefix):] if prefix else logs
-                    matches = [e for e in marker_events(delta) if predicate(e)]
-                    if matches:
-                        self.event('marker_observed', snapshot=matches[-1], polling_attempt=poll)
-                        return matches[-1], logs
-                    time.sleep(0.5)
-                raise TimeoutError('Expected V8 marker did not appear before deadline; inspect target output and container state')
-
-            def resource_snapshot(self, container, reason):
-                state = self.state(container)
-                pid = state.get('Pid', 0)
-                self.event('resource_boundary', reason=reason, container_state=state)
-                if not isinstance(pid, int) or pid <= 0 or not state.get('Running'):
-                    self.say('No live PID: RSS is unobserved, not zero.')
-                    return
-                code = r'''import json, pathlib, sys
-        pid=int(sys.argv[1]); p=pathlib.Path('/proc')/str(pid)
-        status=(p/'status').read_text()
-        values={line.split(':',1)[0]:line.split(':',1)[1].strip() for line in status.splitlines() if ':' in line}
         EMBED_CHECKPOINT_PROBE_PY_1
-        printf "Embedded checkpoint_probe.py part 1/3; cumulative bytes: "
-        wc -c < "$BUNDLE_DIR/checkpoint_probe.py"
     - name: Embed checkpoint_probe.py [2/3]
+      shell: bash
+      run: "set -Eeuo pipefail\ncat >> \"$BUNDLE_DIR/checkpoint_probe.py\" <<'EMBED_CHECKPOINT_PROBE_PY_2'\n             \
+        \   raise RuntimeError('Target log prefix changed; old and new output cannot be distinguished safely')\n         \
+        \   delta = logs[len(prefix):] if prefix else logs\n            matches = [e for e in marker_events(delta) if predicate(e)]\n\
+        \            if matches:\n                self.event('marker_observed', snapshot=matches[-1], polling_attempt=poll)\n\
+        \                return matches[-1], logs\n            time.sleep(0.5)\n        raise TimeoutError('Expected V8 marker\
+        \ did not appear before deadline; inspect target output and container state')\n\n    def resource_snapshot(self, container,\
+        \ reason):\n        state = self.state(container)\n        pid = state.get('Pid', 0)\n        self.event('resource_boundary',\
+        \ reason=reason, container_state=state)\n        if not isinstance(pid, int) or pid <= 0 or not state.get('Running'):\n\
+        \            self.say('No live PID: RSS is unobserved, not zero.')\n            return\n        code = r'''import\
+        \ json, pathlib, sys\npid=int(sys.argv[1]); p=pathlib.Path('/proc')/str(pid)\nstatus=(p/'status').read_text()\nvalues={line.split(':',1)[0]:line.split(':',1)[1].strip()\
+        \ for line in status.splitlines() if ':' in line}\nmem={line.split(':',1)[0]:int(line.split()[1])*1024 for line in\
+        \ pathlib.Path('/proc/meminfo').read_text().splitlines() if ':' in line}\nresult={'pid':pid,'process_status':values,'host_available_bytes':mem.get('MemAvailable')}\n\
+        for name,key in [('VmRSS','rss_bytes'),('VmSize','virtual_bytes'),('VmHWM','peak_rss_bytes')]:\n    value=values.get(name)\n\
+        \    if value: result[key]=int(value.split()[0])*1024\nresult['cgroup']=(p/'cgroup').read_text()\nfor line in result['cgroup'].splitlines():\n\
+        \    if line.startswith('0::'):\n        cg=pathlib.Path('/sys/fs/cgroup')/line.split('::',1)[1].lstrip('/')\n   \
+        \     for name in ['memory.current','memory.peak','memory.max','memory.events','memory.swap.max']:\n            try:\
+        \ result[name]=(cg/name).read_text().strip()\n            except OSError: pass\nprint(json.dumps(result,sort_keys=True))\n\
+        '''\n        rc, out, err = self.run('process-memory-' + reason, ['sudo','python3','-c',code,str(pid)])\n        if\
+        \ rc == 0:\n            try:\n                sample = json.loads(out)\n                self.event('resource_sample',\
+        \ relative_s=round(time.monotonic()-self.monotonic_start,4),\n                           reason=reason, **sample)\n\
+        \            except ValueError:\n                self.event('resource_unavailable', reason=reason, error='Could not\
+        \ parse process-memory data')\n        else:\n            self.event('resource_unavailable', reason=reason, error=err)\n\
+        \        self.run('process-list-' + reason, ['docker','top',container,'-eo','pid,ppid,stat,etime,rss,vsz,args'])\n\
+        \n    def wait_stopped_until(self, deadline_ms):\n        wait = max(0.0, deadline_ms / 1000.0 + 0.2 - time.time())\n\
+        \        limit = time.monotonic() + wait\n        self.event('timed_gate_wait', seconds=round(wait,3), deadline_ms=deadline_ms,\n\
+        \                   explanation='Target is checkpointed and stopped. Host clock continues; this is not clock replay.')\n\
+        \        while time.monotonic() < limit:\n            remaining = limit - time.monotonic()\n            self.say(f'STOPPED\
+        \ GATE HEARTBEAT | waiting={remaining:.2f}s | no target is executing')\n            time.sleep(min(self.heartbeat_s,\
+        \ remaining))\n\n    def evidence_for_container(self, container, docker_root):\n        self.run(\"inspect-complete\"\
+        , [\"docker\", \"inspect\", container])\n        self.run(\"stats\", [\"docker\", \"stats\", \"--no-stream\", container],\
+        \ timeout=30)\n        rc, out, _ = self.run(\"container-id\", [\"docker\", \"inspect\", \"--format\", \"{{.Id}}\"\
+        , container])\n        cid = out.strip()\n        if rc != 0 or not re.fullmatch(r\"[0-9a-f]{64}\", cid):\n      \
+        \      return\n        # Copy logs and inventory only. Do NOT upload raw process-memory images.\n        collect =\
+        \ r'''\nimport json, pathlib, shutil, sys\nbase, dst = map(pathlib.Path, sys.argv[1:])\ndst.mkdir(parents=True, exist_ok=True)\n\
+        rows = []\nif base.exists():\n    for path in sorted(base.rglob('*')):\n        if path.is_file() and not path.is_symlink():\n\
+        \            rows.append({'path': str(path.relative_to(base)), 'bytes': path.stat().st_size})\n            if path.suffix\
+        \ in ('.log', '.txt'):\n                target = dst / str(path.relative_to(base)).replace('/', '__')\n          \
+        \      shutil.copyfile(path, target)\n(dst / 'inventory.json').write_text(json.dumps(rows, indent=2))\nprint(json.dumps(rows,\
+        \ indent=2))\n'''\n        self.run(\"checkpoint-inventory\", [\"sudo\", \"python3\", \"-c\", collect,\n         \
+        \           str(Path(docker_root) / \"containers\" / cid / \"checkpoints\"),\n                    str(self.root /\
+        \ \"criu-checkpoint-logs\")])\n\n    def main(self):\n        suffix = uuid.uuid4().hex[:12]\n        container =\
+        \ \"v8-criu-\" + suffix\n        guard = None\n        row = None\n        created = False\n        docker_root =\
+        \ \"/var/lib/docker\"\n        try:\n            for filename in (\"self-tests.json\", \"network-self-tests.json\"\
+        , \"setup.json\", \"daemon-setup.json\"):\n                path = self.root / filename\n                status = json.loads(path.read_text())\
+        \ if path.exists() else {\"status\": \"missing\"}\n                self.require(filename + \" succeeded\", status.get(\"\
+        status\") == \"passed\", status)\n            rounds = int(os.environ.get(\"RESTORE_ROUNDS\", \"2\"))\n          \
+        \  warmup = int(os.environ.get(\"WARMUP\", \"3\"))\n            gate = int(os.environ.get(\"TIMED_GATE_SECONDS\",\
+        \ \"45\"))\n            self.require(\"round count within bounds\", 1 <= rounds <= 5, rounds)\n            self.require(\"\
+        warmup within bounds\", 1 <= warmup <= 30, warmup)\n            self.require(\"timed gate within bounds\", 15 <= gate\
+        \ <= 180, gate)\n            image = os.environ[\"IMAGE\"]\n            self.require(\"image pinned by SHA256 digest\"\
+        , bool(re.fullmatch(r\"[^\\s]+@sha256:[0-9a-f]{64}\", image)), image)\n            self.report.update(image=image,\
+        \ requested_rounds=rounds, gate_seconds=gate,\n                               run_id=os.environ.get('GITHUB_RUN_ID','local'))\n\
+        \            self.stage = \"image_setup\"\n            self.run(\"image-pull\", [\"docker\", \"pull\", image], timeout=600,\
+        \ required=True)\n            self.run(\"image-inspect\", [\"docker\", \"image\", \"inspect\", image], required=True)\n\
+        \            docker_root = self.run(\"docker-root\", [\"docker\", \"info\", \"--format\", \"{{.DockerRootDir}}\"],\
+        \ required=True)[1].strip()\n            find_script = 'command -v d8 || find / -xdev -type f -name d8 -executable\
+        \ 2>/dev/null; true'\n            _, found, _ = self.run(\"find-d8\", [\"docker\", \"run\", \"--rm\", \"--network\"\
+        , \"none\", \"--entrypoint\", \"/bin/sh\", image, \"-c\", find_script], timeout=120, required=True)\n            candidates\
+        \ = [s.strip() for s in found.splitlines() if s.strip().startswith(\"/\") and \" \" not in s.strip()]\n          \
+        \  self.require(\"real d8 binary found\", bool(candidates), found)\n            d8 = candidates[0]\n            self.report[\"\
+        d8\"] = d8\n            options = [\"--runtime\", \"runc\", \"--network\", \"none\", \"--memory\", \"4g\", \"--memory-swap\"\
+        , \"4g\",\n                       \"--cpus\", \"2\", \"--pids-limit\", \"256\", \"--security-opt\", \"seccomp=unconfined\"\
+        ,\n                       \"--security-opt\", \"apparmor=unconfined\", \"--workdir\", str(Path(d8).parent)]\n    \
+        \        self.report[\"container_options\"] = options\n            self.run(\"d8-version\", [\"docker\", \"run\",\
+        \ \"--rm\", *options, \"--entrypoint\", d8, image, \"--version\"], required=True)\n            self.run('d8-binary-hash',\
+        \ ['docker','run','--rm','--network','none','--entrypoint','/bin/sh',image,\n                                    \
+        \  '-c','sha256sum \"$1\"; uname -a; ls -l \"$1\"','sh',d8],required=True)\n            self.stage = \"api_capabilities\"\
+        \n            rc, out, err = self.run('d8-api-capabilities', ['docker','run','--rm',*options,'--entrypoint',d8,image,'-e',CAPABILITY_JS])\n\
+        \            caps = parse_capabilities(out + \"\\n\" + err)\n            self.report['d8_capabilities'] = caps\n \
+        \           (self.root/'d8-capabilities.json').write_text(json.dumps(caps,indent=2)+'\\n')\n            self.require('real\
+        \ d8 has a supported output API', rc == 0 and\n                         (caps.get('print') == 'function' or caps.get('console_log')\
+        \ == 'function'),\n                         {'exit_code':rc,'capabilities':caps,'stdout':out,'stderr':err})\n    \
+        \        self.require('real d8 has standard typed arrays and time',\n                         caps.get('uint32array')\
+        \ == 'function' and caps.get('date_now') == 'function',caps)\n            self.event('probe_protocol', protocol='timed-gate-v1',\n\
+        \                       read_api_required=False, target_binary_modified=False,\n                       note='No shell\
+        \ read()/readline() or file API is used. A timed boundary is not deterministic clock replay.')\n            self.stage\
+        \ = \"network_fixture_setup\"\n            guard = NetworkNamespaceGuard(self, image, suffix)\n            network_mode\
+        \ = guard.start()\n            options = list(options)\n            options[options.index('--network') + 1] = network_mode\n\
+        \            self.report['container_options'] = options\n            self.report['workflow_revision'] = 'network-fix-3'\n\
+        \            self.report['limitations'].append(\n                'Network namespace is an explicitly retained loopback-only\
+        \ fixture, not restored from the checkpoint.')\n            self.event('target_network_selection', mode=network_mode,\n\
+        \                       reason='Bypass Moby #50750 new-namespace restore path without host networking')\n        \
+        \    self.stage = \"v8_start\"\n            self.run(\"container-create\", [\"docker\", \"create\", \"--name\", container,\
+        \ *options,\n                      \"--log-driver\", \"json-file\", \"--entrypoint\", d8, image, \"/tmp/v8-checkpoint-probe.js\"\
+        ], required=True)\n            created = True\n            js = self.root / \"probe.js\"\n            js.write_text(probe_source(rounds,warmup,gate))\n\
+        \            self.report[\"probe_sha256\"] = hashlib.sha256(js.read_bytes()).hexdigest()\n            self.run(\"\
+        copy-probe\", [\"docker\", \"cp\", str(js), container + \":/tmp/v8-checkpoint-probe.js\"], required=True)\n      \
+        \      self.run(\"container-start\", [\"docker\", \"start\", container], required=True)\n            self.wait_event(container,\
+        \ lambda e: e.get(\"event\") == \"tick\")\n            guard.verify('target-started', container)\n            self.resource_snapshot(container,'startup')\n\
+        \            for number in range(1, rounds + 1):\n                checkpoint = f\"round-{number}\"\n             \
+        \   self.stage = \"pause\"\n                paused, _ = self.wait_event(container, lambda e: e.get('event') == 'paused'\
+        \ and e.get('round') == number,\n                                            timeout=warmup+45)\n                ticket\
+        \ = paused.get('ticket')\n                deadline = paused.get('deadline_ms')\n                self.require(f'round\
+        \ {number}: valid timed gate', isinstance(ticket,str) and\n                             type(deadline) is int and\
+        \ deadline/1000-time.time() > 2,\n                             {'ticket':ticket,'deadline_ms':deadline,'host_now_ms':int(time.time()*1000)})\n\
+        \                row = {'round':number,'checkpoint':checkpoint,'ticket':ticket,'paused':paused,'checks':{},\n    \
+        \                   'capture_status':'not_attempted','restore_status':'not_attempted','fidelity_status':'not_reached'}\n\
+        \                self.report['rounds'].append(row)\n                self.event(\"round_start\", number=number, ticket=ticket,\
+        \ checkpoint=checkpoint)\n                self.require(f\"round {number}: alive before dump\", self.state(container).get(\"\
+        Running\") is True)\n                self.stage = \"pre_capture_namespace\"\n                guard.verify(f'round-{number}-pre-capture',\
+        \ container)\n                self.stage = \"checkpoint\"\n                row['capture_status'] = 'attempting'\n\
+        \                start = time.monotonic()\n                self.run(\"checkpoint-create\", [\"docker\", \"checkpoint\"\
+        , \"create\", container, checkpoint], timeout=180, required=True)\n                row['dump_s'] = time.monotonic()\
+        \ - start\n                row['capture_status'] = 'command_succeeded'\n                self.require(f\"round {number}:\
+        \ stopped after dump\", self.state(container).get(\"Running\") is False)\n                baseline = self.logs(container)\n\
+        \                time.sleep(0.5)\n                self.require(f\"round {number}: logs stable while stopped\", self.logs(container)\
+        \ == baseline)\n                self.require(f\"round {number}: gate did not expire before capture\",\n          \
+        \                   not any(e.get('event') == 'resumed' and e.get('ticket') == ticket for e in marker_events(baseline)),\n\
+        \                             'If false, increase timed_gate_seconds; this is not a valid pause-state capture.')\n\
+        \                (self.root / f\"round-{number}-stopped-baseline.log\").write_text(baseline)\n                self.evidence_for_container(container,\
+        \ docker_root)\n                self.stage = 'stopped_namespace_verification'\n                guard.verify(f'round-{number}-stopped')\n\
+        \                row['capture_status'] = 'passed'\n                self.stage = 'stopped_gate_wait' \n           \
+        \     self.wait_stopped_until(deadline)\n                self.stage = \"pre_restore_namespace\"\n                guard.verify(f'round-{number}-pre-restore')\n\
+        \                self.stage = \"restore\"\n                row['restore_status'] = 'attempting'\n                start\
+        \ = time.monotonic()\n                self.run(\"checkpoint-restore\", [\"docker\", \"start\", \"--checkpoint\", checkpoint,\
+        \ container], timeout=180, required=True)\n                row['restore_s'] = time.monotonic() - start\n         \
+        \       row['restore_status'] = 'command_succeeded'\n                self.require(f\"round {number}: running after\
+        \ restore\", self.state(container).get(\"Running\") is True)\n                self.stage = 'restored_namespace_verification'\n\
+        \                guard.verify(f'round-{number}-restored', container)\n                row['restore_status'] = 'passed'\n\
+        \                self.stage = \"fidelity\"\n                row['fidelity_status'] = 'checking'\n                resumed,\
+        \ _ = self.wait_event(container, lambda e: e.get(\"event\") == \"resumed\" and e.get(\"ticket\") == ticket, prefix=baseline)\n\
+        \                _, after = self.wait_event(container, lambda e: e.get(\"event\") == \"tick\" and e.get(\"tick\",\
+        \ -1) > paused[\"tick\"], prefix=baseline)\n                running = self.state(container).get(\"Running\") is True\n\
+        \                checks = continuity_checks(paused, baseline, after, ticket, running)\n                row.update(checks=checks,resumed=resumed)\n\
+        \                (self.root / f\"round-{number}-resumed.log\").write_text(after)\n                # Emit explicit\
+        \ observed values, not a success label without evidence.\n                for key in ('token','tick','digest','hot','words'):\n\
+        \                    self.say(f\"FIDELITY {key} | before={paused.get(key)!r} | after={resumed.get(key)!r}\")\n   \
+        \             bad = [i for i,(a,b) in enumerate(zip(paused.get('heap_words',[]),resumed.get('heap_words',[]))) if\
+        \ a != b]\n                self.say(f\"FIDELITY probe words | compared={len(paused.get('heap_words',[]))} | mismatching_indices={bad}\"\
+        )\n                for key, value in checks.items():\nEMBED_CHECKPOINT_PROBE_PY_2\n"
+    - name: Embed checkpoint_probe.py [3/3]
       shell: bash
       run: |
         set -Eeuo pipefail
-        cat >> "$BUNDLE_DIR/checkpoint_probe.py" <<'EMBED_CHECKPOINT_PROBE_PY_2'
-        mem={line.split(':',1)[0]:int(line.split()[1])*1024 for line in pathlib.Path('/proc/meminfo').read_text().splitlines() if ':' in line}
-        result={'pid':pid,'process_status':values,'host_available_bytes':mem.get('MemAvailable')}
-        for name,key in [('VmRSS','rss_bytes'),('VmSize','virtual_bytes'),('VmHWM','peak_rss_bytes')]:
-            value=values.get(name)
-            if value: result[key]=int(value.split()[0])*1024
-        result['cgroup']=(p/'cgroup').read_text()
-        for line in result['cgroup'].splitlines():
-            if line.startswith('0::'):
-                cg=pathlib.Path('/sys/fs/cgroup')/line.split('::',1)[1].lstrip('/')
-                for name in ['memory.current','memory.peak','memory.max','memory.events','memory.swap.max']:
-                    try: result[name]=(cg/name).read_text().strip()
-                    except OSError: pass
-        print(json.dumps(result,sort_keys=True))
-        '''
-                rc, out, err = self.run('process-memory-' + reason, ['sudo','python3','-c',code,str(pid)])
-                if rc == 0:
-                    try:
-                        sample = json.loads(out)
-                        self.event('resource_sample', relative_s=round(time.monotonic()-self.monotonic_start,4),
-                                   reason=reason, **sample)
-                    except ValueError:
-                        self.event('resource_unavailable', reason=reason, error='Could not parse process-memory data')
-                else:
-                    self.event('resource_unavailable', reason=reason, error=err)
-                self.run('process-list-' + reason, ['docker','top',container,'-eo','pid,ppid,stat,etime,rss,vsz,args'])
-
-            def wait_stopped_until(self, deadline_ms):
-                wait = max(0.0, deadline_ms / 1000.0 + 0.2 - time.time())
-                limit = time.monotonic() + wait
-                self.event('timed_gate_wait', seconds=round(wait,3), deadline_ms=deadline_ms,
-                           explanation='Target is checkpointed and stopped. Host clock continues; this is not clock replay.')
-                while time.monotonic() < limit:
-                    remaining = limit - time.monotonic()
-                    self.say(f'STOPPED GATE HEARTBEAT | waiting={remaining:.2f}s | no target is executing')
-                    time.sleep(min(self.heartbeat_s, remaining))
-
-            def evidence_for_container(self, container, docker_root):
-                self.run("inspect-complete", ["docker", "inspect", container])
-                self.run("stats", ["docker", "stats", "--no-stream", container], timeout=30)
-                rc, out, _ = self.run("container-id", ["docker", "inspect", "--format", "{{.Id}}", container])
-                cid = out.strip()
-                if rc != 0 or not re.fullmatch(r"[0-9a-f]{64}", cid):
-                    return
-                # Copy logs and inventory only. Do NOT upload raw process-memory images.
-                collect = r'''
-        import json, pathlib, shutil, sys
-        base, dst = map(pathlib.Path, sys.argv[1:])
-        dst.mkdir(parents=True, exist_ok=True)
-        rows = []
-        if base.exists():
-            for path in sorted(base.rglob('*')):
-                if path.is_file() and not path.is_symlink():
-                    rows.append({'path': str(path.relative_to(base)), 'bytes': path.stat().st_size})
-                    if path.suffix in ('.log', '.txt'):
-                        target = dst / str(path.relative_to(base)).replace('/', '__')
-                        shutil.copyfile(path, target)
-        (dst / 'inventory.json').write_text(json.dumps(rows, indent=2))
-        print(json.dumps(rows, indent=2))
-        '''
-                self.run("checkpoint-inventory", ["sudo", "python3", "-c", collect,
-                            str(Path(docker_root) / "containers" / cid / "checkpoints"),
-                            str(self.root / "criu-checkpoint-logs")])
-
-            def main(self):
-                container = "v8-criu-" + uuid.uuid4().hex[:12]
-                created = False
-                docker_root = "/var/lib/docker"
-                try:
-                    for filename in ("setup.json", "daemon-setup.json"):
-                        path = self.root / filename
-                        status = json.loads(path.read_text()) if path.exists() else {"status": "missing"}
-                        self.require(filename + " succeeded", status.get("status") == "passed", status)
-                    rounds = int(os.environ.get("RESTORE_ROUNDS", "2"))
-                    warmup = int(os.environ.get("WARMUP", "3"))
-                    gate = int(os.environ.get("TIMED_GATE_SECONDS", "45"))
-                    self.require("round count within bounds", 1 <= rounds <= 5, rounds)
-                    self.require("warmup within bounds", 1 <= warmup <= 30, warmup)
-                    self.require("timed gate within bounds", 15 <= gate <= 180, gate)
-                    image = os.environ["IMAGE"]
-                    self.require("image pinned by SHA256 digest", bool(re.fullmatch(r"[^\s]+@sha256:[0-9a-f]{64}", image)), image)
-                    self.report.update(image=image, requested_rounds=rounds, gate_seconds=gate,
-                                       run_id=os.environ.get('GITHUB_RUN_ID','local'))
-                    self.stage = "image_setup"
-                    self.run("image-pull", ["docker", "pull", image], timeout=600, required=True)
-                    self.run("image-inspect", ["docker", "image", "inspect", image], required=True)
-                    docker_root = self.run("docker-root", ["docker", "info", "--format", "{{.DockerRootDir}}"], required=True)[1].strip()
-                    find_script = 'command -v d8 || find / -xdev -type f -name d8 -executable 2>/dev/null; true'
-                    _, found, _ = self.run("find-d8", ["docker", "run", "--rm", "--network", "none", "--entrypoint", "/bin/sh", image, "-c", find_script], timeout=120, required=True)
-                    candidates = [s.strip() for s in found.splitlines() if s.strip().startswith("/") and " " not in s.strip()]
-                    self.require("real d8 binary found", bool(candidates), found)
-                    d8 = candidates[0]
-                    self.report["d8"] = d8
-                    options = ["--runtime", "runc", "--network", "none", "--memory", "4g", "--memory-swap", "4g",
-                               "--cpus", "2", "--pids-limit", "256", "--security-opt", "seccomp=unconfined",
-                               "--security-opt", "apparmor=unconfined", "--workdir", str(Path(d8).parent)]
-                    self.report["container_options"] = options
-                    self.run("d8-version", ["docker", "run", "--rm", *options, "--entrypoint", d8, image, "--version"], required=True)
-                    self.run('d8-binary-hash', ['docker','run','--rm','--network','none','--entrypoint','/bin/sh',image,
-                                              '-c','sha256sum "$1"; uname -a; ls -l "$1"','sh',d8],required=True)
-                    self.stage = "api_capabilities"
-                    rc, out, err = self.run('d8-api-capabilities', ['docker','run','--rm',*options,'--entrypoint',d8,image,'-e',CAPABILITY_JS])
-                    caps = parse_capabilities(out + "\n" + err)
-                    self.report['d8_capabilities'] = caps
-                    (self.root/'d8-capabilities.json').write_text(json.dumps(caps,indent=2)+'\n')
-                    self.require('real d8 has a supported output API', rc == 0 and
-                                 (caps.get('print') == 'function' or caps.get('console_log') == 'function'),
-                                 {'exit_code':rc,'capabilities':caps,'stdout':out,'stderr':err})
-                    self.require('real d8 has standard typed arrays and time',
-                                 caps.get('uint32array') == 'function' and caps.get('date_now') == 'function',caps)
-                    self.event('probe_protocol', protocol='timed-gate-v1',
-                               read_api_required=False, target_binary_modified=False,
-                               note='No shell read()/readline() or file API is used. A timed boundary is not deterministic clock replay.')
-                    self.stage = "v8_start"
-                    self.run("container-create", ["docker", "create", "--name", container, *options,
-                              "--log-driver", "json-file", "--entrypoint", d8, image, "/tmp/v8-checkpoint-probe.js"], required=True)
-                    created = True
-                    js = self.root / "probe.js"
-                    js.write_text(probe_source(rounds,warmup,gate))
-                    self.report["probe_sha256"] = hashlib.sha256(js.read_bytes()).hexdigest()
-                    self.run("copy-probe", ["docker", "cp", str(js), container + ":/tmp/v8-checkpoint-probe.js"], required=True)
-                    self.run("container-start", ["docker", "start", container], required=True)
-                    self.wait_event(container, lambda e: e.get("event") == "tick")
-                    self.resource_snapshot(container,'startup')
-                    for number in range(1, rounds + 1):
-                        checkpoint = f"round-{number}"
-                        self.stage = "pause"
-                        paused, _ = self.wait_event(container, lambda e: e.get('event') == 'paused' and e.get('round') == number,
-                                                    timeout=warmup+45)
-                        ticket = paused.get('ticket')
-                        deadline = paused.get('deadline_ms')
-                        self.require(f'round {number}: valid timed gate', isinstance(ticket,str) and
-                                     type(deadline) is int and deadline/1000-time.time() > 2,
-                                     {'ticket':ticket,'deadline_ms':deadline,'host_now_ms':int(time.time()*1000)})
-                        row = {'round':number,'checkpoint':checkpoint,'ticket':ticket,'paused':paused,'checks':{}}
-                        self.report['rounds'].append(row)
-                        self.event("round_start", number=number, ticket=ticket, checkpoint=checkpoint)
-                        self.require(f"round {number}: alive before dump", self.state(container).get("Running") is True)
-                        self.stage = "checkpoint"
-                        start = time.monotonic()
-                        self.run("checkpoint-create", ["docker", "checkpoint", "create", container, checkpoint], timeout=180, required=True)
-                        row['dump_s'] = time.monotonic() - start
-                        self.require(f"round {number}: stopped after dump", self.state(container).get("Running") is False)
-                        baseline = self.logs(container)
-                        time.sleep(0.5)
-                        self.require(f"round {number}: logs stable while stopped", self.logs(container) == baseline)
-                        self.require(f"round {number}: gate did not expire before capture",
-                                     not any(e.get('event') == 'resumed' and e.get('ticket') == ticket for e in marker_events(baseline)),
-                                     'If false, increase timed_gate_seconds; this is not a valid pause-state capture.')
-                        (self.root / f"round-{number}-stopped-baseline.log").write_text(baseline)
-                        self.evidence_for_container(container, docker_root)
-                        self.stage = 'stopped_gate_wait'
-                        self.wait_stopped_until(deadline)
-                        self.stage = "restore"
-                        start = time.monotonic()
-                        self.run("checkpoint-restore", ["docker", "start", "--checkpoint", checkpoint, container], timeout=180, required=True)
-                        row['restore_s'] = time.monotonic() - start
-                        self.require(f"round {number}: running after restore", self.state(container).get("Running") is True)
-                        self.stage = "fidelity"
-                        resumed, _ = self.wait_event(container, lambda e: e.get("event") == "resumed" and e.get("ticket") == ticket, prefix=baseline)
-                        _, after = self.wait_event(container, lambda e: e.get("event") == "tick" and e.get("tick", -1) > paused["tick"], prefix=baseline)
-                        running = self.state(container).get("Running") is True
-                        checks = continuity_checks(paused, baseline, after, ticket, running)
-                        row.update(checks=checks,resumed=resumed)
-                        (self.root / f"round-{number}-resumed.log").write_text(after)
-                        # Emit explicit observed values, not a success label without evidence.
-                        for key in ('token','tick','digest','hot','words'):
-                            self.say(f"FIDELITY {key} | before={paused.get(key)!r} | after={resumed.get(key)!r}")
-                        bad = [i for i,(a,b) in enumerate(zip(paused.get('heap_words',[]),resumed.get('heap_words',[]))) if a != b]
-                        self.say(f"FIDELITY probe words | compared={len(paused.get('heap_words',[]))} | mismatching_indices={bad}")
-                        for key, value in checks.items():
+        cat >> "$BUNDLE_DIR/checkpoint_probe.py" <<'EMBED_CHECKPOINT_PROBE_PY_3'
                             self.require(f"round {number}: {key}", value)
+                        row['fidelity_status'] = 'passed'
                         self.resource_snapshot(container,'restored-'+str(number))
                     self.report["status"] = "passed"
                     self.stage = "complete"
                 except Exception as exc:
                     self.report.update(status="failed", failed_stage=self.stage, exception=repr(exc))
+                    if row is not None:
+                        if row.get('capture_status') == 'attempting': row['capture_status'] = 'failed'
+                        if row.get('restore_status') == 'attempting': row['restore_status'] = 'failed'
+                        if row.get('fidelity_status') == 'checking': row['fidelity_status'] = 'failed'
+                    if self.stage == 'restore':
+                        self.report['restore_diagnosis'] = classify_restore_error(str(exc))
                     traceback.print_exc()
-                    self.event("experiment_failed", error=repr(exc))
+                    self.event("experiment_failed", error=repr(exc), diagnosis=self.report.get('restore_diagnosis'))
                 finally:
                     if created:
                         try:
@@ -604,10 +733,29 @@ jobs:
                             self.run("final-target-logs", ["docker", "logs", container])
                         except Exception as exc:
                             self.event("diagnostic_collection_failed", error=repr(exc))
+                    if guard is not None:
+                        self.report['external_dependencies'] = guard.description()
+                        self.report['namespace_boundaries'] = guard.history
+                        try:
+                            # The target is removed first. Never release a live target's namespace fixture.
+                            guard.close(container)
+                        except Exception as exc:
+                            self.report['cleanup_error'] = repr(exc)
+                            self.event('cleanup_failed', error=repr(exc))
+                            if self.report['status'] == 'passed':
+                                self.report.update(status='failed', failed_stage='cleanup', exception=repr(exc))
+                    elif created:
                         self.run("container-cleanup", ["docker", "rm", "-f", container])
                     self.report.update(finished_utc=self.now(), command_count=self.index)
                     (self.root / "report.json").write_text(json.dumps(self.report, indent=2) + "\n")
                     self.say("FINAL MACHINE-READABLE REPORT\n" + json.dumps(self.report, indent=2))
+                    # Keep the actionable result visible AFTER the intentionally large array dump.
+                    self.say('FINAL RESULT | revision=network-fix-3 | status=' + self.report['status'] +
+                             ' | stage=' + self.report.get('failed_stage', self.stage))
+                    for item in self.report.get('rounds', []):
+                        self.say('ROUND RESULT | ' + json.dumps({k:item.get(k, 'not_reached') for k in
+                            ('round','capture_status','restore_status','fidelity_status','dump_s','restore_s')}, sort_keys=True))
+                    if self.report.get('exception'): self.say('FINAL ERROR | ' + self.report['exception'])
                 return 0 if self.report["status"] == "passed" else 1
 
 
@@ -660,14 +808,6 @@ jobs:
 
         if __name__ == "__main__":
             root = os.environ.get("EVIDENCE_DIR", "evidence")
-        EMBED_CHECKPOINT_PROBE_PY_2
-        printf "Embedded checkpoint_probe.py part 2/3; cumulative bytes: "
-        wc -c < "$BUNDLE_DIR/checkpoint_probe.py"
-    - name: Embed checkpoint_probe.py [3/3]
-      shell: bash
-      run: |
-        set -Eeuo pipefail
-        cat >> "$BUNDLE_DIR/checkpoint_probe.py" <<'EMBED_CHECKPOINT_PROBE_PY_3'
             if len(sys.argv) > 1 and sys.argv[1] == 'daemon':
                 sys.exit(configure_daemon(root))
             if len(sys.argv) > 3 and sys.argv[1] == 'stream':
@@ -676,8 +816,6 @@ jobs:
                 sys.exit(audit.run(sys.argv[2],sys.argv[3:],timeout=int(os.environ.get('STEP_COMMAND_TIMEOUT','1800')))[0])
             sys.exit(Audit(root).main())
         EMBED_CHECKPOINT_PROBE_PY_3
-        printf "Embedded checkpoint_probe.py part 3/3; cumulative bytes: "
-        wc -c < "$BUNDLE_DIR/checkpoint_probe.py"
     - name: Embed build_viewer.py [1/1]
       shell: bash
       run: |
@@ -764,8 +902,6 @@ jobs:
         if __name__ == '__main__':
             raise SystemExit(main())
         EMBED_BUILD_VIEWER_PY_1
-        printf "Embedded build_viewer.py part 1/1; cumulative bytes: "
-        wc -c < "$BUNDLE_DIR/build_viewer.py"
     - name: Embed viewer-template.html [1/4]
       shell: bash
       run: |
@@ -796,16 +932,14 @@ jobs:
         <section class="heading"><div><div class="eyebrow">CHECKPOINT & CONTINUATION LAB</div><h1>Every branch. Every checkpoint.</h1><p id="projectSubtitle">Inspect what happened, then compare what changed.</p></div><div class="badge-line"><span id="dataBadge" class="pill warn">NO EVIDENCE</span><span class="pill">HTML5 / LOCAL</span></div></section>
         <div id="notice" class="notice" role="status"></div>
         <section class="stats" aria-label="Evidence summary"><div class="stat"><div id="statTraces" class="value">0</div><div class="caption">Recorded trajectories</div></div><div class="stat"><div id="statCP" class="value">0</div><div class="caption">Successful captures</div></div><div class="stat"><div id="statEvents" class="value">0</div><div class="caption">Events in evidence</div></div><div class="stat"><div id="statFailures" class="value">0</div><div class="caption">Failure events</div></div></section>
-        <section class="panel" aria-label="Trajectory graph"><div class="panel-head"><div><h2>Trajectory map</h2><p>Shared origins connect only when explicitly recorded.</p></div><div class="panel-tools"><input id="search" type="search" aria-label="Search events" placeholder="Search event, stage, error..."><select id="axisMode" aria-label="Timeline axis"><option value="step">Event order</option><option value="time">Relative wall time</option></select><button id="zoomOut" aria-label="Zoom out">-</button><button id="zoomIn" aria-label="Zoom in">+</button><button id="firstFailure">First failure</button></div></div><div class="graph-scroll" id="graphScroll"><svg id="graph" role="img" aria-label="Interactive trajectory graph"></svg></div><div class="graph-foot"><span id="graphCaption">No events loaded.</span><span>Diamond = capture &nbsp; Square = failure &nbsp; Click a node to inspect</span></div><div class="transport"><div class="transport-top"><button id="prev" aria-label="Previous event">&lt; Step</button><button id="play" class="primary">Play evidence</button><button id="next" aria-label="Next event">Step &gt;</button><select id="speed" aria-label="Playback speed"><option value="1200">Slow</option><option value="650" selected>Normal</option><option value="200">Fast</option></select><span class="spacer"></span><button id="rewind">Rewind to checkpoint</button><select id="checkpointSelect" aria-label="Jump to checkpoint"><option value="">Select checkpoint...</option></select></div><div class="scrubber"><span id="cursorText" class="mono">EVENT 0 / 0</span><input id="scrubber" type="range" min="0" max="0" value="0" aria-label="Evidence playback position"><span id="cursorTime" class="mono">No time</span></div></div></section>
-        <div class="twocol"><section class="panel"><div class="panel-head"><div><h2>Event inspector</h2><p>Exact recorded data, never inferred runtime state.</p></div><span id="eventStatus" class="pill">-</span></div><div class="panel-body" id="inspector"><div class="empty">Open evidence to inspect a trajectory.</div></div></section>
         EMBED_VIEWER_TEMPLATE_HTML_1
-        printf "Embedded viewer-template.html part 1/4; cumulative bytes: "
-        wc -c < "$BUNDLE_DIR/viewer-template.html"
     - name: Embed viewer-template.html [2/4]
       shell: bash
       run: |
         set -Eeuo pipefail
         cat >> "$BUNDLE_DIR/viewer-template.html" <<'EMBED_VIEWER_TEMPLATE_HTML_2'
+        <section class="panel" aria-label="Trajectory graph"><div class="panel-head"><div><h2>Trajectory map</h2><p>Shared origins connect only when explicitly recorded.</p></div><div class="panel-tools"><input id="search" type="search" aria-label="Search events" placeholder="Search event, stage, error..."><select id="axisMode" aria-label="Timeline axis"><option value="step">Event order</option><option value="time">Relative wall time</option></select><button id="zoomOut" aria-label="Zoom out">-</button><button id="zoomIn" aria-label="Zoom in">+</button><button id="firstFailure">First failure</button></div></div><div class="graph-scroll" id="graphScroll"><svg id="graph" role="img" aria-label="Interactive trajectory graph"></svg></div><div class="graph-foot"><span id="graphCaption">No events loaded.</span><span>Diamond = capture &nbsp; Square = failure &nbsp; Click a node to inspect</span></div><div class="transport"><div class="transport-top"><button id="prev" aria-label="Previous event">&lt; Step</button><button id="play" class="primary">Play evidence</button><button id="next" aria-label="Next event">Step &gt;</button><select id="speed" aria-label="Playback speed"><option value="1200">Slow</option><option value="650" selected>Normal</option><option value="200">Fast</option></select><span class="spacer"></span><button id="rewind">Rewind to checkpoint</button><select id="checkpointSelect" aria-label="Jump to checkpoint"><option value="">Select checkpoint...</option></select></div><div class="scrubber"><span id="cursorText" class="mono">EVENT 0 / 0</span><input id="scrubber" type="range" min="0" max="0" value="0" aria-label="Evidence playback position"><span id="cursorTime" class="mono">No time</span></div></div></section>
+        <div class="twocol"><section class="panel"><div class="panel-head"><div><h2>Event inspector</h2><p>Exact recorded data, never inferred runtime state.</p></div><span id="eventStatus" class="pill">-</span></div><div class="panel-body" id="inspector"><div class="empty">Open evidence to inspect a trajectory.</div></div></section>
         <section class="panel"><div class="panel-head"><div><h2>Checkpoint state comparison</h2><p>Probe-level equality is not equality of the entire V8 heap.</p></div></div><div class="panel-body"><div class="compare-pickers"><label>Reference observation<select id="compareA"></select></label><label>Comparison observation<select id="compareB"></select></label></div><div id="diffBody"></div><div class="heap-head"><span>Typed-array word difference</span><span id="heapCount" class="mono">No data</span></div><div id="heapGrid" class="heap-grid" aria-label="Typed-array difference map"></div><div id="heapDetail" class="heap-explain"></div><div class="scope-note">An observation attached to a command is a sampled state, not a new execution checkpoint. Missing fields remain unknown; unknown never counts as a pass.</div></div></section></div>
         <section class="panel"><div class="panel-head"><div><h2>Restoration fidelity matrix</h2><p>Only explicit assertions are shown. Blank coverage is not success.</p></div><span id="matrixSummary" class="check-banner"></span></div><div class="matrix-scroll" id="matrixBody"></div></section>
         <section class="panel resources"><div class="panel-head"><div><h2>Measured memory by trajectory</h2><p>Optional RSS samples; this is not a memory-limit or virtual-address-space chart.</p></div><span id="resourceStatus" class="pill">NO SAMPLES</span></div><div id="resourceBody"></div></section>
@@ -909,6 +1043,12 @@ jobs:
           const d=clone(input);d.warnings=Array.isArray(d.warnings)?d.warnings:[];d.provenance=d.provenance||{};
           const ids=new Set(), allNodeIDs=new Set();
           for(const [i,t] of d.traces.entries()){
+        EMBED_VIEWER_TEMPLATE_HTML_2
+    - name: Embed viewer-template.html [3/4]
+      shell: bash
+      run: |
+        set -Eeuo pipefail
+        cat >> "$BUNDLE_DIR/viewer-template.html" <<'EMBED_VIEWER_TEMPLATE_HTML_3'
             t.id=String(t.id||"trace-"+i);if(ids.has(t.id))throw Error("Duplicate trajectory ID: "+t.id);ids.add(t.id);
             t.label=String(t.label||t.id);t.nodes=Array.isArray(t.nodes)?t.nodes:[];t.checks=Array.isArray(t.checks)?t.checks:[];t.samples=Array.isArray(t.samples)?t.samples:[];
             const nodeIDs=new Set();for(const [j,n] of t.nodes.entries()){n.id=String(n.id||t.id+"/e"+j);if(nodeIDs.has(n.id)||allNodeIDs.has(n.id))throw Error("Duplicate event ID: "+n.id);nodeIDs.add(n.id);allNodeIDs.add(n.id);n.trace_id=t.id;n.label=String(n.label||n.kind||"Event");n.kind=String(n.kind||"event");n.status=String(n.status||"unknown");if(n.kind==="checkpoint"&&n.status!=="passed")n.checkpoint=n.checkpoint||null;}
@@ -931,14 +1071,6 @@ jobs:
           $("warnings").replaceChildren(...d.warnings.map(w=>el("p",{class:"small muted"},w)));
           renderSidebar();renderSnapshots();renderSelection();renderMatrix();renderResources();
         }
-        EMBED_VIEWER_TEMPLATE_HTML_2
-        printf "Embedded viewer-template.html part 2/4; cumulative bytes: "
-        wc -c < "$BUNDLE_DIR/viewer-template.html"
-    - name: Embed viewer-template.html [3/4]
-      shell: bash
-      run: |
-        set -Eeuo pipefail
-        cat >> "$BUNDLE_DIR/viewer-template.html" <<'EMBED_VIEWER_TEMPLATE_HTML_3'
         function renderSidebar(){const list=$("traceList");list.replaceChildren();for(const t of app.data.traces){const b=el("button",{class:"trace-button"+(t.id===app.trace?" active":""),"aria-pressed":String(t.id===app.trace)});b.append(el("span",{class:"trace-name"},t.label),el("span",{class:"trace-sub"},`${t.nodes.length} events / ${t.status||"unknown"}`));b.onclick=()=>{stop();app.trace=t.id;app.index=0;renderSidebar();renderSelection();};list.append(b);}if(!app.data.traces.length)list.append(el("div",{class:"small muted"},"No trajectories loaded."));}
         function nodePositions(){
          const traces=app.data.traces, pos=new Map(), axis=$("axisMode").value;
@@ -1026,6 +1158,12 @@ jobs:
          if(!Array.isArray(aa)||!Array.isArray(bb)){$("heapCount").textContent="Not recorded";$("heapDetail").textContent="Array words missing from one or both observations; digest equality alone is not byte-for-byte evidence.";return;}
          const size=Math.max(aa.length,bb.length),group=Math.max(1,Math.ceil(size/128));let changed=0,missing=0;for(let i=0;i<size;i++){if(i>=aa.length||i>=bb.length)missing++;else if(aa[i]!==bb[i])changed++;}
          $("heapCount").textContent=`${changed} different / ${missing} missing / ${size} words`;
+        EMBED_VIEWER_TEMPLATE_HTML_3
+    - name: Embed viewer-template.html [4/4]
+      shell: bash
+      run: |
+        set -Eeuo pipefail
+        cat >> "$BUNDLE_DIR/viewer-template.html" <<'EMBED_VIEWER_TEMPLATE_HTML_4'
          for(let start=0;start<size;start+=group){const end=Math.min(size,start+group);let diff=0,unknown=0;for(let i=start;i<end;i++){if(i>=aa.length||i>=bb.length)unknown++;else if(aa[i]!==bb[i])diff++;}const label=`Words ${start}-${end-1}: ${diff} different, ${unknown} missing`;const btn=el("button",{class:"heap-cell "+(unknown?"":diff?"changed":"same"),title:label,"aria-label":label});btn.onclick=()=>{$("heapDetail").textContent=label+". "+Array.from({length:Math.min(5,end-start)},(_,j)=>`${start+j}: ${text(aa[start+j])} -> ${text(bb[start+j])}`).join("; ");};$("heapGrid").append(btn);}
          $("heapDetail").textContent=`Each square covers up to ${group} probe words. Teal: equal. Pink: differs. Gray: missing. Click for indices. These are not all V8 heap pages.`;
         }
@@ -1041,14 +1179,6 @@ jobs:
          if(!series.length){$("resourceStatus").textContent="NOT RECORDED";body.append(el("div",{class:"empty"},"No RSS time series was recorded. The page deliberately leaves this chart empty instead of estimating memory from the Docker image size or the container limit."));return;}
          $("resourceStatus").textContent=app.data.synthetic?"SYNTHETIC SAMPLES":"RECORDED RSS";const svg=sv("svg",{viewBox:"0 0 900 150",role:"img","aria-label":"Recorded RSS versus relative seconds"});const maxT=Math.max(1,...series.flatMap(x=>x.s.map(s=>s.relative_s))),maxM=Math.max(1,...series.flatMap(x=>x.s.map(s=>s.rss_bytes/1048576)))*1.15;
          for(let i=0;i<4;i++){const yy=115-i*30;svg.append(sv("line",{x1:65,x2:870,y1:yy,y2:yy,stroke:"#2a374b"}),sv("text",{x:54,y:yy+4,fill:"#a2afc4","text-anchor":"end","font-size":10},(i*maxM/3).toFixed(0)+" MiB"));}
-        EMBED_VIEWER_TEMPLATE_HTML_3
-        printf "Embedded viewer-template.html part 3/4; cumulative bytes: "
-        wc -c < "$BUNDLE_DIR/viewer-template.html"
-    - name: Embed viewer-template.html [4/4]
-      shell: bash
-      run: |
-        set -Eeuo pipefail
-        cat >> "$BUNDLE_DIR/viewer-template.html" <<'EMBED_VIEWER_TEMPLATE_HTML_4'
          series.forEach(({t,s},i)=>{const color=[COLORS.tool,COLORS.checkpoint,COLORS.llm,COLORS.failure][i%4];svg.append(sv("path",{d:s.map((a,j)=>(j?"L":"M")+(65+a.relative_s/maxT*805)+" "+(115-a.rss_bytes/1048576/maxM*90)).join(" "),stroke:color,"stroke-width":2,fill:"none"}));svg.append(sv("text",{x:65+i*190,y:145,fill:color,"font-size":10},short(t.label,25)));});svg.append(sv("text",{x:870,y:131,fill:"#a2afc4","text-anchor":"end","font-size":10},maxT.toFixed(1)+"s relative to each run"));body.append(svg);
         }
         function select(i){const t=currentTrace();if(!t)return;app.index=Math.max(0,Math.min(t.nodes.length-1,i));renderSelection();}
@@ -1077,8 +1207,6 @@ jobs:
         </body>
         </html>
         EMBED_VIEWER_TEMPLATE_HTML_4
-        printf "Embedded viewer-template.html part 4/4; cumulative bytes: "
-        wc -c < "$BUNDLE_DIR/viewer-template.html"
     - name: Embed install_criu.sh [1/1]
       shell: bash
       run: |
@@ -1138,7 +1266,7 @@ jobs:
           ca-certificates git build-essential pkg-config python3 python3-protobuf \
           libprotobuf-dev libprotobuf-c-dev protobuf-c-compiler protobuf-compiler \
           libnl-3-dev libnet1-dev libcap-dev libbsd-dev uuid-dev libgnutls28-dev \
-          libnftables-dev libaio-dev liblz4-dev iproute2 iptables
+          libnftables-dev libaio-dev liblz4-dev iproute2 iptables util-linux
         phase=source_fetch
         source_dir="$(mktemp -d "$RUNNER_TEMP/criu-source.XXXXXX")"
         echo "Source directory: $source_dir"
@@ -1170,8 +1298,6 @@ jobs:
         echo 'CRIU native binary is installed and its --version invocation succeeded.'
         echo 'This is NOT a claim that kernel or Docker checkpoint/restore works.'
         EMBED_INSTALL_CRIU_SH_1
-        printf "Embedded install_criu.sh part 1/1; cumulative bytes: "
-        wc -c < "$BUNDLE_DIR/install_criu.sh"
     - name: Embed host_diagnostics.sh [1/1]
       shell: bash
       run: |
@@ -1211,8 +1337,6 @@ jobs:
         printf '\nNo environment dump, model API key, exploit payload, Docker socket mount, or public service is used.\n'
         printf 'Disposable hosted runner only: the workflow restarts Docker and relaxes container seccomp/AppArmor for CRIU.\n'
         EMBED_HOST_DIAGNOSTICS_SH_1
-        printf "Embedded host_diagnostics.sh part 1/1; cumulative bytes: "
-        wc -c < "$BUNDLE_DIR/host_diagnostics.sh"
     - name: Embed report_tools.py [1/1]
       shell: bash
       run: |
@@ -1241,7 +1365,7 @@ jobs:
 
 
         def summary():
-            records = {n: read(n) for n in ('self-tests.json', 'setup.json', 'daemon-setup.json', 'report.json')}
+            records = {n: read(n) for n in ('self-tests.json', 'network-self-tests.json', 'setup.json', 'daemon-setup.json', 'report.json')}
             success = all(r.get('status') == 'passed' for r in records.values())
             lines = ['# V8 checkpoint + HTML5 trajectory audit', '',
                      '**Execution result: ' + ('PASS for this finite probe only' if success else 'NOT DEMONSTRATED') + '**', '',
@@ -1255,6 +1379,8 @@ jobs:
                       'This uses the actual pinned V8 image and attempts live CRIU checkpoint/restore.',
                       'The probe uses verified output APIs and a timed pause window; it does not require the removed shell read() API.',
                       'Host time continues while the process is stopped. This does NOT claim deterministic clock replay.',
+                      'An isolated loopback-only namespace keeper stays alive across checkpoints. That external namespace is retained, not rewound.',
+                      'See documentation.md and documentation.json in the artifact for the official docs, source paths and workaround boundaries.',
                       'Exact equality is checked for 4,096 probe words, token, counter and hot-function result, not every byte of V8/JIT/OS state.',
                       'The model/agent, sockets, cross-host migration and alternative-agent branches are not tested.',
                       'HTML rewind navigates recorded observations only. No live execution service is embedded.',
@@ -1262,9 +1388,9 @@ jobs:
                       '', '## Assertions', '| Check | Result |', '|---|---|']
             for a in experiment.get('assertions', []):
                 lines.append('| ' + str(a['name']).replace('|','/') + ' | ' + ('PASS' if a.get('passed') is True else 'FAIL') + ' |')
-            lines += ['', '## Checkpoint / restore durations', '| Round | Dump seconds | Restore seconds |', '|---|---|---|']
+            lines += ['', '## Capture / restore / fidelity', '| Round | Capture | Restore | Fidelity | Dump seconds | Restore seconds |', '|---|---|---|---|---|---|']
             for row in experiment.get('rounds',[]):
-                lines.append(f"| {row.get('round')} | {row.get('dump_s','not reached')} | {row.get('restore_s','not reached')} |")
+                lines.append(f"| {row.get('round')} | {row.get('capture_status','unknown')} | {row.get('restore_status','unknown')} | {row.get('fidelity_status','unknown')} | {row.get('dump_s','not reached')} | {row.get('restore_s','not reached')} |")
             text = '\n'.join(lines) + '\n'
             (ROOT/'summary.md').write_text(text)
             (ROOT/'overall.json').write_text(json.dumps({'passed': success, 'stages': records}, indent=2)+'\n')
@@ -1294,7 +1420,7 @@ jobs:
 
 
         def gate():
-            required=('asset-integrity.json','self-tests.json','setup.json','daemon-setup.json','report.json','viewer-build.json')
+            required=('asset-integrity.json','self-tests.json','network-self-tests.json','setup.json','daemon-setup.json','report.json','viewer-build.json')
             states={n:read(n) for n in required}
             for n,r in states.items():
                 print(f"FINAL GATE {n} | status={r.get('status')} | phase={r.get('failed_stage',r.get('last_phase',''))} | error={r.get('exception','')}",flush=True)
@@ -1309,8 +1435,6 @@ jobs:
             if len(sys.argv)!=2 or sys.argv[1] not in functions: raise SystemExit('Use summary, inventory, or gate')
             raise SystemExit(functions[sys.argv[1]]())
         EMBED_REPORT_TOOLS_PY_1
-        printf "Embedded report_tools.py part 1/1; cumulative bytes: "
-        wc -c < "$BUNDLE_DIR/report_tools.py"
     - name: Embed self_tests.py [1/1]
       shell: bash
       run: |
@@ -1434,8 +1558,686 @@ jobs:
             print('SELF TEST SUMMARY '+json.dumps({k:v for k,v in report.items() if k!='tests'}),flush=True)
         raise SystemExit(0 if report['status']=='passed' else 1)
         EMBED_SELF_TESTS_PY_1
-        printf "Embedded self_tests.py part 1/1; cumulative bytes: "
-        wc -c < "$BUNDLE_DIR/self_tests.py"
+    - name: Embed network_tests.py [1/2]
+      shell: bash
+      run: |
+        set -Eeuo pipefail
+        cat > "$BUNDLE_DIR/network_tests.py" <<'EMBED_NETWORK_TESTS_PY_1'
+        """Regression tests of guard/orchestration using a mocked Docker boundary. NOT CRIU proof."""
+        import ast
+        import contextlib
+        import copy
+        import io
+        import json
+        import os
+        from pathlib import Path
+        import tempfile
+        import traceback
+        import unittest
+        from unittest.mock import patch
+
+        import checkpoint_probe as probe
+        from netns_guard import NetworkNamespaceGuard, positive_pid, namespace_inode, isolation_checks, classify_restore_error
+
+        CID = 'a' * 64
+        TARGET = 'v8-criu-0123456789ab'
+        IMAGE = 'cybergym/v8@sha256:' + 'd' * 64
+
+        class FakeAudit:
+            def __init__(self, root):
+                self.root = Path(root)
+                self.report = {}
+                self.commands = []
+                self.observations = []
+                self.keeper_running = True
+                self.keeper_pid = 200
+                self.keeper_start = '2026-10-26T00:00:00Z'
+                self.restart = 0
+                self.keeper_inode = 400
+                self.target_inode = 400
+                self.host_inode = 100
+                self.target_mode = 'container:' + CID
+                self.links = [{'ifname':'lo'}]
+                self.routes4 = [{'dev':'lo','dst':'127.0.0.0/8'}]
+                self.routes6 = [{'dev':'lo','dst':'::1'}]
+                self.target_present = True
+                self.remove_target_fails = False
+                self.inspect_target_fails = False
+                self.create_fails = False
+                self.keeper_removed = False
+
+            def event(self, kind, **kw):
+                self.observations.append({'kind':kind, **kw})
+
+            def require(self, name, condition, detail=None):
+                if not condition:
+                    raise RuntimeError(name + ': ' + repr(detail))
+
+            def run(self, label, argv, timeout=90, required=False):
+                self.commands.append((label, list(argv)))
+                rc, out, err = 0, '', ''
+                if label == 'netns-keeper-create':
+                    if self.create_fails: rc,err=1,'create failed'
+                    else: out=CID+'\n'
+                elif label == 'netns-inspect':
+                    is_target = argv[-1] == TARGET
+                    obj = {'Id': 'b'*64 if is_target else CID,
+                           'State': {'Running':True if is_target else self.keeper_running,
+                                     'Pid':300 if is_target else self.keeper_pid,
+                                     'StartedAt': self.keeper_start},
+                           'HostConfig': {'NetworkMode':self.target_mode if is_target else 'none'},
+                           'RestartCount': self.restart if not is_target else 0}
+                    out=json.dumps(obj)
+                elif label == 'netns-keeper-inode': out=f'net:[{self.keeper_inode}]\n'
+                elif label == 'netns-target-inode': out=f'net:[{self.target_inode}]\n'
+                elif label == 'netns-host-inode': out=f'net:[{self.host_inode}]\n'
+                elif label == 'netns-links': out=json.dumps(self.links)
+                elif label == 'netns-ipv4-routes': out=json.dumps(self.routes4)
+                elif label == 'netns-ipv6-routes': out=json.dumps(self.routes6)
+                elif label == 'netns-cleanup-target-check':
+                    if self.inspect_target_fails: rc,err=1,'Cannot connect to Docker daemon'
+                    elif not self.target_present: rc,err=1,'Error: No such object: '+TARGET
+                    else: out=json.dumps({'Running':True})
+                elif label == 'netns-cleanup-target':
+                    if self.remove_target_fails: rc,err=1,'Device busy'
+                    else:self.target_present=False
+                elif label == 'netns-keeper-cleanup': self.keeper_removed=True
+                elif label != 'netns-keeper-start':
+                    raise AssertionError('Unmocked command: '+label+' '+repr(argv))
+                if required and rc: raise RuntimeError(err)
+                return rc,out,err
+
+        class GuardTests(unittest.TestCase):
+            def setUp(self):
+                self.tmp=tempfile.TemporaryDirectory()
+                self.addCleanup(self.tmp.cleanup)
+                self.a=FakeAudit(self.tmp.name)
+                self.g=NetworkNamespaceGuard(self.a,IMAGE,'0123456789ab')
+
+            def test_01_zero_negative_host_pid_rejected(self):
+                for value in [0,1,-1,None,True,'200',2.5]:
+                    with self.subTest(value=value), self.assertRaises(ValueError): positive_pid(value)
+                self.assertEqual(positive_pid(200),200)
+
+            def test_02_inode_parse(self):
+                self.assertEqual(namespace_inode('net:[400]\n'),400)
+                for value in ['net:[0]','net:[-1]','pid:[400]','400','net:[4]/bad']:
+                    with self.subTest(value=value),self.assertRaises(ValueError):namespace_inode(value)
+
+            def test_03_invalid_suffix(self):
+                with self.assertRaises(ValueError):NetworkNamespaceGuard(self.a,IMAGE,'a;rm -rf /')
+
+            def test_04_command_strategy(self):
+                mode=self.g.start()
+                self.assertEqual(mode,'container:'+CID)
+                args=self.a.commands[0][1]
+                self.assertEqual(args[args.index('--network')+1],'none')
+                self.assertIn('--cap-drop',args)
+                self.assertIn('--read-only',args)
+                self.assertNotIn('--privileged',args)
+                self.assertEqual(self.g.description()['namespace_state_rewound'],False)
+
+            def test_05_valid_initial_and_target_state(self):
+                self.g.start()
+                evidence=self.g.verify('live',TARGET)
+                self.assertTrue(all(evidence['checks'].values()))
+                self.assertEqual(evidence['target_inode'],400)
+                saved=json.loads((self.a.root/'network-live.json').read_text())
+                self.assertEqual(saved,evidence)
+
+            def test_06_reject_host_namespace(self):
+                self.a.keeper_inode=self.a.host_inode
+                with self.assertRaises(RuntimeError):self.g.start()
+
+            def test_07_reject_external_interface(self):
+                self.a.links.append({'ifname':'eth0'})
+                with self.assertRaises(RuntimeError):self.g.start()
+
+            def test_08_reject_ipv4_gateway(self):
+                self.a.routes4=[{'dev':'lo','dst':'default','gateway':'10.0.0.1'}]
+                with self.assertRaises(RuntimeError):self.g.start()
+
+            def test_09_reject_ipv6_gateway(self):
+                self.a.routes6=[{'dev':'eth0','dst':'default','gateway':'fe80::1'}]
+                with self.assertRaises(RuntimeError):self.g.start()
+
+            def test_10_reject_keeper_exit(self):
+                self.g.start();self.a.keeper_running=False
+                with self.assertRaises(RuntimeError):self.g.verify('before-restore')
+
+            def test_11_reject_pid_zero_without_proc_read(self):
+                self.a.keeper_pid=0
+                with self.assertRaises(ValueError):self.g.start()
+                self.assertFalse(any('/proc/0/' in ' '.join(args) for _,args in self.a.commands))
+
+            def test_12_reject_keeper_restart_counter(self):
+                self.g.start();self.a.restart=1
+                with self.assertRaises(RuntimeError):self.g.verify('before-restore')
+
+            def test_13_reject_keeper_pid_change(self):
+                self.g.start();self.a.keeper_pid=201
+                with self.assertRaises(RuntimeError):self.g.verify('before-restore')
+
+            def test_14_reject_same_pid_different_start(self):
+                self.g.start();self.a.keeper_start='different'
+                with self.assertRaises(RuntimeError):self.g.verify('before-restore')
+
+            def test_15_reject_replaced_namespace(self):
+                self.g.start();self.a.keeper_inode=401
+                with self.assertRaises(RuntimeError):self.g.verify('before-restore')
+
+            def test_16_reject_target_host_mode(self):
+                self.g.start();self.a.target_mode='host'
+                with self.assertRaises(RuntimeError):self.g.verify('after-restore',TARGET)
+
+            def test_17_reject_target_wrong_namespace(self):
+                self.g.start();self.a.target_inode=401
+                with self.assertRaises(RuntimeError):self.g.verify('after-restore',TARGET)
+
+            def test_18_stopped_target_does_not_need_pid(self):
+                self.g.start();result=self.g.verify('stopped')
+                self.assertIsNone(result['target_pid'])
+                self.assertTrue(all(result['checks'].values()))
+
+            def test_19_cleanup_target_before_keeper(self):
+                self.g.start();self.g.close(TARGET)
+                labels=[x[0] for x in self.a.commands]
+                self.assertLess(labels.index('netns-cleanup-target'),labels.index('netns-keeper-cleanup'))
+                self.assertTrue(self.a.keeper_removed)
+                self.g.close(TARGET)
+                self.assertEqual(labels,[x[0] for x in self.a.commands])
+
+            def test_20_cleanup_refuses_to_abandon_live_target(self):
+                self.g.start();self.a.remove_target_fails=True
+                with self.assertRaises(RuntimeError):self.g.close(TARGET)
+                self.assertFalse(self.a.keeper_removed)
+
+            def test_21_cleanup_absence_is_allowed(self):
+                self.g.start();self.a.target_present=False;self.g.close(TARGET)
+                self.assertTrue(self.a.keeper_removed)
+
+            def test_22_cleanup_daemon_error_not_absence(self):
+                self.g.start();self.a.inspect_target_fails=True
+                with self.assertRaises(RuntimeError):self.g.close(TARGET)
+                self.assertFalse(self.a.keeper_removed)
+
+            def test_23_create_failure_does_not_continue(self):
+                self.a.create_fails=True
+                with self.assertRaises(RuntimeError):self.g.start()
+                self.assertFalse(any(label=='netns-keeper-start' for label,_ in self.a.commands))
+
+            def test_24_classify_specific_error(self):
+                d=classify_restore_error('bind-mount /proc/0/ns/net -> /var/run/docker/netns/a: no such file')
+                self.assertEqual(d['code'],'docker_network_namespace_pid_zero')
+                self.assertIn('50750',d['reference'])
+
+            def test_25_other_errors_not_mislabeled(self):
+                self.assertEqual(classify_restore_error('criu restore failure')['code'],'runtime_restore_failed')
+
+            def test_26_reject_bad_filename(self):
+                with self.assertRaises(ValueError):self.g.verify('../escape')
+
+            def test_27_route_shapes_and_empty_routes(self):
+                self.assertTrue(all(isolation_checks([{'ifname':'lo'}],[],[],400,100).values()))
+                for route in [{'dev':'lo','dst':'default'}, {'dev':'lo','multipath':[{}]}, {'dev':'eth0'}, 'bad']:
+                    checks=isolation_checks([{'ifname':'lo'}],[route],[],400,100)
+                    self.assertFalse(checks['ipv4_routes_loopback_only'])
+
+            def test_28_controller_always_uses_checkpoint_on_restore(self):
+                tree=ast.parse(Path(probe.__file__).read_text())
+                calls=[n for n in ast.walk(tree) if isinstance(n,ast.Call) and n.args and
+                       isinstance(n.args[0],ast.Constant) and n.args[0].value=='checkpoint-restore']
+                self.assertEqual(len(calls),1)
+                args=calls[0].args[1]
+                constants=[n.value for n in args.elts if isinstance(n,ast.Constant)]
+                self.assertEqual(constants,['docker','start','--checkpoint'])
+                self.assertTrue(any(k.arg=='required' and k.value.value is True for k in calls[0].keywords))
+
+        class OrchestrationTests(unittest.TestCase):
+            """Run actual Audit.main with simulated Docker responses and checkpoint markers."""
+            def exercise(self, fail_restore=False):
+                td=tempfile.TemporaryDirectory();self.addCleanup(td.cleanup)
+                root=Path(td.name)
+                for f in ('self-tests.json','network-self-tests.json','setup.json','daemon-setup.json'):(root/f).write_text('{"status":"passed"}')
+                a=probe.Audit(root)
+                fake=FakeAudit(root)
+                calls=[]
+                def run(label,args,timeout=90,required=False):
+                    calls.append((label,args))
+                    if label.startswith('netns-'):return fake.run(label,args,timeout,required)
+                    if label=='find-d8':return 0,'/challenge/d8\n',''
+                    if label=='docker-root':return 0,'/var/lib/docker\n',''
+                    if label=='d8-api-capabilities':return 0,'V8_API_CAPABILITIES:'+json.dumps(
+                        {'print':'undefined','console_log':'function','uint32array':'function','date_now':'function'}),' '
+                    if label=='checkpoint-restore' and fail_restore:
+                        raise RuntimeError('bind-mount /proc/0/ns/net -> test: no such file or directory')
+                    return 0,'',''
+                paused={'event':'paused','round':1,'ticket':'ticket','token':'a'*48,'tick':10,
+                        'digest':'12345678','hot':13,'words':4096,'heap_words':list(range(4096)),
+                        'deadline_ms':int(probe.time.time()*1000)+180000}
+                baseline='V8_PROBE '+json.dumps(paused)+'\n'
+                resumed={**paused,'event':'resumed'}
+                tick={**paused,'event':'tick','tick':11}
+                after=baseline+'V8_PROBE '+json.dumps(resumed)+'\nV8_PROBE '+json.dumps(tick)+'\n'
+                wait_count=0
+                def wait(container,predicate,prefix='',timeout=45):
+                    nonlocal wait_count
+                    wait_count+=1
+                    if wait_count==1:return tick,''
+                    if wait_count==2:return paused,baseline
+                    if wait_count==3:return resumed,after
+                    return tick,after
+                a.run=run;a.wait_event=wait;a.resource_snapshot=lambda *args:None
+                a.evidence_for_container=lambda *args:None;a.wait_stopped_until=lambda *args:None
+                a.logs=lambda *args:baseline
+                def state(*args):return {'Running':a.stage!='checkpoint','Pid':300,'OOMKilled':False}
+                a.state=state
+                # Guard asks inspect about target by name; set the fake suffix deterministically.
+                class U:
+                    hex='0123456789ab'+'0'*20
+                with patch.dict(os.environ,{'RESTORE_ROUNDS':'1','WARMUP':'1','TIMED_GATE_SECONDS':'45','IMAGE':IMAGE}), \
+                     patch.object(probe.uuid,'uuid4',return_value=U()), patch.object(probe.time,'sleep',return_value=None), \
+                     contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                    rc=a.main()
+                return rc,json.loads((root/'report.json').read_text()),calls
+
+            def test_29_controller_lifecycle_success(self):
+                rc,report,calls=self.exercise()
+                self.assertEqual(rc,0,report.get('exception'))
+                row=report['rounds'][0]
+                self.assertEqual(row['capture_status'],'passed')
+                self.assertEqual(row['restore_status'],'passed')
+                self.assertEqual(row['fidelity_status'],'passed')
+                self.assertTrue(all(row['checks'].values()))
+                create=next(args for label,args in calls if label=='container-create')
+                self.assertEqual(create[create.index('--network')+1],'container:'+CID)
+                self.assertEqual(len(report['namespace_boundaries']),6)
+                labels=[x[0] for x in calls]
+                self.assertLess(labels.index('netns-keeper-start'),labels.index('container-start'))
+                self.assertLess(labels.index('checkpoint-create'),labels.index('checkpoint-restore'))
+
+            def test_30_restore_error_is_not_masked(self):
+                rc,report,calls=self.exercise(True)
+                self.assertEqual(rc,1)
+                self.assertEqual(report['failed_stage'],'restore')
+                self.assertEqual(report['restore_diagnosis']['code'],'docker_network_namespace_pid_zero')
+                self.assertEqual(report['rounds'][0]['capture_status'],'passed')
+                self.assertEqual(report['rounds'][0]['restore_status'],'failed')
+                self.assertEqual(report['rounds'][0]['fidelity_status'],'not_reached')
+                self.assertEqual(sum(label=='container-start' for label,_ in calls),1)
+                self.assertEqual(sum(label=='checkpoint-restore' for label,_ in calls),1)
+
+        if __name__=='__main__':
+            suite=unittest.defaultTestLoader.loadTestsFromModule(__import__(__name__))
+            result=unittest.TextTestRunner(verbosity=2).run(suite)
+            report={'status':'passed' if result.wasSuccessful() else 'failed',
+        EMBED_NETWORK_TESTS_PY_1
+    - name: Embed network_tests.py [2/2]
+      shell: bash
+      run: |
+        set -Eeuo pipefail
+        cat >> "$BUNDLE_DIR/network_tests.py" <<'EMBED_NETWORK_TESTS_PY_2'
+                    'scope':'Mocked Docker boundary plus real controller execution; NOT a Docker/CRIU integration run.',
+                    'tests_run':result.testsRun,'failures':len(result.failures),'errors':len(result.errors),
+                    'skipped':len(result.skipped),'failure_details':[{'test':str(t),'traceback':e} for t,e in result.failures+result.errors]}
+            root=Path(os.environ.get('EVIDENCE_DIR','evidence'));root.mkdir(parents=True,exist_ok=True)
+            (root/'network-self-tests.json').write_text(json.dumps(report,indent=2)+'\n')
+            print('NETWORK TEST REPORT '+json.dumps(report),flush=True)
+            raise SystemExit(0 if result.wasSuccessful() else 1)
+        EMBED_NETWORK_TESTS_PY_2
+    - name: Embed documentation.json [1/1]
+      shell: bash
+      run: |
+        set -Eeuo pipefail
+        cat > "$BUNDLE_DIR/documentation.json" <<'EMBED_DOCUMENTATION_JSON_1'
+        {
+          "reviewed_on": "2026-10-26",
+          "workflow_revision": "network-fix-3",
+          "coverage": "Relevant official documentation, upstream issues and versioned implementation; not an exhaustive archive of all related literature.",
+          "diagnosis": "The observed error matches Moby #50750. The patch selects a pre-existing network namespace instead of the failing new-namespace initialization path.",
+          "evidence_status": "Source-supported workaround. Live Docker/CRIU integration must still be established by the job.",
+          "runtime_inputs": {
+            "observed_docker": "28.0.4",
+            "observed_containerd": "2.4.1",
+            "observed_runc": "1.5.2",
+            "criu_commit": "2b7ac603cda31d015d91c856c34c557cb2300e7d"
+          },
+          "scope_limits": [
+            "Single-host live d8 process, not a VM snapshot.",
+            "Namespace keeper remains running and is not checkpointed or rewound.",
+            "No socket traffic, agent provider state, cross-host migration or deterministic clock replay is tested.",
+            "Post-restore checks compare finite observations, not every byte of V8/JIT/kernel state.",
+            "Static HTML rewind is inspection, not an active restoration service.",
+            "Ordinary startup after failed restore is forbidden; host networking and runtime downgrades are not automatic fallbacks."
+          ],
+          "sources": [
+            {
+              "title": "Moby restore regression #50750",
+              "url": "https://github.com/moby/moby/issues/50750",
+              "kind": "upstream_issue",
+              "source_support": "Exact /proc/0/ns/net error reported with Docker 28+. The issue is not evidence that every runtime combination is fixed.",
+              "workflow_application": "Motivates bypassing the new-namespace initialization path, rather than changing the working V8 probe or CRIU build."
+            },
+            {
+              "title": "containerd issue #12141",
+              "url": "https://github.com/containerd/containerd/issues/12141",
+              "kind": "upstream_issue",
+              "source_support": "Related checkpoint/restore failure discussed in containerd; points back to Docker/Moby namespace handling.",
+              "workflow_application": "Cross-reference only. Closing an issue is not proof of a shipped fix."
+            },
+            {
+              "title": "Moby v28.0.4 task initialization",
+              "url": "https://raw.githubusercontent.com/moby/moby/v28.0.4/daemon/start_linux.go",
+              "kind": "versioned_source",
+              "source_support": "initializeCreatedTask uses /proc/<task PID>/ns/net when the OCI network namespace has an empty path.",
+              "workflow_application": "An explicit pre-existing namespace path bypasses this particular SetKey branch. This is the central source-level rationale."
+            },
+            {
+              "title": "Moby v28.0.4 OCI namespace construction",
+              "url": "https://raw.githubusercontent.com/moby/moby/v28.0.4/daemon/oci_linux.go",
+              "kind": "versioned_source",
+              "source_support": "The container network mode populates the OCI namespace path from the referenced container PID.",
+              "workflow_application": "Create the target with --network container:<keeper ID> BEFORE its first start and checkpoint, not only during restore."
+            },
+            {
+              "title": "Moby v28.0.4 network lifecycle",
+              "url": "https://raw.githubusercontent.com/moby/moby/v28.0.4/daemon/container_operations.go",
+              "kind": "versioned_source",
+              "source_support": "Container-network mode shares an existing network stack instead of allocating an independent Docker network sandbox.",
+              "workflow_application": "Keep the namespace owner running and remove it only after the target is removed."
+            },
+            {
+              "title": "runc v1.5.2 CRIU external namespaces",
+              "url": "https://raw.githubusercontent.com/opencontainers/runc/v1.5.2/libcontainer/criu_linux.go",
+              "kind": "versioned_source",
+              "source_support": "External network namespaces are marked on dump and supplied through an inherited descriptor on restore. Network namespace support requires CRIU 3.11 or newer.",
+              "workflow_application": "The keeper is an external fixture. Its network state is NOT dumped, rewound, or portably migrated by this test."
+            },
+            {
+              "title": "Docker checkpoint reference",
+              "url": "https://docs.docker.com/reference/cli/docker/checkpoint/",
+              "kind": "official_documentation",
+              "source_support": "Checkpoint/restore is experimental, uses CRIU, and is primarily focused on single-host use. No external TTY is used here.",
+              "workflow_application": "Retain actual checkpoint commands and strict continuity checks; never substitute a cold start for a failed restore."
+            },
+            {
+              "title": "Docker checkpoint create",
+              "url": "https://docs.docker.com/reference/cli/docker/checkpoint/create/",
+              "kind": "official_documentation",
+              "source_support": "Creates a checkpoint from a running container. Leave-running is an optional behavior.",
+              "workflow_application": "This workflow uses the default stopped-target behavior and verifies Running=false plus stable logs."
+            },
+            {
+              "title": "Docker container start",
+              "url": "https://docs.docker.com/reference/cli/docker/container/start/",
+              "kind": "official_documentation",
+              "source_support": "The --checkpoint option starts a container from a checkpoint.",
+              "workflow_application": "Only the first target launch is ordinary start. Every tested continuation uses --checkpoint."
+            },
+            {
+              "title": "Docker network sharing",
+              "url": "https://docs.docker.com/engine/network/",
+              "kind": "official_documentation",
+              "source_support": "The supported container:<name|id> mode shares another container networking stack; certain DNS/hostname/port flags are incompatible.",
+              "workflow_application": "The target shares only the dedicated keeper namespace. No host networking or port publishing is used."
+            },
+            {
+              "title": "Docker none driver",
+              "url": "https://docs.docker.com/engine/network/drivers/none/",
+              "kind": "official_documentation",
+              "source_support": "The none driver leaves a private stack with only loopback, rather than eliminating network namespaces altogether.",
+              "workflow_application": "The keeper uses none. Namespace identity, loopback-only links and both route tables are checked at runtime."
+            },
+            {
+              "title": "Docker host driver",
+              "url": "https://docs.docker.com/engine/network/drivers/host/",
+              "kind": "official_documentation",
+              "source_support": "Host networking shares the host network stack rather than isolating the container network.",
+              "workflow_application": "Not used as a workaround: it would change the security boundary of this vulnerable target."
+            },
+            {
+              "title": "CRIU external resources",
+              "url": "https://criu.org/External_resources",
+              "kind": "official_documentation",
+              "source_support": "Some resources cannot be checkpointed/restored without help from the caller, because some state lies outside the dumped container.",
+              "workflow_application": "Declare the namespace keeper as a retained external dependency in report.json and the HTML evidence."
+            },
+            {
+              "title": "CRIU Docker integration",
+              "url": "https://criu.org/Docker",
+              "kind": "official_documentation",
+              "source_support": "Describes native Docker integration and recommends considering Podman as an alternative.",
+              "workflow_application": "This patch retains Docker to isolate the observed change; a future Podman comparison is a separate experiment."
+            },
+            {
+              "title": "CRIU external Docker historical prototype",
+              "url": "https://criu.org/index.php?mobileaction=toggle_view_mobile&title=Docker_External",
+              "kind": "historical_warning",
+              "source_support": "The old external Docker C/R approach is marked as a proof of concept, not the recommended native integration.",
+              "workflow_application": "Do not run raw criu restore behind Docker and pretend Docker tracks the revived process correctly."
+            },
+            {
+              "title": "Docker daemon configuration",
+              "url": "https://docs.docker.com/reference/cli/dockerd/",
+              "kind": "official_documentation",
+              "source_support": "Documents daemon configuration, experimental mode and configuration validation.",
+              "workflow_application": "Keep the existing merged/validated daemon config. Restarting Docker is restricted to the disposable hosted runner."
+            },
+            {
+              "title": "GitHub expression contexts",
+              "url": "https://docs.github.com/en/actions/reference/workflows-and-actions/contexts",
+              "kind": "official_documentation",
+              "source_support": "Available expression contexts depend on the workflow key being evaluated.",
+              "workflow_application": "Keep github.workspace in job-level env; do not reintroduce runner.temp there."
+            },
+            {
+              "title": "GitHub workflow syntax",
+              "url": "https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax",
+              "kind": "official_documentation",
+              "source_support": "Workflow syntax specifies job/step behavior, conditions, shells, and a 21,000-character run-block maximum.",
+              "workflow_application": "Split embedded source into multiple small run blocks within the SAME YAML. Evidence and HTML steps use always()."
+            },
+            {
+              "title": "GitHub artifacts",
+              "url": "https://docs.github.com/en/actions/how-tos/writing-workflows/choosing-what-your-workflow-does/storing-and-sharing-data-from-a-workflow",
+              "kind": "official_documentation",
+              "source_support": "Artifacts retain generated reports and output files from workflow runs.",
+              "workflow_application": "Upload the HTML and diagnostic evidence after both success and failure. Raw memory images remain excluded."
+            }
+          ]
+        }
+        EMBED_DOCUMENTATION_JSON_1
+    - name: Embed documentation.md [1/1]
+      shell: bash
+      run: |
+        set -Eeuo pipefail
+        cat > "$BUNDLE_DIR/documentation.md" <<'EMBED_DOCUMENTATION_MD_1'
+        # V8 checkpoint network restore: documentation and rationale
+
+        Revision: **network-fix-3**. Reviewed: **2026-10-26**.
+
+        Relevant official documentation, upstream issues and versioned implementation; not an exhaustive archive of all related literature.
+
+        ## What the previous run establishes
+
+        The supplied log records a successful live checkpoint followed by a failed Docker restore:
+        ```text
+        bind-mount /proc/0/ns/net -> /var/run/docker/netns/...: no such file or directory
+        ```
+
+        ## Source-supported workflow correction
+
+        Start an inert, dedicated container with `--network none`. Create the V8 target with `--network container:<keeper-full-ID>` from its first launch. Retain the keeper during capture, the stopped interval and restoration. Verify its PID, start time, namespace inode, loopback-only interfaces and IPv4/IPv6 routing. Verify the restored target joins exactly that namespace. Remove the target before removing the keeper.
+
+        Docker 28.0.4 only runs the failing SetKey branch for an empty OCI network namespace path. Container-sharing supplies a nonempty path. runc already has external namespace capture/restore handling. These sources support the workaround; they do not prove this workflow succeeds on an untested runner.
+
+        ## Explicit boundaries
+
+        - Single-host live d8 process, not a VM snapshot.
+        - Namespace keeper remains running and is not checkpointed or rewound.
+        - No socket traffic, agent provider state, cross-host migration or deterministic clock replay is tested.
+        - Post-restore checks compare finite observations, not every byte of V8/JIT/kernel state.
+        - Static HTML rewind is inspection, not an active restoration service.
+        - Ordinary startup after failed restore is forbidden; host networking and runtime downgrades are not automatic fallbacks.
+
+        ## Documentation map
+
+        ### 1. Moby restore regression #50750
+        https://github.com/moby/moby/issues/50750
+
+        Type: upstream_issue.
+        **Source supports:** Exact /proc/0/ns/net error reported with Docker 28+. The issue is not evidence that every runtime combination is fixed.
+
+        **Application:** Motivates bypassing the new-namespace initialization path, rather than changing the working V8 probe or CRIU build.
+
+        ### 2. containerd issue #12141
+        https://github.com/containerd/containerd/issues/12141
+
+        Type: upstream_issue.
+        **Source supports:** Related checkpoint/restore failure discussed in containerd; points back to Docker/Moby namespace handling.
+
+        **Application:** Cross-reference only. Closing an issue is not proof of a shipped fix.
+
+        ### 3. Moby v28.0.4 task initialization
+        https://raw.githubusercontent.com/moby/moby/v28.0.4/daemon/start_linux.go
+
+        Type: versioned_source.
+        **Source supports:** initializeCreatedTask uses /proc/<task PID>/ns/net when the OCI network namespace has an empty path.
+
+        **Application:** An explicit pre-existing namespace path bypasses this particular SetKey branch. This is the central source-level rationale.
+
+        ### 4. Moby v28.0.4 OCI namespace construction
+        https://raw.githubusercontent.com/moby/moby/v28.0.4/daemon/oci_linux.go
+
+        Type: versioned_source.
+        **Source supports:** The container network mode populates the OCI namespace path from the referenced container PID.
+
+        **Application:** Create the target with --network container:<keeper ID> BEFORE its first start and checkpoint, not only during restore.
+
+        ### 5. Moby v28.0.4 network lifecycle
+        https://raw.githubusercontent.com/moby/moby/v28.0.4/daemon/container_operations.go
+
+        Type: versioned_source.
+        **Source supports:** Container-network mode shares an existing network stack instead of allocating an independent Docker network sandbox.
+
+        **Application:** Keep the namespace owner running and remove it only after the target is removed.
+
+        ### 6. runc v1.5.2 CRIU external namespaces
+        https://raw.githubusercontent.com/opencontainers/runc/v1.5.2/libcontainer/criu_linux.go
+
+        Type: versioned_source.
+        **Source supports:** External network namespaces are marked on dump and supplied through an inherited descriptor on restore. Network namespace support requires CRIU 3.11 or newer.
+
+        **Application:** The keeper is an external fixture. Its network state is NOT dumped, rewound, or portably migrated by this test.
+
+        ### 7. Docker checkpoint reference
+        https://docs.docker.com/reference/cli/docker/checkpoint/
+
+        Type: official_documentation.
+        **Source supports:** Checkpoint/restore is experimental, uses CRIU, and is primarily focused on single-host use. No external TTY is used here.
+
+        **Application:** Retain actual checkpoint commands and strict continuity checks; never substitute a cold start for a failed restore.
+
+        ### 8. Docker checkpoint create
+        https://docs.docker.com/reference/cli/docker/checkpoint/create/
+
+        Type: official_documentation.
+        **Source supports:** Creates a checkpoint from a running container. Leave-running is an optional behavior.
+
+        **Application:** This workflow uses the default stopped-target behavior and verifies Running=false plus stable logs.
+
+        ### 9. Docker container start
+        https://docs.docker.com/reference/cli/docker/container/start/
+
+        Type: official_documentation.
+        **Source supports:** The --checkpoint option starts a container from a checkpoint.
+
+        **Application:** Only the first target launch is ordinary start. Every tested continuation uses --checkpoint.
+
+        ### 10. Docker network sharing
+        https://docs.docker.com/engine/network/
+
+        Type: official_documentation.
+        **Source supports:** The supported container:<name|id> mode shares another container networking stack; certain DNS/hostname/port flags are incompatible.
+
+        **Application:** The target shares only the dedicated keeper namespace. No host networking or port publishing is used.
+
+        ### 11. Docker none driver
+        https://docs.docker.com/engine/network/drivers/none/
+
+        Type: official_documentation.
+        **Source supports:** The none driver leaves a private stack with only loopback, rather than eliminating network namespaces altogether.
+
+        **Application:** The keeper uses none. Namespace identity, loopback-only links and both route tables are checked at runtime.
+
+        ### 12. Docker host driver
+        https://docs.docker.com/engine/network/drivers/host/
+
+        Type: official_documentation.
+        **Source supports:** Host networking shares the host network stack rather than isolating the container network.
+
+        **Application:** Not used as a workaround: it would change the security boundary of this vulnerable target.
+
+        ### 13. CRIU external resources
+        https://criu.org/External_resources
+
+        Type: official_documentation.
+        **Source supports:** Some resources cannot be checkpointed/restored without help from the caller, because some state lies outside the dumped container.
+
+        **Application:** Declare the namespace keeper as a retained external dependency in report.json and the HTML evidence.
+
+        ### 14. CRIU Docker integration
+        https://criu.org/Docker
+
+        Type: official_documentation.
+        **Source supports:** Describes native Docker integration and recommends considering Podman as an alternative.
+
+        **Application:** This patch retains Docker to isolate the observed change; a future Podman comparison is a separate experiment.
+
+        ### 15. CRIU external Docker historical prototype
+        https://criu.org/index.php?mobileaction=toggle_view_mobile&title=Docker_External
+
+        Type: historical_warning.
+        **Source supports:** The old external Docker C/R approach is marked as a proof of concept, not the recommended native integration.
+
+        **Application:** Do not run raw criu restore behind Docker and pretend Docker tracks the revived process correctly.
+
+        ### 16. Docker daemon configuration
+        https://docs.docker.com/reference/cli/dockerd/
+
+        Type: official_documentation.
+        **Source supports:** Documents daemon configuration, experimental mode and configuration validation.
+
+        **Application:** Keep the existing merged/validated daemon config. Restarting Docker is restricted to the disposable hosted runner.
+
+        ### 17. GitHub expression contexts
+        https://docs.github.com/en/actions/reference/workflows-and-actions/contexts
+
+        Type: official_documentation.
+        **Source supports:** Available expression contexts depend on the workflow key being evaluated.
+
+        **Application:** Keep github.workspace in job-level env; do not reintroduce runner.temp there.
+
+        ### 18. GitHub workflow syntax
+        https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax
+
+        Type: official_documentation.
+        **Source supports:** Workflow syntax specifies job/step behavior, conditions, shells, and a 21,000-character run-block maximum.
+
+        **Application:** Split embedded source into multiple small run blocks within the SAME YAML. Evidence and HTML steps use always().
+
+        ### 19. GitHub artifacts
+        https://docs.github.com/en/actions/how-tos/writing-workflows/choosing-what-your-workflow-does/storing-and-sharing-data-from-a-workflow
+
+        Type: official_documentation.
+        **Source supports:** Artifacts retain generated reports and output files from workflow runs.
+
+        **Application:** Upload the HTML and diagnostic evidence after both success and failure. Raw memory images remain excluded.
+
+        ## Validation interpretation
+
+        Local syntax, regression and mocked-Docker tests verify controller logic. They are not evidence that CRIU restored a real V8 process. Only the job can establish that by successfully restoring the live target and passing the subsequent continuity and namespace checks.
+        EMBED_DOCUMENTATION_MD_1
     - name: Verify every embedded byte and print the package manifest
       id: integrity
       shell: bash
@@ -1444,7 +2246,7 @@ jobs:
         python3 - <<'PYVERIFY'
         import hashlib,json,os,pathlib,sys
         root=pathlib.Path(os.environ['BUNDLE_DIR']); evidence=pathlib.Path(os.environ['EVIDENCE_DIR'])
-        expected={'checkpoint_probe.py': '70e826f0157042bc16f9336c5427e63b67eed00afcd69b8613ccbd61ce8a8638', 'build_viewer.py': '91a6ee15e3863deeea9307fa675c6ac69ffab17be6120d36741fc76295e81556', 'viewer-template.html': 'f0e324b18c0b1d206208fc3b1c0518006c4c8a3023294a5eab96b8ba8dc51b1e', 'install_criu.sh': '8fbe8a11ffaa911f7b89357ea5b5f5f347e09f4fa292f33a53e0c5f021c72757', 'host_diagnostics.sh': '96cfdc39bcc6b5831c7784e140e1c62e45ba1b33ab698f53aaea7e68a0e647b2', 'report_tools.py': 'd421e378c3eb9056d4cba58581706f3deb00f3d6bc9058865725df1e98ee83fd', 'self_tests.py': 'b6c327fd96f351d7fc102ea90dbaaa74e4e7486e448d4c941e430e296c90a545'}
+        expected={'netns_guard.py': 'f3e42c9f8b8a8c582eb8032d8ea622a4bc54bfd7200d774691ab219f07e4820f', 'checkpoint_probe.py': '3e646ce0d52c5faa3d43d8a4527be56285cce4b0bf077199937cc69fd9bb2771', 'build_viewer.py': '91a6ee15e3863deeea9307fa675c6ac69ffab17be6120d36741fc76295e81556', 'viewer-template.html': 'f0e324b18c0b1d206208fc3b1c0518006c4c8a3023294a5eab96b8ba8dc51b1e', 'install_criu.sh': '9f7b64296c1f1ffdc30f055f1f926d4b42a8c976291275978b6f803c27b43114', 'host_diagnostics.sh': '96cfdc39bcc6b5831c7784e140e1c62e45ba1b33ab698f53aaea7e68a0e647b2', 'report_tools.py': 'c2e4a257b22a6856f7049cb06e5bc09fe21e1050aab1c432aa676ced691e567b', 'self_tests.py': 'b6c327fd96f351d7fc102ea90dbaaa74e4e7486e448d4c941e430e296c90a545', 'network_tests.py': '39920a0f3fd84b6bb157cdc1d81767a30fcdf3e3b45f410a09c2db17c3c4b492', 'documentation.json': '6fddb1b2e975dab78dd340534adf364e75257bba77d27a5c6088afcfcba2db72', 'documentation.md': 'c54acc5bb2f0b6ffb14e3a191b4dd90d2ac497253b84b781212dd653f273f23c'}
         rows=[]
         for name,wanted in expected.items():
             actual=hashlib.sha256((root/name).read_bytes()).hexdigest()
@@ -1455,8 +2257,11 @@ jobs:
         (evidence/'asset-integrity.json').write_text(json.dumps(report,indent=2)+'\n')
         raise SystemExit(0 if report['status']=='passed' else 1)
         PYVERIFY
-        python3 -m py_compile "$BUNDLE_DIR/checkpoint_probe.py" "$BUNDLE_DIR/build_viewer.py" "$BUNDLE_DIR/report_tools.py" "$BUNDLE_DIR/self_tests.py"
+        python3 -m py_compile "$BUNDLE_DIR/checkpoint_probe.py" "$BUNDLE_DIR/build_viewer.py" "$BUNDLE_DIR/report_tools.py" "$BUNDLE_DIR/self_tests.py" "$BUNDLE_DIR/netns_guard.py" "$BUNDLE_DIR/network_tests.py"
         cp "$BUNDLE_DIR"/*.py "$BUNDLE_DIR"/*.sh "$BUNDLE_DIR"/*.html "$EVIDENCE_DIR/sources/"
+        cp "$BUNDLE_DIR/documentation.md" "$BUNDLE_DIR/documentation.json" "$EVIDENCE_DIR/"
+        printf "=== DOCUMENTATION AND WORKAROUND RATIONALE ===\n"
+        cat "$EVIDENCE_DIR/documentation.md"
     - name: Run embedded verifier tests (not a claim of CRIU success)
       id: self_tests
       continue-on-error: true
@@ -1464,6 +2269,12 @@ jobs:
       run: |
         set -Eeuo pipefail
         python3 -u "$BUNDLE_DIR/checkpoint_probe.py" stream local-self-tests   python3 -u "$BUNDLE_DIR/self_tests.py" 2>&1 | tee "$EVIDENCE_DIR/self-test-console.log"
+    - name: Test namespace safety and restore orchestration (mocked Docker; not runtime proof)
+      id: network_tests
+      shell: bash
+      run: |
+        set -Eeuo pipefail
+        python3 -u "$BUNDLE_DIR/network_tests.py" 2>&1 | tee "$EVIDENCE_DIR/network-tests-console.log"
     - name: Stream complete host, resource and runtime diagnostics
       continue-on-error: true
       shell: bash
@@ -1473,7 +2284,7 @@ jobs:
     - name: Source-build the pinned CRIU release with live compiler logs
       id: criu_setup
       continue-on-error: true
-      if: ${{ steps.self_tests.outcome == 'success' }}
+      if: ${{ steps.self_tests.outcome == 'success' && steps.network_tests.outcome == 'success' }}
       shell: bash
       run: |
         set -Eeuo pipefail
